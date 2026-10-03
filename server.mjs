@@ -372,6 +372,13 @@ agent.onEvent = (event) => {
   pushSse(event.sessionId, event);
 };
 
+// model.streaming（token 级流式）：只直播给在线订阅者，不进重放环——
+// 一个回合动辄上百个 chunk，进环会挤掉其他事件且重连重放语义不对
+// （文本以存储持久化为准，直播中断即丢，页面从后续 delta 续流）。
+function isStreamOnlyEvent(event) {
+  return event.type === 'model.streaming';
+}
+
 const RATE_LIMIT_RE = /\b429\b|rate[._ ]?limit/i;
 // 1113/余额类错误重试永远不会成功（凭据没有计费额度），不进入重试循环
 const NO_RETRY_RE = /\b1113\b|insufficient balance|no resource package|余额不足|资源包|额度不足/i;
@@ -423,7 +430,8 @@ agent.onReset = () => {
 function pushSse(sessionId, obj) {
   const s = sessionState(sessionId);
   const isEvent = !obj.__ui;
-  if (isEvent) {
+  const streamOnly = isEvent && isStreamOnlyEvent(obj);
+  if (isEvent && !streamOnly) {
     s.ring.push(obj);
     if (s.ring.length > 1000) s.ring.shift();
   }

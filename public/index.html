@@ -1537,6 +1537,7 @@ function handleZcodeEvent(ev) {
       break;
     }
     case 'turn.completed':
+      purgeLiveStream();
       busySource = null;
       setBusy(false);
       stopLiveTimers();
@@ -1551,6 +1552,7 @@ function handleZcodeEvent(ev) {
       flushQueue();
       break;
     case 'turn.failed': {
+      purgeLiveStream();
       busySource = null;
       setBusy(false);
       stopLiveTimers();
@@ -1591,12 +1593,40 @@ function handleZcodeEvent(ev) {
       chat.appendChild(card); scrollBottom();
       break;
     }
+    case 'model.streaming': {
+      // 官方同款逐字流式：引擎的 token 级直播 chunk（legacy 通道只透传该事件，
+      // 文本部件要到回合结束才持久化）。text_delta → 正文直播累积；
+      // reasoning_delta → 思考行直播。回合结束 purgeLiveStream 清理直播元素，
+      // 由存储渲染的真实部件接管。
+      const p = ev.payload ?? {};
+      const delta = String(p.delta ?? '');
+      const mid = String(p.assistantMessageId ?? '');
+      if (!delta || !mid) break;
+      const m = ensureMsg(mid, 'assistant');
+      if (p.kind === 'reasoning_delta') {
+        const pe = ensureThink(m, '__live-think');
+        pe.content.textContent += delta;
+      } else {
+        let pe = m.partEls.get('__live-text');
+        if (!pe) {
+          const div = el('div');
+          div.__partId = '__live-text';
+          m.bubble.appendChild(div);
+          pe = { kind: 'text', el: div, full: '' };
+          m.partEls.set('__live-text', pe);
+        }
+        pe.full = (pe.full ?? '') + delta;
+        pe.el.textContent = '';
+        richText(pe.el, pe.full);
+      }
+      scrollBottom();
+      break;
+    }
     case 'session.titleUpdated': {
       const t = ev.payload?.title ?? ev.payload?.session?.title;
       if (t) setSessionTitle(t);
       break;
-    }
-    case 'session.closed': {
+    }    case 'session.closed': {
       busySource = null;
       setBusy(false);
       toast('会话已关闭');
@@ -1604,6 +1634,17 @@ function handleZcodeEvent(ev) {
     }
     default: break;
   }
+}
+
+// 清理 token 流式直播元素：回合结束后由存储渲染的真实部件接管
+function purgeLiveStream() {
+  for (const m of msgEls.values()) {
+    for (const key of ['__live-text', '__live-think']) {
+      const pe = m.partEls.get(key);
+      if (pe) { pe.el.remove(); m.partEls.delete(key); }
+    }
+  }
+  thinkTimers.delete('__live-think');
 }
 
 function handleUiEvent(p) {
