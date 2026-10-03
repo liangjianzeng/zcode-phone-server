@@ -2,3 +2,5 @@ config.json
 logs/
 node_modules/
 .zcode-uploads/
+tmp-*.cjs
+.zcode-uploads/
