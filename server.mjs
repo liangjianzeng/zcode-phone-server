@@ -458,16 +458,23 @@ function readCodingPlanApiKey(providerId) {
       const apiKey = decryptCredential(raw[key] ?? '').trim();
       if (apiKey) return apiKey;
     }
+    // identity 键缺席时直接扫键匹配（2026-10-03 实测 Z.AI 重登录后凭据文件只有
+    // account-provider:coding-plan:account:<providerId>:account:<uuid>:api-key，
+    // 没有 identity 键——UUID 已直接嵌在键名里）。
+    for (const [k, v] of Object.entries(raw)) {
+      if (k.startsWith(`account-provider:coding-plan:`) && k.includes(`:${providerId}:`) && k.endsWith(':api-key')) {
+        const apiKey = decryptCredential(v).trim();
+        if (apiKey) return apiKey;
+      }
+    }
     // 桌面端登录把凭据重写为 oauth:* 共享键（engine 的 createSharedZCodeCredentialStore）。
-    // 注意：oauth access_token（JWT）可推动授权、也能直接过端点鉴权（x-api-key/Bearer
-    // 实测 200），但过不了引擎的 V4 签名器与适配器 loadApiKey 双重校验——
-    // 推理要跑通仍需在 config.json 配置 id.secret 形态的 codingPlanApiKey。
+    // oauth access_token（JWT）可推动授权推送，但过不了引擎的凭据强度校验。
     const oauthKey = OAUTH_ACCESS_KEY_BY_PROVIDER[providerId];
     if (oauthKey) {
       const v = decryptCredential(raw[oauthKey] ?? '').trim();
       if (v) {
-        logLine('account', '仅有 oauth JWT 凭据：可完成授权推送，但推理需在 config.json 配置 '
-          + 'codingPlanApiKey（id.secret 形态，https://bigmodel.cn/usercenter/proj-mgmt/apikeys 创建）');
+        logLine('account', '仅有 oauth JWT 凭据：可完成授权推送，但推理需 standalone '
+          + 'coding-plan api-key（桌面端重登录后写入 account-provider:coding-plan:* 键）');
         return v;
       }
     }
@@ -485,9 +492,21 @@ function readCodingPlanApiKey(providerId) {
   }
 }
 
-/** 当前机器上已连接（有 api-key 凭据）的 Coding Plan provider id。 */
+/** 当前机器上已连接（有凭据）的 Coding Plan provider id。
+ *  优先有 standalone api-key 的（能真正推理）；oauth 兜底只在其后考虑。 */
 function connectedProviderId() {
-  for (const pid of ['account:bigmodel-individual-coding-plan', 'account:zai-individual-coding-plan']) {
+  const all = ['account:bigmodel-individual-coding-plan', 'account:zai-individual-coding-plan'];
+  for (const pid of all) {
+    // 只认 standalone 键命中（有真凭据能推理）
+    try {
+      const raw = JSON.parse(fs.readFileSync(CRED_PATH, 'utf8'));
+      const hit = Object.keys(raw).some((k) =>
+        k.startsWith('account-provider:coding-plan:') && k.includes(`:${pid}:`) && k.endsWith(':api-key'));
+      if (hit) return pid;
+    } catch { /* fallthrough */ }
+  }
+  // 无 standalone：退而求其次取任一有 oauth JWT 的（可推授权，推理不可用）
+  for (const pid of all) {
     if (readCodingPlanApiKey(pid)) return pid;
   }
   return undefined;
