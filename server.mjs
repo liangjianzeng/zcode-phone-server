@@ -249,11 +249,10 @@ class ZcodeAgent {
       const pid = params?.providerId ?? '';
       const apiKey = readCodingPlanApiKey(pid);
       if (apiKey && /^eyJ/.test(apiKey)) {
-        // oauth JWT（start-plan 凭据）：zcode-plan 端点需要引擎内置的请求签名，
-        // 裸 JWT 直通实测 401（开源/闭源皆然）。返回 headersApplied:false 交还
-        // 引擎自治——闭源引擎与桌面端同机同凭据文件，可自行签名（桌面即此路径）。
-        result = { headersApplied: false };
-        logLine('interaction-auth', 'jwt credential, defer to engine signer', { pid });
+        // start-plan 的 zcodeJwtToken：官方即以此作 requestAuth.apiKey 直通
+        // （headersApplied: true，见 accountProviderRequestAuthService L75）。
+        result = { headersApplied: true, requestAuth: { apiKey } };
+        logLine('interaction-auth', 'start-plan zcode-jwt passthrough', { pid, masked: apiKey.slice(0, 8) + '…(' + apiKey.length + 'ch)' });
       } else if (apiKey) {
         // standalone api-key（id.secret 形态）：原样透传，适配器自行设
         // x-api-key + Bearer（individual-coding-plan 的 api.z.ai 路径）
@@ -366,8 +365,48 @@ agent.onEvent = (event) => {
   // 活动事件也标记 busy，会话列表的"运行中"才不撒谎；completed/failed 复位。
   if (event.type === 'tool.updated' && !s.busy) { s.busy = true; if (!s.busySince) s.busySince = Date.now(); }
   if (event.type === 'turn.completed' || event.type === 'turn.failed') { s.busy = false; s.busySince = 0; }
+  // 429 限流自动重试：桌面端与手机共用同一账户，桌面跑任务期间手机新回合
+  // 大概率撞并发限流；而桌面在工具执行间隙账户是空闲的，退避重试基本能过。
+  // 只重试手机发起的发送（lastSend），最多 5 次、间隔 20 秒。
+  if (event.type === 'turn.failed') scheduleRateLimitRetry(event.sessionId, event.payload?.error);
   pushSse(event.sessionId, event);
 };
+
+const RATE_LIMIT_RE = /\b429\b|rate[._ ]?limit/i;
+// 1113/余额类错误重试永远不会成功（凭据没有计费额度），不进入重试循环
+const NO_RETRY_RE = /\b1113\b|insufficient balance|no resource package|余额不足|资源包|额度不足/i;
+
+function scheduleRateLimitRetry(sid, error) {
+  const s = sessionState(sid);
+  const ls = s.lastSend;
+  if (!ls?.content) return;
+  const msg = String(error?.message ?? error ?? '');
+  if (Date.now() - ls.at > 5 * 60 * 1000) return; // 只重试 5 分钟内的发送
+  if (NO_RETRY_RE.test(msg)) {
+    pushSse(sid, { __ui: 'note', text: '该凭据无推理额度（1113 余额/资源包不足）：请在平台给账户充值，或在模型菜单换其他模型。此错误不会自动重试。' });
+    return;
+  }
+  if (!RATE_LIMIT_RE.test(msg)) return;
+  if (ls.retries >= 5) {
+    pushSse(sid, { __ui: 'note', text: '限流重试已达上限（5 次），请等桌面任务完成后再试，或在模型菜单换其他模型' });
+    return;
+  }
+  ls.retries++;
+  const n = ls.retries;
+  pushSse(sid, { __ui: 'note', text: `模型账户限流（429），${n}/5 次，20 秒后自动重试…` });
+  ls.timer = setTimeout(async () => {
+    const cur = sessionState(sid);
+    if (cur.busy || cur.lastSend !== ls) return; // 用户已停止或发了新消息
+    try {
+      await agent.request('session/send', { sessionId: sid, content: ls.content, inputId: crypto.randomUUID() }, 120000);
+      cur.busy = true;
+      if (!cur.busySince) cur.busySince = Date.now();
+      pushSse(sid, { __ui: 'note', text: `限流重试（第 ${n} 次）已发出` });
+    } catch (e) {
+      pushSse(sid, { __ui: 'note', text: `限流重试失败：${e?.message ?? e}` });
+    }
+  }, 20000);
+}
 
 agent.onReset = () => {
   for (const [sid, s] of sessions) {
@@ -525,12 +564,19 @@ const OAUTH_ACCESS_KEY_BY_PROVIDER = {
 };
 
 /** 当前机器上已连接（有凭据）的 Coding Plan provider id。
- *  优先有 standalone api-key 的（能真正推理）；oauth 兜底只在其后考虑。
- *  注：start-plan（zcode.z.ai 端点）需要桌面闭源签名链路，桥的 requestAuth
- *  通道无法复刻（裸 JWT 401 / 引擎自治挂起，2026-10-03 实测）；除非凭据文件
- *  出现 start-plan 的 standalone key，否则不推 start-plan。 */
+ *
+ * start-plan 优先：凭据文件存在 `zcodejwttoken` = 桌面 start-plan 登录态
+ * （官方 AccountProviderRequestAuthService：planKind==='start-plan' 时
+ * requestAuth.apiKey = tokenSet.zcodeJwtToken）。用户当前套餐即 start-plan；
+ * account:zai-individual-coding-plan 的 standalone key 是独立计费键（无余额
+ * 必报 1113），只作没有 start-plan 登录态时的兜底。 */
 function connectedProviderId() {
-  const all = ['account:bigmodel-individual-coding-plan', 'account:zai-individual-coding-plan'];
+  try {
+    const raw = JSON.parse(fs.readFileSync(CRED_PATH, 'utf8'));
+    const zjwt = decryptCredential(raw['zcodejwttoken'] ?? '').trim();
+    if (zjwt) return 'account:zai-start-plan';
+  } catch { /* fallthrough */ }
+  const all = ['account:zai-individual-coding-plan', 'account:bigmodel-individual-coding-plan'];
   for (const pid of all) {
     // 只认 standalone 键命中（有真凭据能推理）
     try {
@@ -540,25 +586,30 @@ function connectedProviderId() {
       if (hit) return pid;
     } catch { /* fallthrough */ }
   }
-  // 无 standalone：退而求其次取任一有 oauth JWT 的（可推授权，推理不可用）
-  for (const pid of all) {
-    if (readCodingPlanApiKey(pid)) return pid;
-  }
   return undefined;
 }
 
 /** 读取 Coding Plan api-key（standalone 键名规范见 bootstrap/src/app/standalone-account-provider-runtime.ts）。 */
 function readCodingPlanApiKey(providerId) {
-  // 优先级 1：config.json 显式配置的 Coding Plan API Key（id.secret 形态）。
-  // 引擎对 zhipu-account provider 走 V4 请求签名，要求 apiKey 恰好一个「.」
-  // （Glr：apiKeyId.apiKeySecret）；桌面端 oauth 的 access_token 是 JWT（多个点），
-  // 直接作 apiKey 会被签名器拒（invalid-config），作 headers 又过不了适配器的
-  // loadApiKey 强校验——所以 JWT 只能推动授权，真正推理必须用 id.secret 的 key。
-  // 创建入口：https://bigmodel.cn/usercenter/proj-mgmt/apikeys
+  // 优先级 0：config.json 显式配置的 Coding Plan API Key（id.secret 形态）。
+  // 注意：standalone api-key 是**独立计费**的按量付费凭据——账户没充值时推理
+  // 一律报 [1113] Insufficient balance（2026-10-04 实测），套餐订阅额度只挂在
+  // 桌面端 oauth 凭据上。
   const configured = String(config.codingPlanApiKey ?? '').trim();
   if (configured) return configured;
   try {
     const raw = JSON.parse(fs.readFileSync(CRED_PATH, 'utf8'));
+    // start-plan：官方 requestAuth 凭据是 oauth token set 里的 zcodeJwtToken
+    // （accountProviderRequestAuthService.ts L73-76：planKind==='start-plan'
+    //  → apiKey = tokenSet.zcodeJwtToken）。凭据文件里存于 `zcodejwttoken` 键。
+    // 注意不是 oauth:zai:access_token——那个普通登录 JWT 直通 zcode-plan 端点
+    // 实测 401（2026-10-03），此前"无法复刻"的结论就是错用了它。
+    if (providerId === 'account:zai-start-plan') {
+      const jwt = decryptCredential(raw['zcodejwttoken'] ?? '').trim();
+      if (jwt) return jwt;
+      return undefined;
+    }
+    // individual-coding-plan：standalone 独立计费 api-key（账户需有余额）
     const identity = decryptCredential(raw[`account-provider:${providerId}:identity`] ?? '').trim();
     if (identity) {
       const key = `account-provider:coding-plan:${providerId}:account:${encodeURIComponent(identity)}:api-key`;
@@ -572,17 +623,6 @@ function readCodingPlanApiKey(providerId) {
       if (k.startsWith(`account-provider:coding-plan:`) && k.includes(`:${providerId}:`) && k.endsWith(':api-key')) {
         const apiKey = decryptCredential(v).trim();
         if (apiKey) return apiKey;
-      }
-    }
-    // 桌面端登录把凭据重写为 oauth:* 共享键（engine 的 createSharedZCodeCredentialStore）。
-    // oauth access_token（JWT）可推动授权推送，但过不了引擎的凭据强度校验。
-    const oauthKey = OAUTH_ACCESS_KEY_BY_PROVIDER[providerId];
-    if (oauthKey) {
-      const v = decryptCredential(raw[oauthKey] ?? '').trim();
-      if (v) {
-        logLine('account', '仅有 oauth JWT 凭据：可完成授权推送，但推理需 standalone '
-          + 'coding-plan api-key（桌面端重登录后写入 account-provider:coding-plan:* 键）');
-        return v;
       }
     }
     // 最后兜底：任取一个 oauth:*:access_token（provider 映射缺失时尽量可用）
@@ -628,6 +668,8 @@ function pushAccountConfig() {
     revision: `zcode-phone-${Date.now()}`,
     basedOnZCodeBuiltinRevision: basedOn,
     providers: {
+      // 协议 strict 校验只认 {type, entitled}；planKind 由引擎按 providerId
+      // 从内置配置（zcode-builtin.json）自行解析，多传会被拒（unrecognized_keys）
       [pid]: { access: { type: 'zhipu-account', entitled: true } },
     },
     states: { [pid]: { availability: 'available', entitled: true, current: true } },
@@ -870,10 +912,16 @@ async function handleApi(req, res, url) {
       const st = sessionState(sid);
       st.busy = true;
       if (!st.busySince) st.busySince = Date.now();
+      // 记录本次发送：回合若因 429 限流失败可自动重试（见 scheduleRateLimitRetry）
+      if (st.lastSend?.timer) clearTimeout(st.lastSend.timer);
+      st.lastSend = { content, at: Date.now(), retries: 0, timer: null };
       return sendJson(res, 200, r);
     }
 
     if (req.method === 'POST' && sub === 'stop') {
+      const st = sessionState(sid);
+      if (st.lastSend?.timer) clearTimeout(st.lastSend.timer);
+      st.lastSend = null; // 用户主动停止：取消待执行的限流重试
       const r = await agent.request('session/stop', { sessionId: sid });
       return sendJson(res, 200, r ?? {});
     }
@@ -895,13 +943,17 @@ async function handleApi(req, res, url) {
       }
     }
 
-    // 切换模型（对照官方 GLM-5.3-Flash ▾ 菜单）；同时持久化为新会话默认
+    // 切换模型（对照官方 GLM-5.3-Flash ▾ 菜单）；同时持久化为新会话默认。
+    // 引擎对部分模型强制要求思考档位（如 z.ai 的 GLM-5.3-Flash），
+    // 页面未带档位时回退到当前默认档位，避免 setModel 直接报错。
     if (req.method === 'POST' && sub === 'model') {
       const body = await readBody(req);
       const providerId = String(body.providerId ?? '').trim();
       const modelId = String(body.modelId ?? '').trim();
       if (!providerId || !modelId) return sendJson(res, 400, { error: 'providerId / modelId 必填' });
-      const reasoningLevel = String(body.reasoningLevel ?? '').trim();
+      const reasoningLevel = String(body.reasoningLevel ?? '').trim()
+        || parseModelSelection(config.model)?.options?.reasoningLevel
+        || '';
       const model = reasoningLevel
         ? { providerId, modelId, options: { reasoningLevel } }
         : { providerId, modelId };

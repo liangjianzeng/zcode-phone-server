@@ -1603,6 +1603,14 @@ function handleUiEvent(p) {
     card.append(ok, no);
     chat.appendChild(card); scrollBottom();
   }
+  // 服务端自动重试提示（429 限流退避等）
+  if (p.kind === 'note' && p.text) {
+    chat.querySelectorAll('.sysline[data-retry]').forEach((n) => n.remove());
+    const note = el('div', 'sysline', p.text);
+    note.dataset.retry = '1';
+    chat.appendChild(note); scrollBottom();
+    toast(p.text);
+  }
   if (p.expired) toast('交互请求已超时自动拒绝');
 }
 
@@ -1629,7 +1637,12 @@ function connectStream(sessionId, afterSeq = -1) {
   };
   es.addEventListener('zcode', (e) => { try { handleZcodeEvent(JSON.parse(e.data)); } catch {} });
   es.addEventListener('ui', (e) => { try { handleUiEvent(JSON.parse(e.data)); } catch {} });
-  es.addEventListener('reset', () => { toast('服务已重启，请重新打开会话'); setBusy(false); });
+  es.addEventListener('reset', () => {
+    // 服务重启：引擎会话全部失效，自动 resume 恢复（轮询兜底）
+    busySource = null;
+    setBusy(false);
+    ensureResumed();
+  });
   es.onerror = () => { /* EventSource 自动重连，onopen 里重同步 */ };
 }
 
@@ -1716,7 +1729,26 @@ async function pollTick() {
       startLiveTimers();
     }
     renderTail(probe.messages ?? []);
-  } catch { /* 下次重试 */ }
+  } catch (e) {
+    // 服务端重启后引擎里没有这个会话（未 resume）：自动重新打开恢复
+    if (/not active/i.test(String(e?.message ?? e))) ensureResumed();
+  }
+}
+
+// 服务重启/引擎丢会话后自动 resume 当前会话（30 秒冷却防循环）
+let resumingSession = false;
+let lastResumeAt = 0;
+async function ensureResumed() {
+  if (resumingSession || !curSession) return;
+  if (Date.now() - lastResumeAt < 30000) return;
+  resumingSession = true;
+  lastResumeAt = Date.now();
+  try {
+    toast('服务已重启，正在重新连接会话…');
+    await openSession(curSession);
+  } catch { /* 下次轮询再试 */ } finally {
+    resumingSession = false;
+  }
 }
 
 function startPolling() {
