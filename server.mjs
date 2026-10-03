@@ -248,11 +248,15 @@ class ZcodeAgent {
       // 仍走 apiKey 签名路径。
       const pid = params?.providerId ?? '';
       const apiKey = readCodingPlanApiKey(pid);
-      if (apiKey) {
-        // 桥默认使用开源引擎（ref/ZCode 构建产物，无 V4 签名层）：apiKey 原样
-        // 透传，适配器自行设 x-api-key + Bearer（oauth JWT 实测直通端点）。
-        // 若换回桌面闭源引擎（zcode.cjs），id.secret 形态的 key 仍走 apiKey 签名
-        // 路径；JWT 形态则会被闭源签名器拒（invalid-config），需换回开源引擎。
+      if (apiKey && /^eyJ/.test(apiKey)) {
+        // oauth JWT（start-plan 凭据）：zcode-plan 端点需要引擎内置的请求签名，
+        // 裸 JWT 直通实测 401（开源/闭源皆然）。返回 headersApplied:false 交还
+        // 引擎自治——闭源引擎与桌面端同机同凭据文件，可自行签名（桌面即此路径）。
+        result = { headersApplied: false };
+        logLine('interaction-auth', 'jwt credential, defer to engine signer', { pid });
+      } else if (apiKey) {
+        // standalone api-key（id.secret 形态）：原样透传，适配器自行设
+        // x-api-key + Bearer（individual-coding-plan 的 api.z.ai 路径）
         result = { headersApplied: true, requestAuth: { apiKey } };
         logLine('interaction-auth', 'api-key supplied', { pid, masked: apiKey.slice(0, 10) + '…(' + apiKey.length + 'ch)', dots: (apiKey.match(/\./g) || []).length });
       } else {
@@ -305,15 +309,20 @@ class ZcodeAgent {
 
 // ────────────────────────── 会话注册表 & 交互等待 ──────────────────────────
 
-/** sessionId → {subs:Set<res>, ring:[], busy:bool, title, lastSeq} */
+/** sessionId → {subs:Set<res>, ring:[], busy:bool, busySince, title, lastSeq} */
 const sessions = new Map();
 /** requestId → {resolve, timer} */
 const pendingInteractions = new Map();
 
+// 全项目会话列表缓存（官方 PC 侧边栏数据源；5s TTL 护航页面轮询）
+let allListCache = null;
+// 会话存储里出现过的项目路径（引擎自建的项目也允许作为转发/建会话目标）
+const knownWorkspaces = new Set();
+
 function sessionState(id) {
   let s = sessions.get(id);
   if (!s) {
-    s = { subs: new Set(), ring: [], busy: false, title: '', lastSeq: 0 };
+    s = { subs: new Set(), ring: [], busy: false, busySince: 0, title: '', lastSeq: 0 };
     sessions.set(id, s);
   }
   return s;
@@ -352,8 +361,11 @@ const agent = new ZcodeAgent();
 agent.onEvent = (event) => {
   const s = sessionState(event.sessionId);
   s.lastSeq = Math.max(s.lastSeq, event.seq ?? 0);
-  if (event.type === 'turn.started') s.busy = true;
-  if (event.type === 'turn.completed' || event.type === 'turn.failed') s.busy = false;
+  if (event.type === 'turn.started') { s.busy = true; s.busySince = Date.now(); }
+  // 回合可能由外部（桌面端）驱动、桥进程错过 turn.started：见到回合内
+  // 活动事件也标记 busy，会话列表的"运行中"才不撒谎；completed/failed 复位。
+  if (event.type === 'tool.updated' && !s.busy) { s.busy = true; if (!s.busySince) s.busySince = Date.now(); }
+  if (event.type === 'turn.completed' || event.type === 'turn.failed') { s.busy = false; s.busySince = 0; }
   pushSse(event.sessionId, event);
 };
 
@@ -396,16 +408,86 @@ function parseModelSelection(value) {
   return selection;
 }
 
+// ── 会话设置投影（对照官方 zcode.z.ai：模型选择 / 思考档位 / 权限模式 / slash 命令）──
+
+/** modelSelection → 纯 JSON（宽松：引擎可能带 options.reasoningLevel 或顶层 reasoningLevel）。 */
+function modelRefToJson(ref) {
+  if (!ref || typeof ref !== 'object') return null;
+  const out = { providerId: String(ref.providerId ?? ''), modelId: String(ref.modelId ?? '') };
+  const lvl = ref.options?.reasoningLevel ?? ref.reasoningLevel;
+  if (lvl) out.reasoningLevel = String(lvl);
+  return out;
+}
+
+/**
+ * 把 session/create|resume|read 的快照投影成前端友好的设置对象：
+ * model.current/available（含 reasoning 档位）、thoughtLevel、mode、slashCommands、
+ * projection（上下文占用，供官方样式「上下文容量」卡片使用）。
+ */
+function projectSettings(snapshot) {
+  const st = snapshot?.settings ?? {};
+  const model = st.model ?? {};
+  const thought = st.thoughtLevel ?? {};
+  const proj = snapshot?.projection ?? null;
+  return {
+    model: {
+      current: modelRefToJson(model.current),
+      available: (Array.isArray(model.available) ? model.available : []).map((o) => ({
+        providerId: o.ref?.providerId ?? '',
+        modelId: o.ref?.modelId ?? '',
+        reasoningLevel: o.ref?.options?.reasoningLevel ?? '',
+        label: o.label ?? o.ref?.modelId ?? '',
+        providerLabel: o.providerLabel ?? '',
+        description: o.description ?? '',
+        contextWindow: o.contextWindow ?? 0,
+        reasoningLevels: (o.reasoning?.levels ?? []).map((l) => ({
+          value: l.value, label: l.label, description: l.description ?? '',
+        })),
+        defaultReasoningLevel: o.reasoning?.defaultLevel ?? '',
+        disabledReason: o.disabledReason ?? '',
+      })),
+    },
+    thoughtLevel: {
+      enabled: !!thought.enabled,
+      current: thought.current ?? null,
+      defaultLevel: thought.defaultLevel ?? null,
+      available: (Array.isArray(thought.available) ? thought.available : []).map((l) => ({
+        value: l.value, label: l.label, description: l.description ?? '',
+      })),
+    },
+    mode: { current: st.mode?.current ?? snapshot?.session?.mode ?? config.mode },
+    slashCommands: Array.isArray(snapshot?.slashCommands) ? snapshot.slashCommands : [],
+    projection: proj ? {
+      contextUsed: proj.contextUsed ?? 0,
+      contextWindow: proj.contextWindow ?? 0,
+      totalTokenCount: proj.totalTokenCount ?? 0,
+      status: proj.status ?? '',
+    } : null,
+  };
+}
+
+/** 把会话内的模型/档位选择持久化进 config.model（provider/model$level），新会话沿用。 */
+function persistModelConfig(sel) {
+  if (!sel?.providerId || !sel?.modelId) return;
+  config.model = `${sel.providerId}/${sel.modelId}${sel.reasoningLevel ? '$' + sel.reasoningLevel : ''}`;
+  saveConfig(config);
+}
+
 function workspaceRef(overridePath) {
   // 本地 workspace：workspaceKey = workspacePath（bootstrap/zcode-protocol/workspace.ts 约定）。
-  // overridePath：多工作区切换时由请求显式指定（须在 config.workspaces 白名单内或等于主工作区）。
+  // overridePath：切换项目时由请求显式指定。允许：主工作区、config.workspaces 白名单、
+  // 以及会话存储里出现过 knownWorkspaces（官方 PC 可打开任意历史项目，语义一致）。
   const requested = String(overridePath ?? '').trim();
   let wp = config.workspacePath;
   if (requested) {
-    const allowed = [config.workspacePath, ...(config.workspaces ?? []).map((w) => w.path)]
-      .map((p) => path.resolve(String(p)));
+    const allowed = new Set(
+      [config.workspacePath, ...(config.workspaces ?? []).map((w) => w.path)]
+        .map((p) => path.resolve(String(p))),
+    );
+    for (const k of knownWorkspaces) allowed.add(k);
     const resolved = path.resolve(requested);
-    if (allowed.includes(resolved)) wp = resolved;
+    if (allowed.has(resolved)) wp = resolved;
+    else logLine('workspace', 'requested workspace not allowed, fallback to main', { requested: resolved });
   }
   return { workspacePath: wp, workspaceKey: wp };
 }
@@ -434,11 +516,36 @@ function decryptCredential(value) {
   return Buffer.concat([decipher.update(Buffer.from(dataRaw, 'base64url')), decipher.final()]).toString('utf8');
 }
 
-/** 桌面端 oauth 共享凭据键（providerId → credentials.json 键名）。 */
+/** 桌面端 oauth 共享凭据键（providerId → credentials.json 键名）。
+ *  zai-start-plan 与 zai-individual-coding-plan 共用同一个 Z.AI oauth 登录态。 */
 const OAUTH_ACCESS_KEY_BY_PROVIDER = {
+  'account:zai-start-plan': 'oauth:zai:access_token',
   'account:bigmodel-individual-coding-plan': 'oauth:bigmodel:access_token',
   'account:zai-individual-coding-plan': 'oauth:zai:access_token',
 };
+
+/** 当前机器上已连接（有凭据）的 Coding Plan provider id。
+ *  优先有 standalone api-key 的（能真正推理）；oauth 兜底只在其后考虑。
+ *  注：start-plan（zcode.z.ai 端点）需要桌面闭源签名链路，桥的 requestAuth
+ *  通道无法复刻（裸 JWT 401 / 引擎自治挂起，2026-10-03 实测）；除非凭据文件
+ *  出现 start-plan 的 standalone key，否则不推 start-plan。 */
+function connectedProviderId() {
+  const all = ['account:bigmodel-individual-coding-plan', 'account:zai-individual-coding-plan'];
+  for (const pid of all) {
+    // 只认 standalone 键命中（有真凭据能推理）
+    try {
+      const raw = JSON.parse(fs.readFileSync(CRED_PATH, 'utf8'));
+      const hit = Object.keys(raw).some((k) =>
+        k.startsWith('account-provider:coding-plan:') && k.includes(`:${pid}:`) && k.endsWith(':api-key'));
+      if (hit) return pid;
+    } catch { /* fallthrough */ }
+  }
+  // 无 standalone：退而求其次取任一有 oauth JWT 的（可推授权，推理不可用）
+  for (const pid of all) {
+    if (readCodingPlanApiKey(pid)) return pid;
+  }
+  return undefined;
+}
 
 /** 读取 Coding Plan api-key（standalone 键名规范见 bootstrap/src/app/standalone-account-provider-runtime.ts）。 */
 function readCodingPlanApiKey(providerId) {
@@ -492,26 +599,6 @@ function readCodingPlanApiKey(providerId) {
   }
 }
 
-/** 当前机器上已连接（有凭据）的 Coding Plan provider id。
- *  优先有 standalone api-key 的（能真正推理）；oauth 兜底只在其后考虑。 */
-function connectedProviderId() {
-  const all = ['account:bigmodel-individual-coding-plan', 'account:zai-individual-coding-plan'];
-  for (const pid of all) {
-    // 只认 standalone 键命中（有真凭据能推理）
-    try {
-      const raw = JSON.parse(fs.readFileSync(CRED_PATH, 'utf8'));
-      const hit = Object.keys(raw).some((k) =>
-        k.startsWith('account-provider:coding-plan:') && k.includes(`:${pid}:`) && k.endsWith(':api-key'));
-      if (hit) return pid;
-    } catch { /* fallthrough */ }
-  }
-  // 无 standalone：退而求其次取任一有 oauth JWT 的（可推授权，推理不可用）
-  for (const pid of all) {
-    if (readCodingPlanApiKey(pid)) return pid;
-  }
-  return undefined;
-}
-
 /**
  * 把账号授权推送给 agent（等价桌面 host 的 provider/updateAccountConfig）。
  * providers 仅含 access 覆盖（config/schema.ts accountProviderConfigSchema）；
@@ -526,6 +613,8 @@ function pushAccountConfig() {
     logLine('account', '未找到 Coding Plan api-key 凭据，跳过授权推送');
     return Promise.resolve(false);
   }
+  // access 协议信封只接受 {type, entitled}（strict 校验）；accountType/mode 等
+  // 完整字段由引擎按 builtin 配置与 pid 自行装配
   let basedOn = 'zcode-builtin';
   try {
     const cfgFile = path.resolve(config.builtinProviderConfigPath);
@@ -600,6 +689,7 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, {
       workspacePath: config.workspacePath,
       mode: config.mode,
+      model: config.model,
       autoAnswer: config.autoAnswer,
       agentRunning: !!agent.child,
     });
@@ -629,10 +719,35 @@ async function handleApi(req, res, url) {
 
   if (req.method === 'GET' && p === '/api/sessions') {
     const ws = url.searchParams.get('workspace');
+    // all=1：全项目会话（官方 PC「项目 ⇄ 会话」分组列表的数据源）。
+    // session/list 的 workspace 可选——不传即返回全部会话，每条带归属 workspace。
+    if (url.searchParams.get('all') === '1') {
+      const now = Date.now();
+      if (!allListCache || now - allListCache.t > 5000) {
+        const r = await agent.request('session/list', { limit: 200, includeArchived: false });
+        const list = (r.sessions ?? []).map((s) => ({
+          sessionId: s.sessionId,
+          title: String(s.title ?? '').includes('�') ? '' : s.title,
+          status: s.status,
+          mode: s.mode,
+          updatedAt: s.updatedAt,
+          createdAt: s.createdAt,
+          workspacePath:
+            s.workspace?.workspacePath ?? s.workspace?.workspaceKey ?? s.workspacePath ?? '',
+          busy: sessionState(s.sessionId).busy || String(s.status ?? '').toLowerCase() === 'running',
+        }));
+        list.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+        allListCache = { t: now, list };
+        for (const it of list) {
+          if (it.workspacePath) knownWorkspaces.add(path.resolve(it.workspacePath));
+        }
+      }
+      return sendJson(res, 200, { sessions: allListCache.list });
+    }
     const r = await agent.request('session/list', { workspace: workspaceRef(ws), limit: 50, includeArchived: false });
     const list = (r.sessions ?? []).map((s) => ({
       sessionId: s.sessionId,
-      title: s.title,
+      title: String(s.title ?? '').includes('�') ? '' : s.title,
       status: s.status,
       mode: s.mode,
       updatedAt: s.updatedAt,
@@ -653,7 +768,11 @@ async function handleApi(req, res, url) {
     // 账号授权推送（幂等；app-server 重启后同样生效）
     await pushAccountConfig();
     if (sid) {
-      snap = await agent.request('session/resume', { sessionId: sid, workspace: wsRef }, 180000);
+      // resume 不带 workspace = 沿用会话自身所属项目（避免把别的项目会话改绑到当前项目）。
+      // 仅当调用方显式指定项目时才传（新建时必传，用于落点）。
+      const resumeParams = { sessionId: sid };
+      if (String(body.workspace ?? '').trim()) resumeParams.workspace = wsRef;
+      snap = await agent.request('session/resume', resumeParams, 180000);
     } else {
       snap = await agent.request('session/create', {
         workspace: wsRef,
@@ -680,6 +799,14 @@ async function handleApi(req, res, url) {
       title: snap?.session?.title ?? '',
       status: snap?.session?.status ?? 'idle',
       messages: snap?.messages ?? [],
+      // lastSeq：页面首连从此序号只收新事件（历史已由 messages 渲染，重放会重复）
+      lastSeq: sessionState(sid).lastSeq,
+      // 运行态恢复：页面刷新/重开后能立即回到"运行中"并接续计时
+      busy: sessionState(sid).busy,
+      busySince: sessionState(sid).busySince || undefined,
+      // 会话设置（模型列表/思考档位/权限模式/slash 命令/上下文投影）：
+      // 供官方样式的模型选择、思考档位、权限模式菜单与上下文容量卡使用
+      settings: projectSettings(snap),
     });
   }
 
@@ -708,7 +835,10 @@ async function handleApi(req, res, url) {
     }
 
     if (req.method === 'GET' && sub === 'messages') {
-      const r = await agent.request('session/messages', { sessionId: sid, limit: config.maxHistoryMessages });
+      // limit 可由查询参数覆盖：页面轮询用小 limit 轻量探测，变化才全量拉取
+      const limit =
+        Number(url.searchParams.get('limit')) || config.maxHistoryMessages;
+      const r = await agent.request('session/messages', { sessionId: sid, limit });
       return sendJson(res, 200, { messages: r.messages ?? [] });
     }
 
@@ -737,7 +867,9 @@ async function handleApi(req, res, url) {
       if (!content) return sendJson(res, 400, { error: 'content 为空' });
       if (sessionState(sid).busy) return sendJson(res, 409, { error: '当前回合仍在运行，请先停止或等待完成' });
       const r = await agent.request('session/send', { sessionId: sid, content, inputId: crypto.randomUUID() }, 120000);
-      sessionState(sid).busy = true;
+      const st = sessionState(sid);
+      st.busy = true;
+      if (!st.busySince) st.busySince = Date.now();
       return sendJson(res, 200, r);
     }
 
@@ -750,6 +882,63 @@ async function handleApi(req, res, url) {
       const r = await agent.request('session/close', { sessionId: sid }).catch((e) => ({ error: e.message }));
       sessions.delete(sid);
       return sendJson(res, 200, r ?? {});
+    }
+
+    // 会话设置快照（session/read，消息取 1 条保持轻量）：模型菜单/思考档位/权限
+    // 模式/上下文容量实时刷新用
+    if (req.method === 'GET' && sub === 'settings') {
+      try {
+        const r = await agent.request('session/read', { sessionId: sid, messageLimit: 1 });
+        return sendJson(res, 200, projectSettings(r ?? {}));
+      } catch (e) {
+        return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
+      }
+    }
+
+    // 切换模型（对照官方 GLM-5.3-Flash ▾ 菜单）；同时持久化为新会话默认
+    if (req.method === 'POST' && sub === 'model') {
+      const body = await readBody(req);
+      const providerId = String(body.providerId ?? '').trim();
+      const modelId = String(body.modelId ?? '').trim();
+      if (!providerId || !modelId) return sendJson(res, 400, { error: 'providerId / modelId 必填' });
+      const reasoningLevel = String(body.reasoningLevel ?? '').trim();
+      const model = reasoningLevel
+        ? { providerId, modelId, options: { reasoningLevel } }
+        : { providerId, modelId };
+      await agent.request('session/setModel', { sessionId: sid, model });
+      persistModelConfig({ providerId, modelId, reasoningLevel });
+      return sendJson(res, 200, { ok: true, model: modelRefToJson(model) });
+    }
+
+    // 切换思考档位（对照官方 低/高/最高 菜单）
+    if (req.method === 'POST' && sub === 'thoughtLevel') {
+      const body = await readBody(req);
+      const thoughtLevel = String(body.thoughtLevel ?? '').trim();
+      if (!thoughtLevel) return sendJson(res, 400, { error: 'thoughtLevel 必填' });
+      await agent.request('session/setThoughtLevel', { sessionId: sid, thoughtLevel });
+      // 档位并入 config.model 的 $ 后缀，新会话沿用
+      const cur = parseModelSelection(config.model);
+      if (cur) persistModelConfig({ ...cur, reasoningLevel: thoughtLevel });
+      return sendJson(res, 200, { ok: true, thoughtLevel });
+    }
+
+    // 切换权限模式（对照官方 计划/变更前确认/自动编辑/完全访问 菜单）
+    if (req.method === 'POST' && sub === 'mode') {
+      const body = await readBody(req);
+      const mode = String(body.mode ?? '').trim();
+      if (!['plan', 'build', 'edit', 'yolo', 'auto'].includes(mode)) {
+        return sendJson(res, 400, { error: `mode 不支持：${mode}` });
+      }
+      await agent.request('session/setMode', { sessionId: sid, mode });
+      config.mode = mode;
+      saveConfig(config);
+      return sendJson(res, 200, { ok: true, mode });
+    }
+
+    // 压缩上下文（对照官方容量卡的主动收缩入口）
+    if (req.method === 'POST' && sub === 'compact') {
+      const r = await agent.request('session/compact', { sessionId: sid });
+      return sendJson(res, 200, r ?? { ok: true });
     }
   }
 
@@ -768,6 +957,40 @@ async function handleApi(req, res, url) {
     try {
       const r = await agent.request('plugins/setEnabled', { id: body.id, enabled: !!body.enabled });
       return sendJson(res, 200, r ?? { ok: true });
+    } catch (e) {
+      return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
+    }
+  }
+
+  // 技能目录（对照官方「选择技能」$ 菜单；只读引用投影）
+  if (req.method === 'GET' && p === '/api/skills') {
+    try {
+      const r = await agent.request('skills/referenceCatalog', { workspace: workspaceRef(url.searchParams.get('workspace')) });
+      const skills = (r.skills ?? []).map((s) => ({
+        id: s.id, name: s.name, description: s.description ?? '',
+        scope: s.scope ?? '', pluginName: s.pluginName ?? '',
+      }));
+      return sendJson(res, 200, { skills });
+    } catch (e) {
+      return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
+    }
+  }
+
+  // 已保存工作流（对照官方「工作流」菜单；工作区档 + 全局档合并）
+  if (req.method === 'GET' && p === '/api/workflows') {
+    const ws = workspaceRef(url.searchParams.get('workspace'));
+    try {
+      const [proj, glob] = await Promise.all([
+        agent.request('workflows/list', { workspace: ws }).catch(() => ({})),
+        agent.request('workflows/list', { workspace: ws, scope: 'global' }).catch(() => ({})),
+      ]);
+      const merge = (list, scope) => (Array.isArray(list) ? list : []).map((w) => ({
+        name: w.name ?? '', description: w.description ?? '',
+        args: Array.isArray(w.args) ? w.args : [], scope,
+      }));
+      return sendJson(res, 200, {
+        workflows: [...merge(proj.workflows, 'project'), ...merge(glob.workflows, 'global')],
+      });
     } catch (e) {
       return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
     }
