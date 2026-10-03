@@ -2135,13 +2135,13 @@ async function openSession(sessionId, wsPath) {
       curWs = allSessions[0]?.workspacePath ?? workspaces[0]?.path ?? '';
       try { localStorage.setItem('zcode.ws', curWs); } catch { /* 忽略 */ }
     }
-    // 恢复优先级：上次在本页面看的会话（连续性，避免被桌面端的热门会话
-    // 抢走落点）> 运行中的会话（刷新后进度持续可见）> 最近一个（跨项目）
+    // 恢复优先级：运行中的会话（任务进度必须可见，最高优先）>
+    // 上次本页面查看的会话（连续性）> 最近一个（跨项目兜底）
     let lastSid = '';
     try { lastSid = localStorage.getItem('zcode.lastSession') ?? ''; } catch { /* 忽略 */ }
     const target =
-      allSessions.find((s) => s.sessionId === lastSid) ??
       allSessions.find((s) => s.busy) ??
+      allSessions.find((s) => s.sessionId === lastSid) ??
       allSessions[0];
     if (target) await openSession(target.sessionId, target.workspacePath);
     else $('drawer').classList.add('open');
