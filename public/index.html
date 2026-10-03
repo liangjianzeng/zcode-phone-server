@@ -982,7 +982,9 @@ function renderTextPart(m, partId, text) {
   pe.el.textContent = '';
   richText(pe.el, text);
   // 正文里的文件路径 → 可点击 chip
-  const found = String(text).match(/[A-Za-z]:\\[^\s"']{3,}|(\/[\w.\-]+){2,}(\/[\w.\-]+)/g);
+  // 路径字符集排除 CJK 与全角标点：否则"E:\xxx\yyy）中文说明…"会把整段中文
+  // 吞进匹配，误渲染成文件 chip（Windows 路径含中文目录名时放弃识别，可接受）
+  const found = String(text).match(/[A-Za-z]:\\[^\s"'，。；：！？、（）“”‘’\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]{3,}|(\/[\w.\-]+){2,}(\/[\w.\-]+)/g);
   if (found) for (const f of new Set(found).values()) fileChip(pe.el, f);
   return pe;
 }
@@ -1443,6 +1445,8 @@ async function loadPlugins() {
 
 function handleZcodeEvent(ev) {
   lastSseEventAt = Date.now();
+  // 会话守卫：切换会话瞬间旧流的在途事件不得渲染进新会话视图（串台）
+  if (ev.sessionId && curSession && ev.sessionId !== curSession) return;
   // 页面中途打开/刷新时可能错过 turn.started（回合由桌面端等外部驱动）：
   // 收到任何回合内活动事件就恢复运行态，保证进度条/停止按钮/计时可见
   if (!busy && (ev.type === 'part.started' || ev.type === 'part.upserted' ||
@@ -1603,6 +1607,8 @@ function handleZcodeEvent(ev) {
 }
 
 function handleUiEvent(p) {
+  // 会话守卫：异会话的交互事件不渲染进当前视图（串台）
+  if (p.sessionId && curSession && p.sessionId !== curSession) return;
   if (p.kind === 'permission' && p.pending) {
     const card = el('div', 'ask');
     card.appendChild(el('div', 'q', `权限请求：${p.toolName ?? ''} ${p.reason ?? ''}`));
@@ -1813,7 +1819,7 @@ function renderQueue() {
   for (let i = 0; i < sendQueue.length; i++) {
     const pill = el('div', 'qpill');
     pill.appendChild(el('span', 'qarr', '→'));
-    pill.appendChild(el('span', 'qtext', sendQueue[i]));
+    pill.appendChild(el('span', 'qtext', sendQueue[i].text));
     const x = el('button', 'qx', '✕');
     x.addEventListener('click', () => { sendQueue.splice(i, 1); renderQueue(); });
     pill.appendChild(x);
@@ -1821,9 +1827,10 @@ function renderQueue() {
   }
 }
 
-async function doSend(text) {
+async function doSend(text, sid) {
+  const target = sid ?? curSession;
   try {
-    await api(`sessions/${encodeURIComponent(curSession)}/send`, { method: 'POST', body: JSON.stringify({ content: text }) });
+    await api(`sessions/${encodeURIComponent(target)}/send`, { method: 'POST', body: JSON.stringify({ content: text }) });
     busySince = Date.now();
     setBusy(true);
     return true;
@@ -1835,10 +1842,12 @@ async function doSend(text) {
 
 function flushQueue() {
   if (busy || !sendQueue.length || !curSession) return;
-  const text = sendQueue.shift();
+  // 每条排队消息记录入队时的会话：切换会话后补发仍归原会话，
+  // 不会把排队内容误发进后来打开的别的会话（串台）
+  const item = sendQueue.shift();
   renderQueue();
-  doSend(text).then((ok) => {
-    if (!ok) { sendQueue.unshift(text); renderQueue(); }
+  doSend(item.text, item.sid).then((ok) => {
+    if (!ok) { sendQueue.unshift(item); renderQueue(); }
   });
 }
 
@@ -1864,8 +1873,8 @@ async function send() {
     }
   }
   if (busy) {
-    // 运行中：入队，回合结束后自动发出（官方排队交互）
-    sendQueue.push(text);
+    // 运行中：入队（记录入队时的会话），回合结束后自动发回原会话（官方排队交互）
+    sendQueue.push({ text, sid: curSession });
     renderQueue();
     return;
   }
@@ -2051,6 +2060,8 @@ async function openSession(sessionId, wsPath) {
     const r = await api('sessions', { method: 'POST', body: JSON.stringify(body) });
     if (mySeq !== openSeq) return; // 已有更新的打开请求，本次结果作废（防串台）
     curSession = r.sessionId;
+    // 记录本页面最后查看的会话：下次启动优先恢复它（连续性，见 boot）
+    try { localStorage.setItem('zcode.lastSession', curSession); } catch { /* 忽略 */ }
     // 计时基准全部按新会话重置，避免上一会话的静默/收尾状态串线
     lastSseEventAt = Date.now();
     lastActivity = Date.now();
@@ -2124,8 +2135,14 @@ async function openSession(sessionId, wsPath) {
       curWs = allSessions[0]?.workspacePath ?? workspaces[0]?.path ?? '';
       try { localStorage.setItem('zcode.ws', curWs); } catch { /* 忽略 */ }
     }
-    // 优先恢复运行中的会话（页面刷新/重连后进度持续可见）；否则恢复最近一个（跨项目）
-    const target = allSessions.find((s) => s.busy) ?? allSessions[0];
+    // 恢复优先级：上次在本页面看的会话（连续性，避免被桌面端的热门会话
+    // 抢走落点）> 运行中的会话（刷新后进度持续可见）> 最近一个（跨项目）
+    let lastSid = '';
+    try { lastSid = localStorage.getItem('zcode.lastSession') ?? ''; } catch { /* 忽略 */ }
+    const target =
+      allSessions.find((s) => s.sessionId === lastSid) ??
+      allSessions.find((s) => s.busy) ??
+      allSessions[0];
     if (target) await openSession(target.sessionId, target.workspacePath);
     else $('drawer').classList.add('open');
     startPolling();
