@@ -878,7 +878,7 @@ async function send() {
     await api(`sessions/${encodeURIComponent(curSession)}/send`, { method: 'POST', body: JSON.stringify({ content: text }) });
     setBusy(true);
   } catch (e) {
-    toast(`发送失败：${e.message}`);
+    toast(/409|运行/.test(e.message) ? '该会话正在运行（可能桌面端开着它），等它完成或点 ☰ 换个会话' : `发送失败：${e.message}`);
     composer.value = text;
   }
 }
@@ -916,7 +916,10 @@ $('btnStop').addEventListener('click', async () => {
     await api('state');
     await loadWorkspaces();
     const r = await api(`sessions?workspace=${encodeURIComponent(curWs)}`);
-    if (r.sessions?.length) await openSession(r.sessions[0].sessionId);
+    // 自动恢复跳过运行中的会话（多端共享同一引擎：运行中发送会被 409 拒绝，
+    // 例如桌面端正开着的会话）；全部空闲则恢复最近一个
+    const target = r.sessions?.find((s) => !s.busy) ?? r.sessions?.[0];
+    if (target) await openSession(target.sessionId);
     else $('drawer').classList.add('open');
   } catch (e) {
     toast(`初始化失败：${e.message}`);
