@@ -1455,7 +1455,10 @@ function handleZcodeEvent(ev) {
   switch (ev.type) {
     case 'turn.started': {
       const input = ev.payload?.input;
-      if (input && ev.payload?.inputVisibility !== 'hidden') {
+      // 限流自动重试的重发（inputId 带 __retry 标记）：同一内容的用户气泡
+      // 首次失败前已渲染过，跳过回显避免"一条消息连发两个"
+      const isRetryEcho = String(ev.payload?.inputId ?? '').startsWith('__retry');
+      if (input && ev.payload?.inputVisibility !== 'hidden' && !isRetryEcho) {
         const mid = `user-${ev.seq}`;
         const m = ensureMsg(mid, 'user');
         m.bubble.textContent = String(input);
@@ -2033,7 +2036,10 @@ function setSessionTitle(t) {
   $('sessTitle').textContent = t || '未命名会话';
 }
 
+let openSeq = 0; // openSession 代际号：引擎 resume 可达分钟级，快速切换会话时
+                 // 慢响应后到会把别的会话的消息渲染进来（串台），过期结果直接丢弃
 async function openSession(sessionId, wsPath) {
+  const mySeq = ++openSeq;
   try {
     // 打开已有会话：不传 workspace（引擎沿用会话自身所属项目，避免改绑）；
     // 新会话：落点为指定项目/当前项目。
@@ -2043,6 +2049,7 @@ async function openSession(sessionId, wsPath) {
     }
     const body = sessionId ? { sessionId } : { sessionId: null, workspace: curWs };
     const r = await api('sessions', { method: 'POST', body: JSON.stringify(body) });
+    if (mySeq !== openSeq) return; // 已有更新的打开请求，本次结果作废（防串台）
     curSession = r.sessionId;
     // 计时基准全部按新会话重置，避免上一会话的静默/收尾状态串线
     lastSseEventAt = Date.now();

@@ -398,7 +398,9 @@ function scheduleRateLimitRetry(sid, error) {
     const cur = sessionState(sid);
     if (cur.busy || cur.lastSend !== ls) return; // 用户已停止或发了新消息
     try {
-      await agent.request('session/send', { sessionId: sid, content: ls.content, inputId: crypto.randomUUID() }, 120000);
+      // inputId 打 __retry 标记：turn.started 会回带 inputId，页面据此跳过
+      // 用户消息回显（同一内容的气泡第一次失败时已经渲染过，重发不再重复）
+      await agent.request('session/send', { sessionId: sid, content: ls.content, inputId: `__retry-${n}-${crypto.randomUUID()}` }, 120000);
       cur.busy = true;
       if (!cur.busySince) cur.busySince = Date.now();
       pushSse(sid, { __ui: 'note', text: `限流重试（第 ${n} 次）已发出` });
