@@ -1,0 +1,302 @@
+# ZCode 手机端系统 · 模块级设计
+
+> 范围：DSH-Phone App（Flutter）的 **Zcode 模式** 全链路 —— 手机 WebView ↔ SSH 隧道 ↔
+> zcode-phone-server（本仓库）↔ ZCode 引擎（app-server）↔ 模型提供方。
+> 记录截至 2026-10-04 的架构事实、实现方法、踩坑档案与边界。引擎协议依据开源仓库
+> `ref/ZCode`（packages/shared/src/zcode-protocol、apps/zcode-cli/packages/bootstrap）。
+
+---
+
+## 1. 总体架构
+
+```
+┌─ 手机 App (DSH-Phone, Flutter) ────────────────────────────┐
+│  WebView ←— 注入桥脚本（任务状态/成果识别/输入/图片/终端）        │
+│  TunnelService：本地 127.0.0.1:<localPort> 监听               │
+└──────────────┬────────────────────────────────────────────┘
+               │ SSH 本地转发（dartssh2，每条连接现场拨号 direct-tcpip）
+┌──────────────▼────────────────────────────────────────────┐
+│ zcode-phone-server (server.mjs, 零依赖, Node ≥22.5)          │
+│  HTTP/SSE API + token 鉴权 + 会话注册表 + 限流重试              │
+└──────────────┬────────────────────────────────────────────┘
+               │ stdio（ND-JSON 帧 {id,method,params}，无 jsonrpc 字段）
+┌──────────────▼────────────────────────────────────────────┐
+│ zcode.cjs app-server（引擎；config.zcodePath 可指桌面版/开源版）  │
+└──────────────┬────────────────────────────────────────────┘
+               │ HTTPS（凭据：start-plan zcodeJwtToken 直通）
+               ▼  模型提供方（z.ai / bigmodel Coding Plan）
+```
+
+### 1.1 三条决定设计的基础事实
+
+| # | 事实 | 推论 |
+|---|------|------|
+| F1 | **会话存储共享**：桌面端与手机引擎共用 `~/.zcode/cli/db/db.sqlite`（session/message/part/… 表）；消息按**部件粒度**实时落盘 | 任意进程都能读到别人回合的进度（轮询跟随的可行性依据） |
+| F2 | **SSE 事件是进程内的**：引擎只推送自己执行的回合；桌面端驱动的回合对手机引擎不可见 | 旁观回合只能轮询存储跟随，无法拿到实时事件（含 token 流） |
+| F3 | **凭据文件共享**：`~/.zcode/v2/credentials.json`（aes-256-gcm，密钥为机器自包含串） | 手机桥可读取桌面端登录态（oauth token set、standalone key） |
+
+---
+
+## 2. 模块：zcode-phone-server（server.mjs）
+
+### 2.1 配置（config.json，gitignore，首启自动生成 token）
+
+| 字段 | 说明 | 当前值要点 |
+|---|---|---|
+| `port` / `token` | 监听 127.0.0.1:8787；token 鉴权（query/header/cookie） | |
+| `workspacePath` / `workspaces[]` | 主工作区 + 多工作区白名单 | |
+| `mode` / `model` | 新会话权限模式 / 模型选择 `provider/modelId$reasoningLevel` | `account:zai-start-plan/GLM-5.3-Flash$max`（**必须带档位**，引擎强制） |
+| `autoAnswer` | `allow`=自动放行权限/自动选第一项；`ask`=转发手机人工 | |
+| `nodePath` / `zcodePath` | 引擎运行时；当前指**桌面版闭源二进制**（与桌面同凭据机制） | `…/Programs/ZCode/resources/glm/zcode.cjs` |
+| `builtinProviderConfigPath` | 内置 Provider 规则（Registry 的模型目录来源；CLI 自带缓存会缺文件） | 桌面随包 `zcode-builtin.json` |
+
+### 2.2 凭据解析（readCodingPlanApiKey / connectedProviderId）
+
+**优先级（2026-10-04 定稿）**：
+
+1. `config.codingPlanApiKey`（显式配置，当前为空）
+2. **`providerId === 'account:zai-start-plan'`** → 读凭据文件 `zcodejwttoken` 键（387 字节 JWT）。
+   依据官方 `accountProviderRequestAuthService.ts` L73-76：`planKind==='start-plan'` 时
+   `requestAuth.apiKey = tokenSet.zcodeJwtToken`。
+3. 其余 provider（individual-coding-plan）→ standalone 独立计费键
+   `account-provider:coding-plan:<pid>:account:<uuid>:api-key`（**独立计费，账户无余额必报 1113**）
+4. 兜底：任一 `oauth:*:access_token`
+
+**`connectedProviderId()`**：凭据文件存在 `zcodejwttoken` ⇒ 返回 `account:zai-start-plan`；
+否则按 standalone 键命中判定 individual-coding-plan。
+
+**鉴权交互 `interaction/requestProviderRuntimeHeaders`**：
+- JWT（`^eyJ`）→ `{headersApplied: true, requestAuth: {apiKey}}` **直通**（官方同款，实测 200）
+- id.secret → 同上直通（走到按量端点）
+- 无凭据 → `{headersApplied: false, errorMessage}`（引擎报 "Provider runtime headers were not applied"，回合中止）
+
+**授权推送 `pushAccountConfig`**：`provider/updateAccountConfig`，providers.access 仅接受
+`{type:'zhipu-account', entitled:true}`（**strict 校验，多传 accountType/mode 被拒**）；
+planKind 由引擎按 providerId 从内置配置解析。`basedOnZCodeBuiltinRevision` 必须等于
+`zcode-builtin:<revision>:<sha256(内置配置绝对路径)>`，否则 RegistryService **静默跳过**。
+
+### 2.3 引擎桥（ZcodeAgent）
+
+- stdio ND-JSON；响应帧 `{id,result|error}`；通知帧 `session/event`；反向请求必须应答。
+- 反向请求表：`session/requestRuntimePreferences`（关增强/关内存/自动解答）、
+  `requestProviderRuntimeHeaders`（见上）、`interaction/requestPermission`（autoAnswer 分流）、
+  `interaction/requestUserInput`（allow=自动采纳第一项）。
+- 崩溃自动拉起（退避 `2s*count`，上限 15s）；`onReset` 向所有 SSE 订阅者发 `event: reset`。
+
+### 2.4 会话注册表与 SSE 枢纽
+
+```
+sessionState(sid) = { subs:Set<res>, ring:[≤1000], busy, busySince, lastSend, lastSeq }
+```
+
+- `agent.onEvent`：更新 `lastSeq`；`turn.started`→busy=true+busySince；`tool.updated` 且 !busy
+  →busy=true（**外部驱动回合的运行中标记**）；`turn.completed|failed`→复位；
+  `turn.failed`→`scheduleRateLimitRetry`。
+- `pushSse`：常规事件进 ring（重连重放 `afterSeq` 过滤）+ 直播订阅者；
+  **`model.streaming` 例外：只直播不进环**（单回合百余 chunk，进环挤占 ring 且重放语义不对）。
+- 事件语义速查：
+  - `turn.started|completed|failed`：payload 含 `input`/`inputId`/`error`；
+    **`inputId` 可打标记**（重试回显跳过的依据）
+  - `part.started|upserted|delta`：协议部件事件（**legacy 通道回合期间不推文本部件**）
+  - `tool.updated`（kind: scheduled/started/progress/result/error）：工具实时状态
+  - `model.streaming`（**token 级直播**）：`{assistantMessageId, delta, kind: text_delta|reasoning_delta, done}`
+  - `session.updated / titleUpdated / closed`
+- SSE 端点：`GET /api/sessions/:id/stream?afterSeq=` —— 重放 ring + 订阅 + 15s 心跳；
+  `event: zcode`（引擎事件）/`event: ui`（桥注入）/`event: reset`。
+
+### 2.5 HTTP API
+
+| 端点 | 要点 |
+|---|---|
+| `GET /api/state` | workspace/mode/**model**/autoAnswer/agentRunning（页面输入卡模型名来源） |
+| `GET /api/workspaces`、`GET /api/sessions?workspace=|all=1` | 会话列表（含 `busy` 引擎侧标记、updatedAt） |
+| `POST /api/sessions {sessionId?, workspace?}` | create/resume + **subscribe**（legacy 通道必须订阅才有事件）+ setModel（**必须带档位**）；响应含 `lastSeq/busy/busySince`（页面恢复运行态与增量订阅） |
+| `GET /api/sessions/:id/messages?limit=` | limit 可覆盖（页面轻量探测用小值）；`Session is not active` = 未 resume |
+| `GET /api/sessions/:id/stream` | SSE（见上） |
+| `POST …/send|stop|close` | send 记录 `lastSend`（重试依据）；stop 取消待重试 |
+| `GET …/goal|usage|settings`、`GET/POST /api/plugins…` | 计划/用量/设置快照/插件（引擎不支持时 `{unavailable}` 降级） |
+| `POST /api/upload` | 附件落盘 `<workspace>/.zcode-uploads/`，消息以路径引用 |
+| `POST …/model|thoughtLevel|mode` | 会话内切换；model 缺档位时回退当前配置档位 |
+
+### 2.6 限流自动重试（scheduleRateLimitRetry）
+
+- 触发：`turn.failed` 且错误匹配 `/\b429\b|rate[._ ]?limit/i`，且存在 5 分钟内的 `lastSend`。
+- **`NO_RETRY_RE`：`\b1113\b|insufficient balance|…`（余额类）不重试**——重试永远不可能成功，
+  直接推人话提示。
+- 行为：至多 5 次、间隔 20s；重发 `inputId='__retry-<n>-<uuid>'`（页面据此跳过重复回显）；
+  用户 stop / 新发送（lastSend 被替换）即取消。
+
+### 2.7 已知边界（架构级）
+
+- **桌面驱动回合**：无 SSE 事件（F2）、`updatedAt` 不变、engine `status` 恒 idle。
+  页面只能靠轮询存储跟随（部件粒度、秒级），且**无 token 流**。
+- **文本部件回合末才持久化**：流式观感完全依赖 `model.streaming` 直播，断流即丢、后续续流。
+- **sqlite 直写**：清库操作绕过引擎直接删行（先备份、白名单、孤儿清理）；引擎不感知，
+  会话列表以引擎重启后的实时查询为准。
+
+---
+
+## 3. 模块：Web 页面（public/index.html）
+
+### 3.1 渲染模型
+
+| 表 | 键 | 内容 |
+|---|---|---|
+| `msgEls` | messageId | `{el, bubble, parts:Map(partId→part), partEls:Map(partId→{kind,el,…})}` |
+| `toolEls` | toolCallId | `{el(details), state, name, desc, body}` 扁平行：`[icon] 名称 命令摘要 状态图标` |
+| `thinkTimers` | partId | 思考行起始时刻（收尾时结算"持续了 X 秒"） |
+
+- `renderHistory`：全量清建（清 msgEls/toolEls/thinkTimers + 更新 `lastFingerprint`）。
+- `renderTail`：增量渲染消息尾部（复用 ensureMsg/renderTextPart/ensureThink/toolCard），
+  不清历史、不丢滚动——**轮询跟随与完成补绘专用**。
+- `fingerprint`：最后一条 assistant 消息的 `id|role|parts.length|末部件type|status|text长度`。
+- `turnLooksFinished/Running`：最后 assistant 消息末部件是否 `step-finish`。
+- 工具行图标/名称按 toolName 映射（bash→终端、edit→编辑、grep→搜索…）；描述与名字相同则去重。
+
+### 3.2 事件处理（handleZcodeEvent / handleUiEvent）
+
+- **会话守卫**：`ev.sessionId !== curSession` 的事件直接丢弃（切换瞬间旧流在途事件防串台）。
+- `turn.started`：渲染用户回显（`inputId` 带 `__retry` 前缀则跳过——限流重试不重复出消息）。
+- `part.*` / `tool.updated`：部件与工具行增量更新；活动事件触发"运行态推断"（见 3.3）。
+- **`model.streaming`（逐字流式）**：
+  - `reasoning_delta` → `ensureThink(m,'__live-think')` 内容追加；
+  - `text_delta` → `m.partEls['__live-text']` 累积 + richText 全量重绘该 div；
+  - 回合结束 `purgeLiveStream()` 移除 `__live-*` 元素，由存储真实部件接管。
+- `turn.completed/failed`：复位 + 从存储补一次尾部重绘（修正断流期间卡 running 的工具行）
+  + `flushQueue()`；failed 对 1113/429 给人话文案。
+- `ui` 事件：权限批准卡片（批准/拒绝按钮文案匹配 App 审批检测）、`note`（重试提示行）。
+
+### 3.3 运行态状态机（核心不变量：任何运行态都必须能退出）
+
+```
+状态: busy(bool) + busySource('sse'|'inferred'|null)
+时间戳: busySince(计时) lastActivity(存储变化) lastSseEventAt(流事件) finishedSince(收尾稳定)
+```
+
+置位路径：
+1. SSE `turn.started` → `busySource='sse'`
+2. 活动事件推断（`!busy && part/tool 事件`）→ `'inferred'`（错过 turn.started 的旁观回合）
+3. openSession 恢复：server `busy/busySince` → 'sse'；存储末部件非 step-finish → 'inferred'
+4. `doSend` 成功
+
+收敛路径（全部以**存储**为事实源）：
+1. SSE `turn.completed|failed|session.closed`
+2. 轮询：`inferred` 且 step-finish **稳定 6 秒**（多步回合步骤间隙会短暂 step-finish，防误停）
+3. 轮询兜底：busy 且 finished 且 **静默 30 秒**（SSE 无事件 + 存储无变化）→ 强制复位 + 尾部重绘
+   ——覆盖"SSE 断流后 turn.completed 丢失"的永久转圈
+4. 轮询兜底：`inferred` 120 秒无任何变化（回合异常中断）
+
+App 桥（两代并存）：
+- `notifyTaskState(running)` → `callHandler('onTaskState', {state:'running'|'settled', running, sessionId})`
+  （现役 APK 只读 `state`；v2 读 `running`）
+- **哨兵词**：`#turnStatus` 内 `Deep diving` 隐藏 span **仅 busy 期间存在于 DOM**
+  （旧 APK 桥据 `[role=status][aria-live=polite]` 含哨兵词判定；常驻会让 App 永远"任务进行中"）
+
+### 3.4 轮询跟随（1.2s）
+
+- 探测 `messages?limit=10` → 指纹比对 → 变化才 `renderTail`；无变化走收敛判定。
+- `document.hidden` 跳过（WebView 后台暂停定时器，回前台自动补）。
+- `Session is not active` → `ensureResumed()`（30s 冷却，自动 resume 当前会话）。
+- SSE `reset`（服务重启）→ 同样 `ensureResumed()`。
+
+### 3.5 会话管理与串台防线（四道）
+
+1. **openSeq 代际守卫**：引擎 resume 可达分钟级，快速切换时慢响应后到 → 非最新代际的结果
+   直接作废（不渲染、不订阅）。
+2. **事件会话守卫**：见 3.2。
+3. **排队绑定会话**：`sendQueue.push({text, sid})`，补发仍归原会话（`doSend(text, sid)`）。
+4. **boot 恢复优先级**：`busy 会话 > zcode.lastSession > 最近`——
+   任务进度可见性 > 连续性 > 兜底（**顺序不能换**，lastSession 优先曾导致任务不可见的回归）。
+
+openSession 同时：记录 lastSession、重置计时基准、按 server busy/存储恢复运行态、
+`connectStream(sid, r.lastSeq)`（**增量订阅**，历史已渲染，避免全量重放文本重复）。
+
+### 3.6 输入与排队
+
+- 运行中输入 → 入队（绑定会话）→ 回合结束自动发出；队列药丸（官方"→"样式）可删。
+- 附件：App 拍照/分享 → `pickImage(base64)` → 发送时先 `POST /api/upload` 落盘，消息带路径。
+- 发送按钮形态：空闲=紫底↑发送；运行中=■停止（aria-label 同步切换，供语音桥识别）。
+
+### 3.7 必须保持的桥接契约（改动页面时的红线）
+
+| 契约 | 消费方 | 要点 |
+|---|---|---|
+| `[role=status][aria-live=polite]` 含哨兵词 `Deep diving`，**仅运行时存在** | taskBridgeJs（App 熄屏通知） | 常驻=永远"任务进行中" |
+| `.fileMention` class + `title=完整路径` | artifactBridgeJs（成果点击/下载） | |
+| `批准/拒绝` 短按钮文案 | taskBridgeJs 审批检测（≤12 字符正则） | |
+| `window.__dshComposerBridge{insertText,send}` / `__dshPhotoBridge.pickImage` / `__zcode` v2 | App 注入桥 | |
+| `data-composer-card` | artifactBridgeJs 放行 composer 点击 | |
+
+---
+
+## 4. 模块：DSH-Phone App（Flutter 侧，Zcode 模式相关）
+
+### 4.1 TunnelService
+
+- 连接时：SSH 会话 + 本地 `ServerSocket(localPort)`；**每条本地连接现场拨号
+  `client.forwardLocal('127.0.0.1', _activeConfig.remotePort)`** —— 远端端口不在 SSH 会话里固化。
+- `updateActiveConfig(config, profileIndex)`：就地换转发目标端口 → **模式切换免重连**
+  （同实例 DSH 3080 ⇄ Zcode 8787 只是转发目标不同；App 只需重载 WebView 到新地址）。
+- 吞吐：不做应用层节流（曾因"有界背压"计数只增不减限速至 267KB/s，已废弃）。
+
+### 4.2 顶栏
+
+- 模式切换：`IconButton(Icons.swap_horiz, color: Colors.green)`（与顶栏图标同款风格，绿色区分）；
+  `_toggleMode` 保存配置 → `updateActiveConfig` → 重载页面，**不断开 SSH**。
+- 实例切换：`_InstanceChip`（`Icons.dns_outlined` 服务器图标 + 连接状态色点，
+  与模式切换图标区分）；点击弹菜单切换（含未配置跳设置）。
+- 实例展示名 `SSHConfig.label`：别名 > 地址，**无前缀**（曾有的 `[Z]` 前缀已去除）。
+
+### 4.3 注入桥（webview_bridges.dart，每次导航后重注）
+
+| 桥 | 功能 | 页面侧配合 |
+|---|---|---|
+| taskBridgeJs | 扫 `[role=status]` 哨兵词 → running/settled；扫描批准按钮 → approval | 哨兵词仅运行时存在；`.ask` 卡片按钮文案匹配 |
+| artifactBridgeJs | 点击成果（代码块/fileMention/路径文本）→ 查看/下载 | `.fileMention`+title、`data-composer-card` 放行 |
+| composerBridgeJs | 找输入框注入/点发送 | 发送按钮 aria-label="发送/停止" |
+| photoBridgeJs | base64 → File → drop 进附件槽 | 页面 `pickImage` 接住（非 DSH drop 路径） |
+| terminalBridgeJs | xterm 按键条 | Zcode 页面无终端，仅 DSH 模式 |
+
+`onTaskState` handler：`state` 字段 → TaskNotifier（running 常驻通知 / settled 完成通知 /
+approval 高优通知）。页面 v2 通知与 DOM 桥**双通道并存**，通知 id 相同自然去重。
+
+---
+
+## 5. 问题档案（现象 → 根因 → 修复 → 验证）
+
+| # | 现象 | 根因 | 修复 | 验证 |
+|---|---|---|---|---|
+| 1 | App 永远"任务进行中"，完成无通知 | 页面哨兵词常驻 DOM + v2 通知 `{running}` 格式 App 不认（只认 `{state}`） | 哨兵随 busy 出现/消失；通知双格式 | 熄屏通知状态与任务同步 |
+| 2 | 刷新后看不到运行中任务 | boot 跳过 busy 会话 | 优先 busy；响应带 `busy/busySince/lastSeq` | 刷新即恢复运行态+计时 |
+| 3 | 流式文本重复 | SSE 全量重放 delta 叠加 | 增量订阅（lastSeq）+ 重连 resync | 长回合无重复 |
+| 4 | 换 z.ai 账户后建会话直接失败 | config.model 还指 bigmodel provider | 改 `account:zai-start-plan/GLM-5.3-Flash$max` | create 200 |
+| 5 | 推理报 `1113 Insufficient balance` | standalone 独立计费 key 无余额；订阅额度挂在 oauth 凭据 | 凭据优先级改 start-plan `zcodejwttoken` | 推理 200 |
+| 6 | "start-plan 无法复刻"（JWT 401 / defer 挂起） | 401 测试错用普通 access_token；defer 让引擎等不到 headers | 用 `zcodejwttoken` 直通（官方 L73-76） | 全链路 turn.completed |
+| 7 | 一条消息连发两条 | 429 重试重发产生第二条回显 | `__retry` inputId + 页面跳过回显 | 单发单条 |
+| 8 | 会话历史串台 | ① openSession 竞态（慢响应后到覆盖）②排队补发进错误会话 ③旧流在途事件泄漏 ④boot 落点漂移 | 代际守卫 / 排队绑定会话 / 事件会话守卫 / busy>lastSession>最近 | A→B 竞态测试稳定停 B；截图场景复现链路全堵 |
+| 9 | 任务完成后永久转圈 | SSE 断流后 completed 丢失，`busySource='sse'` 使轮询跳过收尾；工具行卡 running | 存储事实源自愈：finished+静默30s 强制复位+补绘；completed 后补绘 | E2E busy true→false 收敛 |
+| 10 | lastSession 优先导致任务不可见（#8 修复的回归） | 优先级顺序错误 | 恢复 busy 最优先 | 重载落在 busy 会话 |
+| 11 | 正文出现紫色碎片 chip | 路径正则贪婪吞中文 | 字符集排除 CJK/全角 | 中文后缀不再匹配 |
+| 12 | 服务重启后页面刷 `Session is not active` | 引擎丢会话、页面不重连 | ensureResumed（30s 冷却）+ reset 自动重连 | 重启后自愈 |
+| 13 | 无流式输出（等回合结束一次性出） | `model.streaming` token 直播未被消费；文本部件回合末才落盘 | 页面消费 token 直播；服务端流式不进环 | 正文 11→128→234→278 字逐段增长 |
+
+---
+
+## 6. 验证方法库（本仓库迭代用）
+
+- **SSE 捕获**：`curl -N …/stream?afterSeq=-1` 后台挂 45-60s，统计事件类型/时间分布。
+- **页面状态采样**：浏览器 evaluate 读 `busySource/busy/lastFingerprint/msgCount/DOM 文本长度`。
+- **竞态测试**：`openSession(A); openSession(B)` 不 await，断言最终停在 B 且首条消息一致。
+- **存储手术**：动 `~/.zcode/cli/db/db.sqlite` 前**必须备份三件套**（db/-wal/-shm），
+  白名单删除 + 孤儿行清理 + 残留复查；注意引擎 JSON 可能转义中文（LIKE 匹配假阴性，
+  用 API 层解析定位再按 id 删）。
+- **回归红线**：改动页面后核对 3.7 桥接契约表；改动 boot 后核对 3.5 优先级顺序。
+
+## 7. 待办与风险
+
+- **桌面驱动回合非流式**（F2 架构边界）：仅秒级跟随；若需对齐官方需直连桌面进程（外部合作）。
+- `session/list` 的 `updatedAt` 对外部回合静止：列表级"运行中"识别依赖引擎侧 busy 推断
+  （tool.updated 到达才置位）；引擎重启后、首轮工具事件前不可见。
+- 双代 App 桥并存：APK 全量升级到 v2 后可移除 DOM 哨兵兼容（保留亦无害）。
+- sqlite 直写维护脚本未沉淀为工具，手工操作需遵守第 6 节红线。
+- `model.streaming` 直播不进环：断流重连后正文从断点续流，断点前文本待回合结束由存储补齐。
