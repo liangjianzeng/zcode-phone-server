@@ -166,7 +166,7 @@
   #drawer .sheet .head b { flex:1; }
   /* 右侧信息面板（用量/插件）从右滑出 */
   #info .sheet {
-    position: absolute; right: 0; top: 0; bottom: 0; width: min(86vw, 360px);
+    position: absolute; right: 0; top: 0; bottom: 0; width: min(94vw, 440px);
     background: var(--panel); border-left: 1px solid var(--line);
     display: flex; flex-direction: column;
   }
@@ -503,43 +503,68 @@ async function loadPlan() {
     const r = await api(`sessions/${encodeURIComponent(curSession)}/goal`);
     const body = $('planBody');
     const text = typeof r === 'string' ? r : (r.goal ?? r.response ?? r.text ?? r.plan ?? (r.unavailable ? '' : ''));
-    if (!text || /no goal is set/i.test(text)) { $('planCard').style.display = 'none'; return; }
-    body.textContent = text;
+    const snap = r.snapshot ?? {};
+    const used = snap.contextUsed, win = snap.contextWindow;
+    if ((!text || /no goal is set/i.test(text)) && !(used > 0)) { $('planCard').style.display = 'none'; return; }
+    body.textContent = /no goal is set/i.test(text ?? '') ? '（本轮尚未设定目标）' : (text || '（暂无）');
+    if (win > 0) {
+      const bar = el('div');
+      bar.style.cssText = 'margin-top:8px;';
+      const pct = Math.min(100, Math.round((used / win) * 100));
+      bar.innerHTML = `<div style="font-size:11.5px;color:var(--dim);margin-bottom:3px;">上下文占用 ${used ?? 0} / ${win} tokens（${pct}%）</div>` +
+        `<div style="height:6px;border-radius:3px;background:var(--line);overflow:hidden;"><div style="height:100%;width:${pct}%;background:${pct > 80 ? 'var(--err)' : 'var(--accent)'};"></div></div>`;
+      body.appendChild(bar);
+    }
     $('planCard').style.display = 'block';
   } catch { $('planCard').style.display = 'none'; }
 }
 
 function renderKvList(obj) {
+  // 展平所有层级：嵌套对象以 a.b.c 键名内联展示，不丢任何字段
   const body = $('infoBody');
   body.textContent = '';
-  const entries = Object.entries(obj ?? {});
-  if (!entries.length) { body.appendChild(el('div', 'sysline', '暂无数据')); return; }
-  for (const [k, v] of entries) {
-    if (v && typeof v === 'object') continue;
+  const rows = [];
+  const walk = (o, prefix) => {
+    for (const [k, v] of Object.entries(o ?? {})) {
+      const key = prefix ? `${prefix}.${k}` : k;
+      if (v && typeof v === 'object') walk(v, key);
+      else rows.push([key, String(v)]);
+    }
+  };
+  walk(obj, '');
+  if (!rows.length) { body.appendChild(el('div', 'sysline', '暂无数据')); return; }
+  for (const [k, v] of rows) {
     const row = el('div', 'kv');
     row.appendChild(el('div', 'k', k));
-    row.appendChild(el('div', 'v', String(v)));
+    row.appendChild(el('div', 'v', v));
     body.appendChild(row);
-  }
-  const nested = entries.filter(([, v]) => v && typeof v === 'object');
-  for (const [k, v] of nested) {
-    body.appendChild(el('div', 'sect', k));
-    const pre = el('pre'); pre.style.cssText = 'margin:4px 12px;font-size:12px;color:var(--dim);white-space:pre-wrap;';
-    pre.textContent = JSON.stringify(v, null, 1).slice(0, 3000);
-    body.appendChild(pre);
   }
 }
 
-async function loadUsage() {
-  $('infoTitle').textContent = '⚡ 用量 / 缓存';
-  $('infoBody').textContent = '';
-  $('infoBody').appendChild(el('div', 'sysline', '加载中…'));
+async function loadUsage(silent = false) {
+  if (!silent) {
+    $('infoTitle').textContent = '⚡ 用量 / 缓存';
+    $('infoBody').textContent = '';
+    $('infoBody').appendChild(el('div', 'sysline', '加载中…'));
+  }
   try {
     const r = await api(`sessions/${encodeURIComponent(curSession)}/usage`);
     if (r.unavailable) { renderKvList({ 状态: `引擎暂不支持：${r.unavailable}` }); return; }
     renderKvList(r);
-  } catch (e) { renderKvList({ 错误: e.message }); }
+  } catch (e) { if (!silent) renderKvList({ 错误: e.message }); }
 }
+
+// 回合进行中实时刷新已打开的用量面板与计划卡片
+let liveTimer = null;
+function startLiveTimers() {
+  stopLiveTimers();
+  liveTimer = setInterval(() => {
+    if (!busy) { stopLiveTimers(); return; }
+    if ($('info').classList.contains('open')) loadUsage(true);
+    loadPlan();
+  }, 5000);
+}
+function stopLiveTimers() { if (liveTimer) { clearInterval(liveTimer); liveTimer = null; } }
 
 async function loadPlugins() {
   $('infoTitle').textContent = '⧩ 插件';
@@ -585,6 +610,7 @@ function handleZcodeEvent(ev) {
       }
       setBusy(true);
       notifyApp('onTaskState', { running: true, sessionId: curSession });
+      startLiveTimers();
       break;
     }
     case 'part.started':
@@ -645,12 +671,17 @@ function handleZcodeEvent(ev) {
     }
     case 'turn.completed':
       setBusy(false);
+      stopLiveTimers();
       notifyApp('onTaskState', { running: false, sessionId: curSession });
       loadPlan();
+      loadUsage(true);
+      loadSessionList();
       break;
     case 'turn.failed': {
       setBusy(false);
+      stopLiveTimers();
       notifyApp('onTaskState', { running: false, sessionId: curSession });
+      loadUsage(true);
       const e = el('div', 'errline', `回合失败：${ev.payload?.error ?? '未知错误'}`);
       chat.appendChild(e); scrollBottom();
       break;
