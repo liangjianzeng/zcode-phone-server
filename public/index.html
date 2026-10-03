@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>ZCode Phone</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --card: #1c2333; --line: #2d333b;
+    --fg: #e6edf3; --dim: #8b949e; --accent: #4f8cc9; --ok: #3fb950; --warn: #d29922; --err: #f85149;
+    --bubble-user: #1f4e79; --bubble-ai: #1c2333;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 5; padding-top: calc(10px + env(safe-area-inset-top));
+  }
+  header h1 { font-size: 16px; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header button { flex: none; }
+  main { flex: 1; overflow-y: auto; padding: 12px 12px 8px; scroll-behavior: smooth; }
+
+  .msg { margin: 8px 0; display: flex; }
+  .msg.user { justify-content: flex-end; }
+  .bubble {
+    max-width: 86%; border-radius: 14px; padding: 9px 12px;
+    background: var(--bubble-ai); border: 1px solid var(--line);
+    word-break: break-word; overflow-wrap: anywhere;
+  }
+  .msg.user .bubble { background: var(--bubble-user); border-color: #2b5f8f; }
+  .bubble pre {
+    background: #0a0e14; border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px; overflow-x: auto; font-size: 12.5px; margin: 6px 0;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .bubble code.inline { background: #0a0e14; padding: 1px 5px; border-radius: 5px; font-size: 13px; }
+
+  /* 工具调用卡片 */
+  .tool {
+    border: 1px solid var(--line); border-radius: 10px; background: var(--card);
+    margin: 6px 0; font-size: 13px; overflow: hidden;
+  }
+  .tool > summary {
+    list-style: none; cursor: pointer; padding: 7px 10px;
+    display: flex; gap: 8px; align-items: center;
+  }
+  .tool > summary::-webkit-details-marker { display: none; }
+  .tool .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .tool.running .dot { background: var(--warn); animation: pulse 1s infinite; }
+  .tool.completed .dot { background: var(--ok); }
+  .tool.error .dot, .tool.failed .dot { background: var(--err); }
+  .tool.pending .dot { background: var(--dim); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .tool .tname { font-weight: 600; }
+  .tool .tdesc { color: var(--dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tool .tbody { padding: 0 10px 9px; color: var(--dim); font-size: 12.5px; }
+  .tool .tbody pre { max-height: 200px; overflow: auto; margin: 4px 0; }
+
+  /* DSH-Phone 桥兼容标记：成果 chip（artifactBridgeJs 识别 class 含 fileMention + title=完整路径） */
+  .fileMention {
+    display: inline-block; margin: 2px 4px 2px 0; padding: 3px 10px; border-radius: 999px;
+    border: 1px solid var(--accent); color: #9ecbff; background: rgba(79,140,201,.12);
+    font-size: 12.5px;
+  }
+  .errline { color: var(--err); font-size: 13px; margin: 6px 0; }
+  .sysline { color: var(--dim); font-size: 12.5px; text-align: center; margin: 6px 0; }
+
+  /* 运行状态条 —— DSH taskBridgeJs 兼容：role=status + aria-live=polite + 哨兵词 "Deep diving" */
+  #turnStatus {
+    display: none; align-items: center; gap: 8px; margin: 4px 12px; padding: 6px 12px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    color: var(--warn); font-size: 13px;
+  }
+  #turnStatus.on { display: flex; }
+
+  footer {
+    border-top: 1px solid var(--line); background: var(--panel);
+    padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+  }
+  .composer { display: flex; gap: 8px; align-items: flex-end; }
+  textarea#composer {
+    flex: 1; resize: none; background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 12px; padding: 9px 12px;
+    font: inherit; min-height: 42px; max-height: 140px; outline: none;
+  }
+  button {
+    background: var(--card); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 10px; padding: 8px 14px; font: inherit; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: transparent; border-color: var(--err); color: var(--err); }
+  button:disabled { opacity: .45; }
+
+  /* 会话抽屉 */
+  #drawer {
+    position: fixed; inset: 0; background: rgba(0,0,0,.5); display: none; z-index: 20;
+  }
+  #drawer.open { display: block; }
+  #drawer .sheet {
+    position: absolute; left: 0; top: 0; bottom: 0; width: min(82vw, 340px);
+    background: var(--panel); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column;
+  }
+  #drawer .sheet .head { padding: 14px; border-bottom: 1px solid var(--line); display:flex; gap:8px; align-items:center; }
+  #drawer .sheet .head b { flex:1; }
+  #sessList { flex: 1; overflow-y: auto; padding: 8px; }
+  .sess {
+    padding: 10px 12px; border-radius: 10px; margin: 4px 0; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .sess:active, .sess.cur { background: var(--card); border-color: var(--line); }
+  .sess .t { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess .m { font-size: 12px; color: var(--dim); display: flex; gap: 8px; }
+  .sess .busy { color: var(--warn); }
+
+  /* 提问卡片（AskUserQuestion） */
+  .ask {
+    border: 1px solid var(--warn); border-radius: 12px; background: rgba(210,153,34,.08);
+    padding: 10px 12px; margin: 8px 0; font-size: 13.5px;
+  }
+  .ask .q { margin: 4px 0 8px; }
+  .ask button { margin: 2px 6px 2px 0; padding: 5px 12px; border-radius: 999px; font-size: 12.5px; }
+  .toast {
+    position: fixed; left: 50%; transform: translateX(-50%); bottom: 90px;
+    background: #2b333d; border: 1px solid var(--line); color: var(--fg);
+    padding: 8px 16px; border-radius: 10px; z-index: 50; font-size: 13px; display: none;
+    max-width: 86vw; text-align: center;
+  }
+</style>
+</head>
+<body>
+<header>
+  <button id="btnMenu">☰</button>
+  <h1 id="title">ZCode Phone</h1>
+  <button id="btnStop" class="danger" style="display:none">停止</button>
+</header>
+
+<div id="turnStatus" role="status" aria-live="polite">Deep diving · 任务进行中…</div>
+<main id="chat"></main>
+
+<footer>
+  <div class="composer">
+    <textarea id="composer" rows="1" placeholder="输入任务，回车发送"></textarea>
+    <button id="btnSend" class="primary">发送</button>
+  </div>
+</footer>
+
+<div id="drawer">
+  <div class="sheet">
+    <div class="head"><b>会话</b><button id="btnNew" class="primary">＋ 新会话</button><button id="btnClose">✕</button></div>
+    <div id="sessList"><div class="sysline">加载中…</div></div>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+
+<script>
+'use strict';
+// token 通过 URL ?token= 携带（与 DSH-Phone 的访问方式一致），API 调用原样透传。
+const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
+const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
+
+const $ = (id) => document.getElementById(id);
+const chat = $('chat'), composer = $('composer');
+
+let curSession = null;      // 当前 sessionId
+let es = null;              // EventSource
+let busy = false;
+// 渲染模型：messageId → {role, el, parts: Map(partId → el)}
+// 工具卡片单独维护：toolCallId → {el, status}
+const msgEls = new Map();
+const toolEls = new Map();
+
+function toast(msg, ms = 2200) {
+  const t = $('toast'); t.textContent = msg; t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(() => (t.style.display = 'none'), ms);
+}
+
+async function api(p, opts = {}) {
+  const r = await fetch(API(p), { headers: { 'Content-Type': 'application/json' }, ...opts });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error ?? `HTTP ${r.status}`);
+  return data;
+}
+
+function scrollBottom() { requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; }); }
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+// 极简富文本：转义 + 反引号代码块/行内码，其余纯文本（安全优先，不引外部库）
+function richText(container, text) {
+  const parts = String(text).split(/```/);
+  parts.forEach((seg, i) => {
+    if (i % 2 === 1) { // 代码块：首行语言名丢弃
+      const pre = el('pre');
+      pre.textContent = seg.replace(/^[a-zA-Z0-9_+-]*\n/, '');
+      container.appendChild(pre);
+    } else {
+      const lines = seg.split('\n');
+      lines.forEach((line, j) => {
+        if (j) container.appendChild(document.createElement('br'));
+        // 行内代码
+        const pieces = line.split(/`([^`]+)`/);
+        pieces.forEach((pc, k) => {
+          if (k % 2 === 1) { const c = el('code', 'inline', pc); container.appendChild(c); }
+          else container.appendChild(document.createTextNode(pc));
+        });
+      });
+    }
+  });
+}
+
+function setBusy(on) {
+  busy = on;
+  $('turnStatus').classList.toggle('on', on);
+  $('btnStop').style.display = on ? '' : 'none';
+  $('btnSend').disabled = on;
+}
+
+// ── 消息渲染 ──
+
+function ensureMsg(messageId, role) {
+  let m = msgEls.get(messageId);
+  if (m) return m;
+  const wrap = el('div', `msg ${role}`);
+  const bubble = el('div', 'bubble');
+  wrap.appendChild(bubble);
+  chat.appendChild(wrap);
+  m = { el: wrap, bubble, parts: new Map() };
+  msgEls.set(messageId, m);
+  scrollBottom();
+  return m;
+}
+
+function toolCard(toolCallId, toolName, desc) {
+  let t = toolEls.get(toolCallId);
+  if (t) return t;
+  const details = document.createElement('details');
+  details.className = 'tool pending';
+  const summary = document.createElement('summary');
+  const dot = el('span', 'dot');
+  const name = el('span', 'tname', toolName ?? 'tool');
+  const d = el('span', 'tdesc', desc ?? '');
+  summary.append(dot, name, d);
+  const body = el('div', 'tbody');
+  details.append(summary, body);
+  chat.appendChild(details);
+  t = { el: details, dot, desc: d, body };
+  toolEls.set(toolCallId, t);
+  scrollBottom();
+  return t;
+}
+
+function setToolStatus(toolCallId, status, desc, detail) {
+  const t = toolEls.get(toolCallId);
+  if (!t) return;
+  t.el.className = `tool ${status}`;
+  if (desc !== undefined) t.desc.textContent = desc;
+  if (detail !== undefined) {
+    t.body.textContent = '';
+    const pre = el('pre'); pre.textContent = String(detail).slice(0, 4000);
+    t.body.appendChild(pre);
+  }
+  scrollBottom();
+}
+
+// DSH 桥兼容：文件 chip（class 含 fileMention，title = 完整路径）
+function fileChip(container, p) {
+  const name = p.split(/[\\/]/).pop() ?? p;
+  const b = el('button', 'fileMention', name);
+  b.setAttribute('title', p);
+  b.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    toast(`文件：${p}`);
+  });
+  container.appendChild(b);
+}
+
+function renderTextPart(bubble, part) {
+  const div = el('div');
+  richText(div, part.text ?? '');
+  // 识别正文里的文件路径 → 渲染为可点击 chip
+  const re = /[A-Za-z]:\\[^\s"']{3,}|(\/[\w.\-]+){2,}(\/[\w.\-]+)/g;
+  const text = part.text ?? '';
+  const found = text.match(re);
+  if (found) for (const f of new Set(found).values()) fileChip(div, f);
+  bubble.appendChild(div);
+}
+
+// 历史消息（/session/messages 的 MessageWithParts）
+function renderHistory(messages) {
+  chat.textContent = '';
+  msgEls.clear(); toolEls.clear();
+  for (const msg of messages) {
+    const role = msg.info?.role ?? 'assistant';
+    const mid = String(msg.info?.messageId ?? msg.info?.id ?? Math.random());
+    const m = ensureMsg(mid, role === 'user' ? 'user' : 'assistant');
+    for (const part of msg.parts ?? []) {
+      switch (part.type) {
+        case 'text': renderTextPart(m.bubble, part); break;
+        case 'reasoning': { const r = el('div', 'sysline', '（思考过程已省略）'); m.bubble.appendChild(r); break; }
+        case 'tool': {
+          const st = part.state ?? {};
+          const card = toolCard(part.callId, part.tool, st.title ?? '');
+          const status = st.status ?? 'pending';
+          const detail = status === 'error' ? st.error : st.output;
+          card.el.className = `tool ${status}`;
+          if (detail) { const pre = el('pre'); pre.textContent = String(detail).slice(0, 4000); card.body.appendChild(pre); }
+          // 工具的 Write/Edit 目标文件 → chip
+          const fp = st?.input?.file_path ?? st?.input?.filePath ?? st?.input?.path;
+          if (fp) fileChip(card.body, String(fp));
+          break;
+        }
+        default: break;
+      }
+    }
+  }
+  scrollBottom();
+}
+
+// ── 实时事件处理 ──
+
+function handleZcodeEvent(ev) {
+  switch (ev.type) {
+    case 'turn.started': {
+      const input = ev.payload?.input;
+      if (input && ev.payload?.inputVisibility !== 'hidden') {
+        const mid = `user-${ev.seq}`;
+        const m = ensureMsg(mid, 'user');
+        m.bubble.textContent = String(input);
+        scrollBottom();
+      }
+      setBusy(true);
+      break;
+    }
+    case 'part.started':
+    case 'part.upserted': {
+      const part = ev.payload?.part;
+      if (!part?.messageId) break;
+      const m = ensureMsg(String(part.messageId), 'assistant');
+      m.parts.set(part.partId, part);
+      if (part.type === 'text') renderTextPart(m.bubble, part);
+      else if (part.type === 'tool') {
+        const st = part.state ?? {};
+        toolCard(part.callId, part.tool, st.title ?? '');
+        setToolStatus(part.callId, st.status ?? 'pending', st.title, st.status === 'error' ? st.error : st.output);
+      }
+      scrollBottom();
+      break;
+    }
+    case 'part.delta': {
+      const { messageId, partId, field, delta } = ev.payload ?? {};
+      if (!delta) break;
+      const m = msgEls.get(String(messageId));
+      if (m && field === 'text') {
+        const p = m.parts.get(partId) ?? {};
+        p.text = (p.text ?? '') + delta;
+        m.parts.set(partId, p);
+        // 流式期间只更新最后一个 text div（简化：每次全量重渲染该 part）
+        const last = m.bubble.lastChild;
+        if (last && last.__partId === partId) {
+          last.textContent = '';
+          richText(last, p.text);
+        } else {
+          const div = el('div'); div.__partId = partId;
+          richText(div, p.text);
+          m.bubble.appendChild(div);
+        }
+        scrollBottom();
+      }
+      break;
+    }
+    case 'tool.updated': {
+      const p = ev.payload ?? {};
+      if (p.kind === 'batch') break;
+      const id = p.toolCallId;
+      const desc = p.toolName ?? '';
+      toolCard(id, desc, '');
+      if (p.kind === 'scheduled') setToolStatus(id, 'pending', desc, p.input ? JSON.stringify(p.input, null, 1) : undefined);
+      if (p.kind === 'started') setToolStatus(id, 'running', desc, p.input ? JSON.stringify(p.input, null, 1) : undefined);
+      if (p.kind === 'progress') setToolStatus(id, 'running', desc, p.stdoutTail ?? p.stderrTail ?? p.outputPreview);
+      if (p.kind === 'result') {
+        setToolStatus(id, 'completed', desc, typeof p.result === 'string' ? p.result : JSON.stringify(p.result, null, 1));
+        // Write/Edit 结果带文件路径 → chip
+        const s = JSON.stringify(p.result ?? {});
+        const fp = s.match(/"(?:file_path|filePath|path)":"([^"]+)"/);
+        if (fp) fileChip(toolEls.get(id)?.body ?? chat, fp[1]);
+      }
+      if (p.kind === 'error') setToolStatus(id, 'error', desc, p.error ? JSON.stringify(p.error, null, 1) : undefined);
+      break;
+    }
+    case 'turn.completed': setBusy(false); break;
+    case 'turn.failed': {
+      setBusy(false);
+      const e = el('div', 'errline', `回合失败：${ev.payload?.error ?? '未知错误'}`);
+      chat.appendChild(e); scrollBottom();
+      break;
+    }
+    case 'permission.requested': {
+      // autoAnswer=ask 时才会看到；渲染批准卡片（按钮文案匹配 DSH approval 检测）
+      const card = el('div', 'ask');
+      card.appendChild(el('div', 'q', `请求权限：${ev.payload?.toolName ?? ''}（${ev.payload?.riskLevel ?? ''}） ${ev.payload?.reason ?? ''}`));
+      const ok = el('button', 'primary', '批准');
+      const no = el('button', 'danger', '拒绝');
+      ok.addEventListener('click', () => answerInteraction(ev.payload?.requestId, { decision: 'allow' }, card));
+      no.addEventListener('click', () => answerInteraction(ev.payload?.requestId, { decision: 'deny', reason: '用户拒绝' }, card));
+      card.append(ok, no);
+      chat.appendChild(card); scrollBottom();
+      break;
+    }
+    case 'userInput.requested': {
+      const p = ev.payload ?? {};
+      const card = el('div', 'ask');
+      card.appendChild(el('div', 'q', p.prompt ?? p.questions?.[0]?.question ?? 'Agent 提问'));
+      for (const q of p.questions ?? []) {
+        for (const opt of q.options ?? []) {
+          const b = el('button', '', opt.label ?? opt.value);
+          b.addEventListener('click', () => answerInteraction(p.requestId, { action: 'accept', content: { answer: opt.value } }, card));
+          card.appendChild(b);
+        }
+      }
+      chat.appendChild(card); scrollBottom();
+      break;
+    }
+    case 'session.closed': {
+      setBusy(false);
+      toast('会话已关闭');
+      break;
+    }
+    default: break;
+  }
+}
+
+function handleUiEvent(p) {
+  if (p.kind === 'permission' && p.pending) {
+    const card = el('div', 'ask');
+    card.appendChild(el('div', 'q', `权限请求：${p.toolName ?? ''} ${p.reason ?? ''}`));
+    const ok = el('button', 'primary', '批准');
+    const no = el('button', 'danger', '拒绝');
+    ok.addEventListener('click', () => answerInteraction(p.requestId, { decision: 'allow' }, card));
+    no.addEventListener('click', () => answerInteraction(p.requestId, { decision: 'deny', reason: '用户拒绝' }, card));
+    card.append(ok, no);
+    chat.appendChild(card); scrollBottom();
+  }
+  if (p.expired) toast('交互请求已超时自动拒绝');
+}
+
+async function answerInteraction(requestId, answer, card) {
+  try {
+    await api(`interactions/${encodeURIComponent(requestId)}`, { method: 'POST', body: JSON.stringify(answer) });
+    if (card) card.remove();
+  } catch (e) { toast(`应答失败：${e.message}`); }
+}
+
+// ── SSE 连接 ──
+
+function connectStream(sessionId, afterSeq = -1) {
+  if (es) { es.close(); es = null; }
+  es = new EventSource(`/api/sessions/${encodeURIComponent(sessionId)}/stream?afterSeq=${afterSeq}&token=${encodeURIComponent(TOKEN)}`);
+  es.addEventListener('zcode', (e) => { try { handleZcodeEvent(JSON.parse(e.data)); } catch {} });
+  es.addEventListener('ui', (e) => { try { handleUiEvent(JSON.parse(e.data)); } catch {} });
+  es.addEventListener('reset', () => { toast('服务已重启，请重新打开会话'); setBusy(false); });
+  es.onerror = () => { /* EventSource 自动重连 */ };
+}
+
+// ── 会话管理 ──
+
+async function openSession(sessionId) {
+  try {
+    const r = await api('sessions', { method: 'POST', body: JSON.stringify(sessionId ? { sessionId } : {}) });
+    curSession = r.sessionId;
+    renderHistory(r.messages ?? []);
+    connectStream(curSession, -1);
+    $('drawer').classList.remove('open');
+    toast(sessionId ? '已恢复会话' : '新会话已创建');
+    loadSessionList();
+  } catch (e) {
+    toast(`打开会话失败：${e.message}`);
+  }
+}
+
+async function loadSessionList() {
+  const box = $('sessList');
+  try {
+    const r = await api('sessions');
+    box.textContent = '';
+    if (!r.sessions?.length) { box.appendChild(el('div', 'sysline', '还没有会话')); return; }
+    for (const s of r.sessions) {
+      const item = el('div', 'sess' + (s.sessionId === curSession ? ' cur' : ''));
+      const t = el('div', 't', s.title || s.sessionId);
+      const m = el('div', 'm');
+      const st = s.busy || s.status === 'running' ? el('span', 'busy', '● 运行中') : el('span', '', s.status ?? '');
+      const time = s.updatedAt ? new Date(s.updatedAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+      m.append(st, el('span', '', time));
+      item.append(t, m);
+      item.addEventListener('click', () => openSession(s.sessionId));
+      box.appendChild(item);
+    }
+  } catch (e) {
+    box.textContent = '';
+    box.appendChild(el('div', 'errline', `加载失败：${e.message}`));
+  }
+}
+
+// ── 发送 ──
+
+async function send() {
+  const text = composer.value.trim();
+  if (!text || !curSession || busy) return;
+  composer.value = '';
+  composer.style.height = 'auto';
+  try {
+    await api(`sessions/${encodeURIComponent(curSession)}/send`, { method: 'POST', body: JSON.stringify({ content: text }) });
+    setBusy(true);
+  } catch (e) {
+    toast(`发送失败：${e.message}`);
+    composer.value = text;
+  }
+}
+
+// ── 事件绑定 ──
+
+$('btnSend').addEventListener('click', send);
+composer.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+});
+composer.addEventListener('input', () => {
+  composer.style.height = 'auto';
+  composer.style.height = Math.min(composer.scrollHeight, 140) + 'px';
+});
+$('btnMenu').addEventListener('click', () => { loadSessionList(); $('drawer').classList.add('open'); });
+$('btnClose').addEventListener('click', () => $('drawer').classList.remove('open'));
+$('drawer').addEventListener('click', (e) => { if (e.target.id === 'drawer') $('drawer').classList.remove('open'); });
+$('btnNew').addEventListener('click', () => openSession(null));
+$('btnStop').addEventListener('click', async () => {
+  if (!curSession) return;
+  try { await api(`sessions/${encodeURIComponent(curSession)}/stop`, { method: 'POST', body: '{}' }); toast('已请求停止'); }
+  catch (e) { toast(`停止失败：${e.message}`); }
+});
+
+// ── 启动：自动恢复最近会话 ──
+
+(async function boot() {
+  try {
+    const st = await api('state');
+    document.title = 'ZCode Phone';
+    const r = await api('sessions');
+    if (r.sessions?.length) await openSession(r.sessions[0].sessionId);
+    else $('drawer').classList.add('open');
+  } catch (e) {
+    toast(`初始化失败：${e.message}`);
+    $('drawer').classList.add('open');
+  }
+})();
+</script>
+</body>
+</html>
