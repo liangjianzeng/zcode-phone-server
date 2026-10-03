@@ -22,6 +22,7 @@
 
 import { spawn } from 'node:child_process';
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -650,6 +651,53 @@ function readCodingPlanApiKey(providerId) {
 }
 
 /**
+ * z.ai 计费端点调用助手（GET/POST JSON）。
+ * 必须用 node:https + agent:false（每次新建连接）——全局 fetch(undici) 的
+ * 连接池在 z.ai 端 RST 后会被污染，此后所有请求报 "fetch failed"（2026-10-04 实测）。
+ */
+function zaiBillingRequest(pathAndQuery, { method = 'GET', body } = {}) {
+  return new Promise((resolve, reject) => {
+    const key = readCodingPlanApiKey(connectedProviderId());
+    if (!key) return reject(new Error('no coding plan api key'));
+    const u = new URL(pathAndQuery.startsWith('http') ? pathAndQuery : 'https://zcode.z.ai' + pathAndQuery);
+    const payload = method === 'POST' && body != null ? JSON.stringify(body) : null;
+    const req = https.request({
+      hostname: u.hostname,
+      port: 443,
+      path: u.pathname + u.search,
+      method,
+      agent: false,
+      timeout: 15000,
+      headers: {
+        authorization: `Bearer ${key}`,
+        accept: 'application/json',
+        ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}),
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+/** 套餐概览缓存（billing/current 返回含 grant_units/有效期；5 分钟内直接复用）。 */
+let planOverviewCache = { at: 0, data: null };
+async function fetchPlanOverview() {
+  if (planOverviewCache.data && Date.now() - planOverviewCache.at < 300000) return planOverviewCache.data;
+  const r = await zaiBillingRequest('/api/v1/zcode-plan/billing/current');
+  if (r.status !== 200) throw new Error(`billing/current ${r.status}: ${r.body.slice(0, 120)}`);
+  const j = JSON.parse(r.body);
+  if (j.code !== 0) throw new Error(`billing/current code=${j.code} ${j.msg ?? ''}`.slice(0, 160));
+  planOverviewCache = { at: Date.now(), data: j.data ?? {} };
+  return planOverviewCache.data;
+}
+
+/**
  * 把账号授权推送给 agent（等价桌面 host 的 provider/updateAccountConfig）。
  * providers 仅含 access 覆盖（config/schema.ts accountProviderConfigSchema）；
  * states 中 entitled 的 builtin provider 必须带 current 布尔。
@@ -1052,6 +1100,49 @@ async function handleApi(req, res, url) {
       }));
       return sendJson(res, 200, {
         workflows: [...merge(proj.workflows, 'project'), ...merge(glob.workflows, 'global')],
+      });
+    } catch (e) {
+      return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
+    }
+  }
+
+  // 套餐概览（z.ai billing/current：套餐名/状态/额度/有效期；5 分钟缓存）
+  if (req.method === 'GET' && p === '/api/plan') {
+    try {
+      const d = await fetchPlanOverview();
+      const plans = (d.plans ?? []).map((pl) => ({
+        name: pl.name ?? '',
+        planId: pl.plan_id ?? '',
+        status: pl.status ?? '',
+        startsAt: pl.starts_at ?? 0,
+        endsAt: pl.ends_at ?? 0,
+        entitlements: (pl.entitlements ?? []).map((en) => ({
+          model: en.show_name ?? '',
+          grantUnits: en.grant_units ?? 0,
+          unitType: en.unit_type ?? '',
+          period: en.period ?? '',
+        })),
+      }));
+      return sendJson(res, 200, { plans });
+    } catch (e) {
+      return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
+    }
+  }
+
+  // 本机用量统计（agent-db，与桌面端共用同一 sqlite：含桌面端驱动的会话）
+  if (req.method === 'GET' && p === '/api/usage-stats') {
+    const range = ['all', '7d', '30d'].includes(url.searchParams.get('range')) ? url.searchParams.get('range') : '7d';
+    try {
+      const r = await agent.request('usage/stats', { range });
+      const s = r?.summary ?? {};
+      return sendJson(res, 200, {
+        range: r?.range ?? range,
+        totalTokens: s.totalTokens ?? 0,
+        inputTokens: s.inputTokens ?? 0,
+        outputTokens: s.outputTokens ?? 0,
+        cacheReadTokens: s.cacheReadTokens ?? 0,
+        totalSessions: s.totalSessions ?? 0,
+        totalTurns: s.totalTurns ?? 0,
       });
     } catch (e) {
       return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
