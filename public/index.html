@@ -403,6 +403,7 @@
     <div class="sheetbody">
       <div class="sect">项目 / 会话</div>
       <div id="projList"><div class="sysline">加载中…</div></div>
+      <div class="sysline" id="pageBuild" style="padding:14px 0 6px;"></div>
     </div>
   </div>
 </div>
@@ -420,6 +421,9 @@
 'use strict';
 // token 通过 URL ?token= 携带，API 调用原样透传。
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
+// 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
+// 服务端修复长期无法到达终端；新页面有此标记=代码最新）
+const PAGE_BUILD = '2026-10-04.1';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -2176,7 +2180,7 @@ async function openSession(sessionId, wsPath) {
       curWs = allSessions[0]?.workspacePath ?? workspaces[0]?.path ?? '';
       try { localStorage.setItem('zcode.ws', curWs); } catch { /* 忽略 */ }
     }
-    // 恢复优先级：运行中的会话（任务进度必须可见，最高优先）>
+    // 优先级：运行中的会话（任务进度必须可见，最高优先）>
     // 上次本页面查看的会话（连续性）> 最近一个（跨项目兜底）
     let lastSid = '';
     try { lastSid = localStorage.getItem('zcode.lastSession') ?? ''; } catch { /* 忽略 */ }
@@ -2185,7 +2189,15 @@ async function openSession(sessionId, wsPath) {
       allSessions.find((s) => s.sessionId === lastSid) ??
       allSessions[0];
     if (target) await openSession(target.sessionId, target.workspacePath);
-    else $('drawer').classList.add('open');
+    // 目标会话打开失败（如已被清理）：清掉失效记忆并回退到最近会话
+    if (curSession !== (target?.sessionId ?? '')) {
+      try { localStorage.removeItem('zcode.lastSession'); } catch { /* 忽略 */ }
+      const fallback = allSessions.find((s) => s.sessionId !== target?.sessionId);
+      if (fallback) await openSession(fallback.sessionId, fallback.workspacePath);
+    }
+    if (!curSession) $('drawer').classList.add('open');
+    const pb = $('pageBuild');
+    if (pb) pb.textContent = '页面版本 ' + PAGE_BUILD;
     startPolling();
   } catch (e) {
     toast(`初始化失败：${e.message}`);
