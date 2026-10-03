@@ -668,6 +668,26 @@ async function handleApi(req, res, url) {
     const sid = decodeURIComponent(seg[2]);
     const sub = seg[3];
 
+    // 计划/目标（容错：引擎方法参数不符时返回 unavailable，前端优雅降级）
+    if (req.method === 'GET' && sub === 'goal') {
+      try {
+        const r = await agent.request('session/goal', { sessionId: sid, action: 'show' });
+        return sendJson(res, 200, r ?? {});
+      } catch (e) {
+        return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
+      }
+    }
+
+    // 会话用量（token/缓存/成本，形状以引擎返回为准）
+    if (req.method === 'GET' && sub === 'usage') {
+      try {
+        const r = await agent.request('session/usage', { sessionId: sid });
+        return sendJson(res, 200, r ?? {});
+      } catch (e) {
+        return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
+      }
+    }
+
     if (req.method === 'GET' && sub === 'messages') {
       const r = await agent.request('session/messages', { sessionId: sid, limit: config.maxHistoryMessages });
       return sendJson(res, 200, { messages: r.messages ?? [] });
@@ -711,6 +731,26 @@ async function handleApi(req, res, url) {
       const r = await agent.request('session/close', { sessionId: sid }).catch((e) => ({ error: e.message }));
       sessions.delete(sid);
       return sendJson(res, 200, r ?? {});
+    }
+  }
+
+  if (req.method === 'GET' && p === '/api/plugins') {
+    // 插件清单（只读 + 启停）；引擎不支持时优雅降级
+    try {
+      const r = await agent.request('plugins/list', { workspace: workspaceRef(url.searchParams.get('workspace')) });
+      return sendJson(res, 200, r ?? {});
+    } catch (e) {
+      return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
+    }
+  }
+
+  if (req.method === 'POST' && p === '/api/plugins/setEnabled') {
+    const body = await readBody(req);
+    try {
+      const r = await agent.request('plugins/setEnabled', { id: body.id, enabled: !!body.enabled });
+      return sendJson(res, 200, r ?? { ok: true });
+    } catch (e) {
+      return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
     }
   }
 

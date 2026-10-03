@@ -23,8 +23,6 @@
     .fileMention { color: #0550ae; }
     .toast { background: #ffffff; }
   }
-  /* 桥哨兵词容器：对用户不可见，但 textContent 仍含哨兵词（旧版 App 桥检测用） */
-  .vh { position: absolute; left: -9999px; top: auto; width: 1px; height: 1px; overflow: hidden; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { height: 100%; }
   body {
@@ -32,18 +30,46 @@
     font: 15px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
     display: flex; flex-direction: column;
   }
+  /* 桥哨兵词容器：对用户不可见，但 textContent 仍含哨兵词（旧版 App 桥检测用） */
+  .vh { position: absolute; left: -9999px; top: auto; width: 1px; height: 1px; overflow: hidden; }
+
+  /* ── 顶栏：ZCode 品牌 ── */
   header {
     display: flex; align-items: center; gap: 8px; padding: 10px 12px;
     background: var(--panel); border-bottom: 1px solid var(--line);
     position: sticky; top: 0; z-index: 5; padding-top: calc(10px + env(safe-area-inset-top));
   }
-  header h1 { font-size: 16px; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  header button { flex: none; }
+  .brand { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+  .zbadge {
+    width: 26px; height: 26px; border-radius: 8px; flex: none;
+    background: linear-gradient(135deg, var(--accent), #7c5cff);
+    color: #fff; font-weight: 700; font-size: 15px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .brand .t { font-size: 16px; font-weight: 650; white-space: nowrap; }
+  .brand .ws {
+    font-size: 11.5px; color: var(--dim); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; max-width: 30vw;
+  }
   header select {
-    flex: none; max-width: 34vw; background: var(--card); color: var(--fg);
+    flex: none; max-width: 30vw; background: var(--card); color: var(--fg);
     border: 1px solid var(--line); border-radius: 8px; padding: 6px 4px; font: inherit; font-size: 12.5px;
   }
+  header button { flex: none; }
+  header .iconbtn { padding: 6px 10px; }
   main { flex: 1; overflow-y: auto; padding: 12px 12px 8px; scroll-behavior: smooth; }
+
+  /* ── 空态首屏： unmistakable Zcode ── */
+  .hero { display: flex; flex-direction: column; align-items: center; gap: 10px; margin: 14vh auto 0; color: var(--dim); }
+  .hero .bigz {
+    width: 64px; height: 64px; border-radius: 20px;
+    background: linear-gradient(135deg, var(--accent), #7c5cff);
+    color: #fff; font-size: 36px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 6px 24px rgba(79,140,201,.35);
+  }
+  .hero .t1 { font-size: 20px; font-weight: 650; color: var(--fg); }
+  .hero .t2 { font-size: 13px; }
 
   .msg { margin: 8px 0; display: flex; }
   .msg.user { justify-content: flex-end; }
@@ -81,7 +107,7 @@
   .tool .tbody { padding: 0 10px 9px; color: var(--dim); font-size: 12.5px; }
   .tool .tbody pre { max-height: 200px; overflow: auto; margin: 4px 0; }
 
-  /* DSH-Phone 桥兼容标记：成果 chip（artifactBridgeJs 识别 class 含 fileMention + title=完整路径） */
+  /* App 桥兼容标记：成果 chip（artifactBridgeJs 识别 class 含 fileMention + title=完整路径） */
   .fileMention {
     display: inline-block; margin: 2px 4px 2px 0; padding: 3px 10px; border-radius: 999px;
     border: 1px solid var(--accent); color: #9ecbff; background: rgba(79,140,201,.12);
@@ -90,13 +116,25 @@
   .errline { color: var(--err); font-size: 13px; margin: 6px 0; }
   .sysline { color: var(--dim); font-size: 12.5px; text-align: center; margin: 6px 0; }
 
-  /* 运行状态条 —— DSH taskBridgeJs 兼容：role=status + aria-live=polite + 哨兵词 "Deep diving" */
+  /* 运行状态条 —— 旧版 App 桥兼容：role=status + aria-live=polite + 隐藏哨兵词 "Deep diving" */
   #turnStatus {
     display: none; align-items: center; gap: 8px; margin: 4px 12px; padding: 6px 12px;
     background: var(--card); border: 1px solid var(--line); border-radius: 10px;
     color: var(--warn); font-size: 13px;
   }
   #turnStatus.on { display: flex; }
+
+  /* ── 计划卡片 ── */
+  #planCard {
+    margin: 4px 12px 0; border: 1px solid var(--line); border-radius: 12px;
+    background: var(--card); font-size: 13px; overflow: hidden; display: none;
+  }
+  #planCard > summary {
+    list-style: none; cursor: pointer; padding: 8px 12px;
+    display: flex; align-items: center; gap: 8px; font-weight: 600;
+  }
+  #planCard > summary::-webkit-details-marker { display: none; }
+  #planCard .pbody { padding: 0 12px 10px; color: var(--dim); white-space: pre-wrap; max-height: 40vh; overflow: auto; }
 
   footer {
     border-top: 1px solid var(--line); background: var(--panel);
@@ -116,11 +154,9 @@
   button.danger { background: transparent; border-color: var(--err); color: var(--err); }
   button:disabled { opacity: .45; }
 
-  /* 会话抽屉 */
-  #drawer {
-    position: fixed; inset: 0; background: rgba(0,0,0,.5); display: none; z-index: 20;
-  }
-  #drawer.open { display: block; }
+  /* ── 抽屉（会话/工作区主导航）与信息面板 ── */
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: none; z-index: 20; }
+  .overlay.open { display: block; }
   #drawer .sheet {
     position: absolute; left: 0; top: 0; bottom: 0; width: min(82vw, 340px);
     background: var(--panel); border-right: 1px solid var(--line);
@@ -128,7 +164,24 @@
   }
   #drawer .sheet .head { padding: 14px; border-bottom: 1px solid var(--line); display:flex; gap:8px; align-items:center; }
   #drawer .sheet .head b { flex:1; }
-  #sessList { flex: 1; overflow-y: auto; padding: 8px; }
+  /* 右侧信息面板（用量/插件）从右滑出 */
+  #info .sheet {
+    position: absolute; right: 0; top: 0; bottom: 0; width: min(86vw, 360px);
+    background: var(--panel); border-left: 1px solid var(--line);
+    display: flex; flex-direction: column;
+  }
+  #info .sheet .head { padding: 14px; border-bottom: 1px solid var(--line); display:flex; gap:8px; align-items:center; }
+  #info .sheet .head b { flex:1; }
+  .sheetbody { flex: 1; overflow-y: auto; padding: 8px; }
+  .wsrow {
+    display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-radius: 10px;
+    margin: 3px 0; cursor: pointer; border: 1px solid transparent; font-size: 13.5px;
+  }
+  .wsrow.cur { background: var(--card); border-color: var(--accent); }
+  .wsrow .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
+  .wsrow.cur .dot { background: var(--ok); }
+  .wsrow .p { color: var(--dim); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sect { padding: 10px 12px 4px; font-size: 12px; color: var(--dim); font-weight: 600; letter-spacing: .04em; }
   .sess {
     padding: 10px 12px; border-radius: 10px; margin: 4px 0; cursor: pointer;
     border: 1px solid transparent;
@@ -137,6 +190,15 @@
   .sess .t { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sess .m { font-size: 12px; color: var(--dim); display: flex; gap: 8px; }
   .sess .busy { color: var(--warn); }
+  .kv { display: flex; gap: 10px; padding: 6px 12px; font-size: 13px; border-bottom: 1px solid var(--line); }
+  .kv .k { color: var(--dim); width: 42%; flex: none; overflow: hidden; text-overflow: ellipsis; }
+  .kv .v { flex: 1; word-break: break-all; }
+  .plug {
+    display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+    border-bottom: 1px solid var(--line); font-size: 13.5px;
+  }
+  .plug .n { flex: 1; min-width: 0; }
+  .plug .d { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* 提问卡片（AskUserQuestion） */
   .ask {
@@ -155,15 +217,28 @@
 </head>
 <body>
 <header>
-  <button id="btnMenu">☰</button>
-  <h1 id="title">ZCode Phone</h1>
+  <button id="btnMenu" class="iconbtn" title="会话与工作区">☰</button>
+  <div class="brand">
+    <div class="zbadge">Z</div>
+    <div style="min-width:0">
+      <div class="t">ZCode</div>
+      <div class="ws" id="wsLabel"></div>
+    </div>
+  </div>
   <select id="wsSel" title="工作区" style="display:none"></select>
-  <button id="btnNewTop" title="新建会话">＋</button>
+  <button id="btnUsage" class="iconbtn" title="用量/缓存">⚡</button>
+  <button id="btnPlugins" class="iconbtn" title="插件">⧩</button>
+  <button id="btnNewTop" class="iconbtn" title="新建会话">＋</button>
   <button id="btnStop" class="danger" style="display:none">停止</button>
 </header>
 
+<details id="planCard">
+  <summary><span>📋 计划</span><span id="planHint" style="color:var(--dim);font-weight:400;font-size:12px;"></span></summary>
+  <div class="pbody" id="planBody">（暂无）</div>
+</details>
+
 <div id="turnStatus" role="status" aria-live="polite">ZCode 工作中 · 任务进行中…<span class="vh">Deep diving</span></div>
-<main id="chat"></main>
+<main id="chat"><div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2" id="heroTip">选择一个工作区，下达你的第一个任务</div></div></main>
 
 <footer>
   <div id="attachBar" style="display:none;align-items:center;gap:8px;margin:0 0 6px;padding:6px 10px;background:var(--card);border:1px solid var(--line);border-radius:10px;font-size:12.5px;">
@@ -171,22 +246,36 @@
     <button id="attachClear" style="padding:2px 8px;">✕</button>
   </div>
   <div class="composer">
-    <textarea id="composer" rows="1" placeholder="输入任务，回车发送"></textarea>
+    <textarea id="composer" rows="1" placeholder="给 ZCode 下达任务，回车发送"></textarea>
     <button id="btnSend" class="primary">发送</button>
   </div>
 </footer>
 
-<div id="drawer">
+<!-- 主导航抽屉：工作区 + 会话 -->
+<div id="drawer" class="overlay">
   <div class="sheet">
-    <div class="head"><b>会话</b><button id="btnNew" class="primary">＋ 新会话</button><button id="btnClose">✕</button></div>
-    <div id="sessList"><div class="sysline">加载中…</div></div>
+    <div class="head"><b>工作区 / 会话</b><button id="btnNew" class="primary">＋ 新会话</button><button id="btnClose">✕</button></div>
+    <div class="sheetbody">
+      <div class="sect">工作区</div>
+      <div id="wsList"><div class="sysline">加载中…</div></div>
+      <div class="sect">会话（当前工作区）</div>
+      <div id="sessList"><div class="sysline">加载中…</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- 信息面板：用量 / 插件 -->
+<div id="info" class="overlay">
+  <div class="sheet">
+    <div class="head"><b id="infoTitle">用量</b><button id="btnInfoClose">✕</button></div>
+    <div class="sheetbody" id="infoBody"><div class="sysline">加载中…</div></div>
   </div>
 </div>
 <div id="toast" class="toast"></div>
 
 <script>
 'use strict';
-// token 通过 URL ?token= 携带（与 DSH-Phone 的访问方式一致），API 调用原样透传。
+// token 通过 URL ?token= 携带，API 调用原样透传。
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
@@ -304,6 +393,8 @@ function setBusy(on) {
 function ensureMsg(messageId, role) {
   let m = msgEls.get(messageId);
   if (m) return m;
+  const hero = chat.querySelector('.hero');
+  if (hero) hero.remove();
   const wrap = el('div', `msg ${role}`);
   const bubble = el('div', 'bubble');
   wrap.appendChild(bubble);
@@ -346,7 +437,7 @@ function setToolStatus(toolCallId, status, desc, detail) {
   scrollBottom();
 }
 
-// DSH 桥兼容：文件 chip（class 含 fileMention，title = 完整路径）
+// App 桥兼容：文件 chip（class 含 fileMention，title = 完整路径）
 function fileChip(container, p) {
   const name = p.split(/[\\/]/).pop() ?? p;
   const b = el('button', 'fileMention', name);
@@ -373,6 +464,10 @@ function renderTextPart(bubble, part) {
 function renderHistory(messages) {
   chat.textContent = '';
   msgEls.clear(); toolEls.clear();
+  if (!messages.length) {
+    chat.innerHTML = '<div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2">这个会话还没有消息</div></div>';
+    return;
+  }
   for (const msg of messages) {
     const role = msg.info?.role ?? 'assistant';
     const mid = String(msg.info?.messageId ?? msg.info?.id ?? Math.random());
@@ -398,6 +493,82 @@ function renderHistory(messages) {
     }
   }
   scrollBottom();
+}
+
+// ── 计划卡片 / 用量 / 插件（引擎能力，端点容错降级）──
+
+async function loadPlan() {
+  if (!curSession) return;
+  try {
+    const r = await api(`sessions/${encodeURIComponent(curSession)}/goal`);
+    const body = $('planBody');
+    const text = typeof r === 'string' ? r : (r.goal ?? r.response ?? r.text ?? r.plan ?? (r.unavailable ? '' : ''));
+    if (!text || /no goal is set/i.test(text)) { $('planCard').style.display = 'none'; return; }
+    body.textContent = text;
+    $('planCard').style.display = 'block';
+  } catch { $('planCard').style.display = 'none'; }
+}
+
+function renderKvList(obj) {
+  const body = $('infoBody');
+  body.textContent = '';
+  const entries = Object.entries(obj ?? {});
+  if (!entries.length) { body.appendChild(el('div', 'sysline', '暂无数据')); return; }
+  for (const [k, v] of entries) {
+    if (v && typeof v === 'object') continue;
+    const row = el('div', 'kv');
+    row.appendChild(el('div', 'k', k));
+    row.appendChild(el('div', 'v', String(v)));
+    body.appendChild(row);
+  }
+  const nested = entries.filter(([, v]) => v && typeof v === 'object');
+  for (const [k, v] of nested) {
+    body.appendChild(el('div', 'sect', k));
+    const pre = el('pre'); pre.style.cssText = 'margin:4px 12px;font-size:12px;color:var(--dim);white-space:pre-wrap;';
+    pre.textContent = JSON.stringify(v, null, 1).slice(0, 3000);
+    body.appendChild(pre);
+  }
+}
+
+async function loadUsage() {
+  $('infoTitle').textContent = '⚡ 用量 / 缓存';
+  $('infoBody').textContent = '';
+  $('infoBody').appendChild(el('div', 'sysline', '加载中…'));
+  try {
+    const r = await api(`sessions/${encodeURIComponent(curSession)}/usage`);
+    if (r.unavailable) { renderKvList({ 状态: `引擎暂不支持：${r.unavailable}` }); return; }
+    renderKvList(r);
+  } catch (e) { renderKvList({ 错误: e.message }); }
+}
+
+async function loadPlugins() {
+  $('infoTitle').textContent = '⧩ 插件';
+  $('infoBody').textContent = '';
+  $('infoBody').appendChild(el('div', 'sysline', '加载中…'));
+  try {
+    const r = await api('plugins');
+    if (r.unavailable) { renderKvList({ 状态: `引擎暂不支持：${r.unavailable}` }); return; }
+    const list = r.plugins ?? r.items ?? [];
+    const body = $('infoBody');
+    body.textContent = '';
+    if (!Array.isArray(list) || !list.length) { body.appendChild(el('div', 'sysline', '暂无插件')); return; }
+    for (const p of list) {
+      const row = el('div', 'plug');
+      const n = el('div', 'n');
+      n.appendChild(el('div', '', p.name ?? p.id ?? p.pluginId ?? ''));
+      n.appendChild(el('div', 'd', p.description ?? p.version ?? ''));
+      const on = p.enabled ?? p.installed ?? false;
+      const btn = el('button', on ? '' : 'primary', on ? '停用' : '启用');
+      btn.addEventListener('click', async () => {
+        try {
+          await api('plugins/setEnabled', { method: 'POST', body: JSON.stringify({ id: p.id ?? p.pluginId ?? p.name, enabled: !on }) });
+          loadPlugins();
+        } catch (e) { toast(`操作失败：${e.message}`); }
+      });
+      row.append(n, btn);
+      body.appendChild(row);
+    }
+  } catch (e) { renderKvList({ 错误: e.message }); }
 }
 
 // ── 实时事件处理 ──
@@ -475,6 +646,7 @@ function handleZcodeEvent(ev) {
     case 'turn.completed':
       setBusy(false);
       notifyApp('onTaskState', { running: false, sessionId: curSession });
+      loadPlan();
       break;
     case 'turn.failed': {
       setBusy(false);
@@ -550,6 +722,67 @@ function connectStream(sessionId, afterSeq = -1) {
   es.onerror = () => { /* EventSource 自动重连 */ };
 }
 
+// ── 工作区 ──
+
+let workspaces = [];   // [{name, path}]
+let curWs = localStorage.getItem('zcode.ws') ?? '';
+
+function wsDisplayName(w) { return w.name || w.path.split(/[\\/]/).pop() || w.path; }
+function renderWsList() {
+  const box = $('wsList');
+  box.textContent = '';
+  for (const w of workspaces) {
+    const row = el('div', 'wsrow' + (w.path === curWs ? ' cur' : ''));
+    row.appendChild(el('span', 'dot'));
+    const t = el('div');
+    t.appendChild(el('div', '', wsDisplayName(w)));
+    t.appendChild(el('div', 'p', w.path));
+    row.appendChild(t);
+    row.addEventListener('click', () => {
+      curWs = w.path;
+      localStorage.setItem('zcode.ws', curWs);
+      renderWsList();
+      syncWsControls();
+      loadSessionList();
+      toast('工作区：' + wsDisplayName(w));
+    });
+    box.appendChild(row);
+  }
+}
+
+function syncWsControls() {
+  const cur = workspaces.find((w) => w.path === curWs);
+  $('wsLabel').textContent = cur ? wsDisplayName(cur) : '';
+  const sel = $('wsSel');
+  sel.textContent = '';
+  for (const w of workspaces) {
+    const o = document.createElement('option');
+    o.value = w.path;
+    o.textContent = wsDisplayName(w);
+    sel.appendChild(o);
+  }
+  sel.value = curWs;
+  sel.style.display = workspaces.length > 1 ? '' : 'none';
+}
+
+async function loadWorkspaces() {
+  try {
+    const r = await api('workspaces');
+    workspaces = r.workspaces ?? [];
+  } catch { workspaces = []; }
+  if (!workspaces.some((w) => w.path === curWs)) curWs = workspaces[0]?.path ?? '';
+  renderWsList();
+  syncWsControls();
+  // 兼容旧选择器（隐藏备用）
+  const sel = $('wsSel');
+  sel.onchange = () => {
+    curWs = sel.value;
+    localStorage.setItem('zcode.ws', curWs);
+    renderWsList();
+    loadSessionList();
+  };
+}
+
 // ── 会话管理 ──
 
 async function openSession(sessionId) {
@@ -561,6 +794,7 @@ async function openSession(sessionId) {
     $('drawer').classList.remove('open');
     toast(sessionId ? '已恢复会话' : '新会话已创建');
     loadSessionList();
+    loadPlan();
   } catch (e) {
     toast(`打开会话失败：${e.message}`);
   }
@@ -571,7 +805,7 @@ async function loadSessionList() {
   try {
     const r = await api(`sessions?workspace=${encodeURIComponent(curWs)}`);
     box.textContent = '';
-    if (!r.sessions?.length) { box.appendChild(el('div', 'sysline', '还没有会话')); return; }
+    if (!r.sessions?.length) { box.appendChild(el('div', 'sysline', '这个工作区还没有会话')); return; }
     for (const s of r.sessions) {
       const item = el('div', 'sess' + (s.sessionId === curSession ? ' cur' : ''));
       const t = el('div', 't', s.title || s.sessionId);
@@ -587,35 +821,6 @@ async function loadSessionList() {
     box.textContent = '';
     box.appendChild(el('div', 'errline', `加载失败：${e.message}`));
   }
-}
-
-// ── 工作区 ──
-
-let workspaces = [];   // [{name, path}]
-let curWs = localStorage.getItem('zcode.ws') ?? '';
-
-async function loadWorkspaces() {
-  try {
-    const r = await api('workspaces');
-    workspaces = r.workspaces ?? [];
-  } catch { workspaces = []; }
-  if (!workspaces.some((w) => w.path === curWs)) curWs = workspaces[0]?.path ?? '';
-  const sel = $('wsSel');
-  sel.textContent = '';
-  for (const w of workspaces) {
-    const o = document.createElement('option');
-    o.value = w.path;
-    o.textContent = w.name || w.path.split(/[\\/]/).pop() || w.path;
-    sel.appendChild(o);
-  }
-  sel.value = curWs;
-  sel.style.display = workspaces.length > 1 ? '' : 'none';
-  sel.onchange = () => {
-    curWs = sel.value;
-    localStorage.setItem('zcode.ws', curWs);
-    loadSessionList();
-    toast('工作区：' + (workspaces.find((w) => w.path === curWs)?.name ?? curWs));
-  };
 }
 
 // ── 发送 ──
@@ -657,12 +862,16 @@ composer.addEventListener('input', () => {
   composer.style.height = 'auto';
   composer.style.height = Math.min(composer.scrollHeight, 140) + 'px';
 });
-$('btnMenu').addEventListener('click', () => { loadSessionList(); $('drawer').classList.add('open'); });
+$('btnMenu').addEventListener('click', () => { renderWsList(); loadSessionList(); $('drawer').classList.add('open'); });
 $('btnClose').addEventListener('click', () => $('drawer').classList.remove('open'));
 $('drawer').addEventListener('click', (e) => { if (e.target.id === 'drawer') $('drawer').classList.remove('open'); });
 $('btnNew').addEventListener('click', () => openSession(null));
 $('btnNewTop').addEventListener('click', () => openSession(null));
 $('attachClear').addEventListener('click', clearAttach);
+$('btnUsage').addEventListener('click', () => { $('info').classList.add('open'); loadUsage(); });
+$('btnPlugins').addEventListener('click', () => { $('info').classList.add('open'); loadPlugins(); });
+$('btnInfoClose').addEventListener('click', () => $('info').classList.remove('open'));
+$('info').addEventListener('click', (e) => { if (e.target.id === 'info') $('info').classList.remove('open'); });
 $('btnStop').addEventListener('click', async () => {
   if (!curSession) return;
   try { await api(`sessions/${encodeURIComponent(curSession)}/stop`, { method: 'POST', body: '{}' }); toast('已请求停止'); }
@@ -673,8 +882,7 @@ $('btnStop').addEventListener('click', async () => {
 
 (async function boot() {
   try {
-    const st = await api('state');
-    document.title = 'ZCode Phone';
+    await api('state');
     await loadWorkspaces();
     const r = await api(`sessions?workspace=${encodeURIComponent(curWs)}`);
     if (r.sessions?.length) await openSession(r.sessions[0].sessionId);
