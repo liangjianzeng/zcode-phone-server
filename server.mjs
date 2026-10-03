@@ -41,12 +41,23 @@ const DEFAULT_CONFIG = {
   token: '',
   /** ZCode 会话的工作目录（手机端聊天的项目根）。 */
   workspacePath: ROOT,
+  /**
+   * 多工作区列表（[{name, path}]）：页面顶栏可切换，新建会话落在所选工作区。
+   * 空数组 = 只有上面单一 workspacePath 可用。
+   */
+  workspaces: [],
   /** 新建会话的权限模式：plan | build | edit | yolo。 */
   mode: 'yolo',
   /** 新会话使用的模型（providerId/modelId$reasoningLevel，provider 取第一个 "/" 前，档位取 "$" 后）。 */
   model: 'account:bigmodel-individual-coding-plan/GLM-5.3-Flash$max',
   /** agent 反向交互（权限/提问）自动应答：allow=自动放行；ask=转发手机端人工处理。 */
   autoAnswer: 'allow',
+  /**
+   * Coding Plan API Key（id.secret 形态，引擎 V4 请求签名必需）。
+   * 桌面端 oauth 的 access_token（JWT）只能完成授权推送，跑不了推理；
+   * 在 https://bigmodel.cn/usercenter/proj-mgmt/apikeys 创建后粘贴到这里。
+   */
+  codingPlanApiKey: '',
   /** 运行 zcode.cjs 的 Node 可执行文件（引擎需要 Node ≥22.5 的 node:sqlite）。 */
   nodePath: path.join(ROOT, 'tools', 'node22', 'node.exe'),
   /** ZCode 引擎入口。 */
@@ -228,13 +239,22 @@ class ZcodeAgent {
         askUserQuestionAutoResolutionEnabled: true,
       };
     } else if (method === 'interaction/requestProviderRuntimeHeaders') {
-      // 请求期鉴权：Coding Plan 模型每次请求由桥回传 api-key
-      // （响应合同见 shared zcodeProviderRuntimeHeadersResponseSchema）
+      // 请求期鉴权：Coding Plan 模型每次请求由桥回传凭据
+      // （响应合同见 shared zcodeProviderRuntimeHeadersResponseSchema）。
+      // 桌面端 oauth 的 access_token 是 JWT（多个点），直接作 apiKey 会被引擎的
+      // V4 签名器当「id.secret」签名凭据解析而报 invalid-config（2026-10-03 实测）；
+      // 该 token 实测可直接作 anthropic 兼容端点凭据（x-api-key / Bearer 均 200），
+      // 故 JWT 形态改传 headers 绕过签名器；单点形态（真正的 id.secret API key）
+      // 仍走 apiKey 签名路径。
       const pid = params?.providerId ?? '';
       const apiKey = readCodingPlanApiKey(pid);
       if (apiKey) {
+        // 桥默认使用开源引擎（ref/ZCode 构建产物，无 V4 签名层）：apiKey 原样
+        // 透传，适配器自行设 x-api-key + Bearer（oauth JWT 实测直通端点）。
+        // 若换回桌面闭源引擎（zcode.cjs），id.secret 形态的 key 仍走 apiKey 签名
+        // 路径；JWT 形态则会被闭源签名器拒（invalid-config），需换回开源引擎。
         result = { headersApplied: true, requestAuth: { apiKey } };
-        logLine('interaction-auth', 'api-key supplied', { pid });
+        logLine('interaction-auth', 'api-key supplied', { pid, masked: apiKey.slice(0, 10) + '…(' + apiKey.length + 'ch)', dots: (apiKey.match(/\./g) || []).length });
       } else {
         result = { headersApplied: false, errorMessage: `zcode-phone-server 未找到 ${pid} 的凭据` };
       }
@@ -376,9 +396,17 @@ function parseModelSelection(value) {
   return selection;
 }
 
-function workspaceRef() {
-  // 本地 workspace：workspaceKey = workspacePath（bootstrap/zcode-protocol/workspace.ts 约定）
-  const wp = config.workspacePath;
+function workspaceRef(overridePath) {
+  // 本地 workspace：workspaceKey = workspacePath（bootstrap/zcode-protocol/workspace.ts 约定）。
+  // overridePath：多工作区切换时由请求显式指定（须在 config.workspaces 白名单内或等于主工作区）。
+  const requested = String(overridePath ?? '').trim();
+  let wp = config.workspacePath;
+  if (requested) {
+    const allowed = [config.workspacePath, ...(config.workspaces ?? []).map((w) => w.path)]
+      .map((p) => path.resolve(String(p)));
+    const resolved = path.resolve(requested);
+    if (allowed.includes(resolved)) wp = resolved;
+  }
   return { workspacePath: wp, workspaceKey: wp };
 }
 
@@ -406,15 +434,51 @@ function decryptCredential(value) {
   return Buffer.concat([decipher.update(Buffer.from(dataRaw, 'base64url')), decipher.final()]).toString('utf8');
 }
 
+/** 桌面端 oauth 共享凭据键（providerId → credentials.json 键名）。 */
+const OAUTH_ACCESS_KEY_BY_PROVIDER = {
+  'account:bigmodel-individual-coding-plan': 'oauth:bigmodel:access_token',
+  'account:zai-individual-coding-plan': 'oauth:zai:access_token',
+};
+
 /** 读取 Coding Plan api-key（standalone 键名规范见 bootstrap/src/app/standalone-account-provider-runtime.ts）。 */
 function readCodingPlanApiKey(providerId) {
+  // 优先级 1：config.json 显式配置的 Coding Plan API Key（id.secret 形态）。
+  // 引擎对 zhipu-account provider 走 V4 请求签名，要求 apiKey 恰好一个「.」
+  // （Glr：apiKeyId.apiKeySecret）；桌面端 oauth 的 access_token 是 JWT（多个点），
+  // 直接作 apiKey 会被签名器拒（invalid-config），作 headers 又过不了适配器的
+  // loadApiKey 强校验——所以 JWT 只能推动授权，真正推理必须用 id.secret 的 key。
+  // 创建入口：https://bigmodel.cn/usercenter/proj-mgmt/apikeys
+  const configured = String(config.codingPlanApiKey ?? '').trim();
+  if (configured) return configured;
   try {
     const raw = JSON.parse(fs.readFileSync(CRED_PATH, 'utf8'));
     const identity = decryptCredential(raw[`account-provider:${providerId}:identity`] ?? '').trim();
-    if (!identity) return undefined;
-    const key = `account-provider:coding-plan:${providerId}:account:${encodeURIComponent(identity)}:api-key`;
-    const apiKey = decryptCredential(raw[key] ?? '').trim();
-    return apiKey || undefined;
+    if (identity) {
+      const key = `account-provider:coding-plan:${providerId}:account:${encodeURIComponent(identity)}:api-key`;
+      const apiKey = decryptCredential(raw[key] ?? '').trim();
+      if (apiKey) return apiKey;
+    }
+    // 桌面端登录把凭据重写为 oauth:* 共享键（engine 的 createSharedZCodeCredentialStore）。
+    // 注意：oauth access_token（JWT）可推动授权、也能直接过端点鉴权（x-api-key/Bearer
+    // 实测 200），但过不了引擎的 V4 签名器与适配器 loadApiKey 双重校验——
+    // 推理要跑通仍需在 config.json 配置 id.secret 形态的 codingPlanApiKey。
+    const oauthKey = OAUTH_ACCESS_KEY_BY_PROVIDER[providerId];
+    if (oauthKey) {
+      const v = decryptCredential(raw[oauthKey] ?? '').trim();
+      if (v) {
+        logLine('account', '仅有 oauth JWT 凭据：可完成授权推送，但推理需在 config.json 配置 '
+          + 'codingPlanApiKey（id.secret 形态，https://bigmodel.cn/usercenter/proj-mgmt/apikeys 创建）');
+        return v;
+      }
+    }
+    // 最后兜底：任取一个 oauth:*:access_token（provider 映射缺失时尽量可用）
+    for (const [k, v] of Object.entries(raw)) {
+      if (k.startsWith('oauth:') && k.endsWith(':access_token')) {
+        const d = decryptCredential(v).trim();
+        if (d) return d;
+      }
+    }
+    return undefined;
   } catch (e) {
     logLine('credential-error', String(e?.message ?? e));
     return undefined;
@@ -522,8 +586,31 @@ async function handleApi(req, res, url) {
     });
   }
 
+  if (req.method === 'GET' && p === '/api/workspaces') {
+    // 可选工作区（主工作区 + config.workspaces），供页面顶栏切换器使用
+    return sendJson(res, 200, {
+      workspaces: [
+        { name: '默认', path: config.workspacePath },
+        ...(config.workspaces ?? []),
+      ],
+    });
+  }
+
+  if (req.method === 'POST' && p === '/api/upload') {
+    // App 拍照/相册图片落盘：存到所选工作区的 .zcode-uploads/，消息中以路径引用（模型工具可直接读取）
+    const body = await readBody(req, 16 * 1024 * 1024);
+    const wsRef = workspaceRef(body.workspace);
+    const safeName = String(body.name ?? 'image.png').replace(/[\\/:*?"<>|]/g, '_').slice(-80);
+    const dir = path.join(wsRef.workspacePath, '.zcode-uploads');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${Date.now()}-${safeName}`);
+    fs.writeFileSync(file, Buffer.from(String(body.dataBase64 ?? ''), 'base64'));
+    return sendJson(res, 200, { path: file });
+  }
+
   if (req.method === 'GET' && p === '/api/sessions') {
-    const r = await agent.request('session/list', { workspace: workspaceRef(), limit: 50, includeArchived: false });
+    const ws = url.searchParams.get('workspace');
+    const r = await agent.request('session/list', { workspace: workspaceRef(ws), limit: 50, includeArchived: false });
     const list = (r.sessions ?? []).map((s) => ({
       sessionId: s.sessionId,
       title: s.title,
@@ -542,14 +629,15 @@ async function handleApi(req, res, url) {
   if (req.method === 'POST' && p === '/api/sessions') {
     const body = await readBody(req);
     let sid = body.sessionId;
+    const wsRef = workspaceRef(body.workspace);
     let snap;
     // 账号授权推送（幂等；app-server 重启后同样生效）
     await pushAccountConfig();
     if (sid) {
-      snap = await agent.request('session/resume', { sessionId: sid, workspace: workspaceRef() }, 180000);
+      snap = await agent.request('session/resume', { sessionId: sid, workspace: wsRef }, 180000);
     } else {
       snap = await agent.request('session/create', {
-        workspace: workspaceRef(),
+        workspace: wsRef,
         mode: config.mode,
         model: parseModelSelection(config.model),
         titleGenerationEnabled: true,
@@ -560,7 +648,9 @@ async function handleApi(req, res, url) {
     sessionState(sid);
     // 订阅事件流（legacy 通道：subscribe 后才有 session/event 推送）
     await agent.request('session/subscribe', { sessionId: sid, deliveryKind: 'desktop-continuous', includeSnapshot: false });
-    // 显式落一次模型选择：create 的 model 参数不保证写入会话运行时（turn 期校验用的是会话选择）
+    // 显式落一次模型选择：create 的 model 参数不保证写入会话运行时（turn 期校验用的是会话选择）。
+    // session/setModel 的 model 是 {providerId, modelId, options?} 对象（2026-10-03 实测：
+    // 传字符串报 expected object；此前 [object Object] 报错实为 Registry 空所致）。
     const sel = parseModelSelection(config.model);
     if (sel) {
       await agent.request('session/setModel', { sessionId: sid, model: sel }).catch((e) =>

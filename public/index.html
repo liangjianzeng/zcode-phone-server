@@ -9,7 +9,22 @@
     --bg: #0d1117; --panel: #161b22; --card: #1c2333; --line: #2d333b;
     --fg: #e6edf3; --dim: #8b949e; --accent: #4f8cc9; --ok: #3fb950; --warn: #d29922; --err: #f85149;
     --bubble-user: #1f4e79; --bubble-ai: #1c2333;
+    color-scheme: dark;
   }
+  /* 主题实时跟随系统深浅色（CSS 媒体查询，系统切换即生效，无需刷新） */
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f8fa; --panel: #ffffff; --card: #f0f3f6; --line: #d0d7de;
+      --fg: #1f2328; --dim: #656d76; --accent: #0969da; --ok: #1a7f37; --warn: #9a6700; --err: #cf222e;
+      --bubble-user: #ddf4ff; --bubble-ai: #f0f3f6;
+      color-scheme: light;
+    }
+    .bubble pre, .bubble code.inline { background: #eaeef2; }
+    .fileMention { color: #0550ae; }
+    .toast { background: #ffffff; }
+  }
+  /* 桥哨兵词容器：对用户不可见，但 textContent 仍含哨兵词（旧版 App 桥检测用） */
+  .vh { position: absolute; left: -9999px; top: auto; width: 1px; height: 1px; overflow: hidden; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { height: 100%; }
   body {
@@ -24,6 +39,10 @@
   }
   header h1 { font-size: 16px; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   header button { flex: none; }
+  header select {
+    flex: none; max-width: 34vw; background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 4px; font: inherit; font-size: 12.5px;
+  }
   main { flex: 1; overflow-y: auto; padding: 12px 12px 8px; scroll-behavior: smooth; }
 
   .msg { margin: 8px 0; display: flex; }
@@ -138,13 +157,19 @@
 <header>
   <button id="btnMenu">☰</button>
   <h1 id="title">ZCode Phone</h1>
+  <select id="wsSel" title="工作区" style="display:none"></select>
+  <button id="btnNewTop" title="新建会话">＋</button>
   <button id="btnStop" class="danger" style="display:none">停止</button>
 </header>
 
-<div id="turnStatus" role="status" aria-live="polite">Deep diving · 任务进行中…</div>
+<div id="turnStatus" role="status" aria-live="polite">ZCode 工作中 · 任务进行中…<span class="vh">Deep diving</span></div>
 <main id="chat"></main>
 
 <footer>
+  <div id="attachBar" style="display:none;align-items:center;gap:8px;margin:0 0 6px;padding:6px 10px;background:var(--card);border:1px solid var(--line);border-radius:10px;font-size:12.5px;">
+    <span id="attachName" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
+    <button id="attachClear" style="padding:2px 8px;">✕</button>
+  </div>
   <div class="composer">
     <textarea id="composer" rows="1" placeholder="输入任务，回车发送"></textarea>
     <button id="btnSend" class="primary">发送</button>
@@ -176,6 +201,52 @@ let busy = false;
 // 工具卡片单独维护：toolCallId → {el, status}
 const msgEls = new Map();
 const toolEls = new Map();
+
+// ── App 桥协议 v2 ──
+// 页面主动向 App 上报事件（不再依赖 App 爬 DOM 关键字）；App 可调用 window.__zcode 上的函数。
+// 旧版 App（APK 未升级）仍走 DOM 约定：哨兵词以隐藏形式保留在状态条里，两代桥并存。
+window.__zcodeBridge = 2;
+function notifyApp(handler, payload) {
+  try { window.flutter_inappwebview?.callHandler(handler, payload); } catch { /* 非 App 环境忽略 */ }
+}
+
+// ── 待发图片附件（App 拍照/相册注入）──
+let pendingImage = null;
+function showAttachChip() {
+  const bar = $('attachBar');
+  if (!pendingImage) { bar.style.display = 'none'; return; }
+  $('attachName').textContent = `📷 ${pendingImage.name}（发送时上传到工作区）`;
+  bar.style.display = 'flex';
+}
+function clearAttach() { pendingImage = null; showAttachChip(); }
+
+// ── App 注入函数：新版显式契约 window.__zcode + 旧版 DSH 命名兼容（当前已装 APK 即用）──
+window.__dshComposerBridge = {
+  insertText(text) {
+    composer.value = String(text ?? '');
+    composer.dispatchEvent(new Event('input'));
+    return { ok: true };
+  },
+  async send() {
+    if (busy) return { ok: false, error: 'busy' };
+    if (!composer.value.trim() && !pendingImage) return { ok: false, error: 'empty' };
+    await send();
+    return { ok: true, via: 'zcode' };
+  },
+};
+window.__dshPhotoBridge = {
+  pickImage(base64, name, mime) {
+    pendingImage = { base64: String(base64 ?? ''), name: String(name ?? 'image.png'), mime: String(mime ?? 'image/png') };
+    showAttachChip();
+    return { ok: true };
+  },
+};
+window.__zcode = {
+  version: 2,
+  insert(text) { return window.__dshComposerBridge.insertText(text); },
+  send() { return window.__dshComposerBridge.send(); },
+  attachImage(base64, name, mime) { return window.__dshPhotoBridge.pickImage(base64, name, mime); },
+};
 
 function toast(msg, ms = 2200) {
   const t = $('toast'); t.textContent = msg; t.style.display = 'block';
@@ -342,6 +413,7 @@ function handleZcodeEvent(ev) {
         scrollBottom();
       }
       setBusy(true);
+      notifyApp('onTaskState', { running: true, sessionId: curSession });
       break;
     }
     case 'part.started':
@@ -400,9 +472,13 @@ function handleZcodeEvent(ev) {
       if (p.kind === 'error') setToolStatus(id, 'error', desc, p.error ? JSON.stringify(p.error, null, 1) : undefined);
       break;
     }
-    case 'turn.completed': setBusy(false); break;
+    case 'turn.completed':
+      setBusy(false);
+      notifyApp('onTaskState', { running: false, sessionId: curSession });
+      break;
     case 'turn.failed': {
       setBusy(false);
+      notifyApp('onTaskState', { running: false, sessionId: curSession });
       const e = el('div', 'errline', `回合失败：${ev.payload?.error ?? '未知错误'}`);
       chat.appendChild(e); scrollBottom();
       break;
@@ -478,7 +554,7 @@ function connectStream(sessionId, afterSeq = -1) {
 
 async function openSession(sessionId) {
   try {
-    const r = await api('sessions', { method: 'POST', body: JSON.stringify(sessionId ? { sessionId } : {}) });
+    const r = await api('sessions', { method: 'POST', body: JSON.stringify({ sessionId, workspace: curWs }) });
     curSession = r.sessionId;
     renderHistory(r.messages ?? []);
     connectStream(curSession, -1);
@@ -493,7 +569,7 @@ async function openSession(sessionId) {
 async function loadSessionList() {
   const box = $('sessList');
   try {
-    const r = await api('sessions');
+    const r = await api(`sessions?workspace=${encodeURIComponent(curWs)}`);
     box.textContent = '';
     if (!r.sessions?.length) { box.appendChild(el('div', 'sysline', '还没有会话')); return; }
     for (const s of r.sessions) {
@@ -513,13 +589,55 @@ async function loadSessionList() {
   }
 }
 
+// ── 工作区 ──
+
+let workspaces = [];   // [{name, path}]
+let curWs = localStorage.getItem('zcode.ws') ?? '';
+
+async function loadWorkspaces() {
+  try {
+    const r = await api('workspaces');
+    workspaces = r.workspaces ?? [];
+  } catch { workspaces = []; }
+  if (!workspaces.some((w) => w.path === curWs)) curWs = workspaces[0]?.path ?? '';
+  const sel = $('wsSel');
+  sel.textContent = '';
+  for (const w of workspaces) {
+    const o = document.createElement('option');
+    o.value = w.path;
+    o.textContent = w.name || w.path.split(/[\\/]/).pop() || w.path;
+    sel.appendChild(o);
+  }
+  sel.value = curWs;
+  sel.style.display = workspaces.length > 1 ? '' : 'none';
+  sel.onchange = () => {
+    curWs = sel.value;
+    localStorage.setItem('zcode.ws', curWs);
+    loadSessionList();
+    toast('工作区：' + (workspaces.find((w) => w.path === curWs)?.name ?? curWs));
+  };
+}
+
 // ── 发送 ──
 
 async function send() {
-  const text = composer.value.trim();
-  if (!text || !curSession || busy) return;
+  if (!curSession || busy) return;
+  let text = composer.value.trim();
+  if (!text && !pendingImage) return;
   composer.value = '';
   composer.style.height = 'auto';
+  // 待发图片：先上传到当前工作区，消息里带上文件路径（模型工具可直接读取该文件）
+  if (pendingImage) {
+    const img = pendingImage;
+    clearAttach();
+    try {
+      const r = await api('upload', { method: 'POST', body: JSON.stringify({ name: img.name, dataBase64: img.base64, workspace: curWs }) });
+      text = text ? `${text}\n\n[图片已保存到 ${r.path}]` : `请查看图片 ${r.path}`;
+    } catch (e) {
+      toast(`图片上传失败：${e.message}`);
+      return;
+    }
+  }
   try {
     await api(`sessions/${encodeURIComponent(curSession)}/send`, { method: 'POST', body: JSON.stringify({ content: text }) });
     setBusy(true);
@@ -543,6 +661,8 @@ $('btnMenu').addEventListener('click', () => { loadSessionList(); $('drawer').cl
 $('btnClose').addEventListener('click', () => $('drawer').classList.remove('open'));
 $('drawer').addEventListener('click', (e) => { if (e.target.id === 'drawer') $('drawer').classList.remove('open'); });
 $('btnNew').addEventListener('click', () => openSession(null));
+$('btnNewTop').addEventListener('click', () => openSession(null));
+$('attachClear').addEventListener('click', clearAttach);
 $('btnStop').addEventListener('click', async () => {
   if (!curSession) return;
   try { await api(`sessions/${encodeURIComponent(curSession)}/stop`, { method: 'POST', body: '{}' }); toast('已请求停止'); }
@@ -555,7 +675,8 @@ $('btnStop').addEventListener('click', async () => {
   try {
     const st = await api('state');
     document.title = 'ZCode Phone';
-    const r = await api('sessions');
+    await loadWorkspaces();
+    const r = await api(`sessions?workspace=${encodeURIComponent(curWs)}`);
     if (r.sessions?.length) await openSession(r.sessions[0].sessionId);
     else $('drawer').classList.add('open');
   } catch (e) {
