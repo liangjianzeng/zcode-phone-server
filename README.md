@@ -3,6 +3,9 @@
 ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Protocol stdio 协议），
 封装成 token 鉴权的 HTTP/SSE 服务，供 DSH-Phone 风格手机端经 SSH 隧道访问。
 
+> **新开发机请先读 [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md)**——架构图、
+> 5 分钟启动、APK 构建联调、协议避坑手册与故障速查都在那里。
+
 - **零 npm 依赖**，用项目自带 Node 22 运行（引擎需要 ≥22.5 的 `node:sqlite`）。
 - **只监听 127.0.0.1**，绝不直接暴露公网；手机端走 SSH 隧道 / Tailscale。
 
