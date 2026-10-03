@@ -1066,6 +1066,8 @@ function setToolStatus(toolCallId, status, desc, detail) {
 let lastFingerprint = '';    // 最后渲染的消息尾部指纹（renderHistory 内更新）
 let busySource = null;       // 'sse' = 本引擎事件驱动；'inferred' = 轮询推断
 let lastActivity = 0;        // 推断运行态最近一次见到存储变化的时刻
+let lastSseEventAt = 0;      // 最近一次收到 SSE 事件（检测流静默/死亡）
+let finishedSince = 0;       // 推断态首次见到"回合已收尾"指纹的时刻
 let pollTimer = null;
 
 function lastBusyMessage(messages) {
@@ -1440,6 +1442,7 @@ async function loadPlugins() {
 // ── 实时事件处理 ──
 
 function handleZcodeEvent(ev) {
+  lastSseEventAt = Date.now();
   // 页面中途打开/刷新时可能错过 turn.started（回合由桌面端等外部驱动）：
   // 收到任何回合内活动事件就恢复运行态，保证进度条/停止按钮/计时可见
   if (!busy && (ev.type === 'part.started' || ev.type === 'part.upserted' ||
@@ -1531,6 +1534,10 @@ function handleZcodeEvent(ev) {
       setBusy(false);
       stopLiveTimers();
       notifyTaskState(false);
+      // 断流期间工具行可能停在 running：从存储补一次最终状态重绘
+      api(`sessions/${encodeURIComponent(curSession)}/messages?limit=10`)
+        .then((r) => renderTail(r.messages ?? []))
+        .catch(() => {});
       loadPlan();
       loadUsage(true);
       loadAllSessions();
@@ -1694,14 +1701,35 @@ function renderTail(messages) {
 
 // 轮询跟随：探测最近几条消息的指纹，变化才增量渲染尾部。
 // 桌面端驱动的回合没有 SSE 事件，靠这里实现手机端近实时同步（1.2s 探测）。
+//
+// 收敛自愈（以存储为准，任何运行态都必须能退出，否则就是"永久转圈"）：
+// - busy 期间存储显示回合已收尾（最后部件 step-finish）且无任何活动
+//   （SSE 静默 + 存储无变化）超过 30 秒 → 强制复位。
+//   覆盖 SSE 断流后 turn.completed 丢失导致的不收敛。
+// - SSE 存活时事件持续刷新 lastSseEventAt，步骤间隙不会误判
+//   （工具执行期事件也在流，且存储里工具部件停在 running，finished=false）。
 async function pollTick() {
-  if (!curSession || busySource === 'sse') return;
+  if (!curSession) return;
   if (document.hidden) return; // WebView 后台会暂停定时器，回前台自然补一次
   try {
     const probe = await api(`sessions/${encodeURIComponent(curSession)}/messages?limit=10`);
-    const fp = fingerprint(probe.messages ?? []);
+    const msgs = probe.messages ?? [];
+    const fp = fingerprint(msgs);
+    const finished = turnLooksFinished(msgs);
+    const quietMs = Date.now() - Math.max(lastActivity, lastSseEventAt);
     if (fp === lastFingerprint) {
-      // 推断运行态长时间无存储变化：回合可能异常中断，兜底收尾
+      // 无存储变化：busy 超过 30 秒且回合已收尾 → 复位（补一次尾部重绘，
+      // 修正断流期间停留在 running 的工具行）
+      if (busy && finished && quietMs > 30000) {
+        renderTail(msgs);
+        busySource = null;
+        setBusy(false);
+        notifyTaskState(false);
+        flushQueue();
+        loadAllSessions();
+        return;
+      }
+      // 推断运行态长时间无任何变化：回合可能异常中断，兜底收尾
       if (busySource === 'inferred' && Date.now() - lastActivity > 120000) {
         busySource = null;
         setBusy(false);
@@ -1711,24 +1739,41 @@ async function pollTick() {
       return;
     }
     lastActivity = Date.now();
-    const finished = turnLooksFinished(probe.messages ?? []);
-    if (busySource === 'inferred' && finished) {
-      renderTail(probe.messages ?? []);
-      busySource = null;
-      setBusy(false);
-      notifyTaskState(false);
-      flushQueue();
-      loadAllSessions();
-      return;
+    // 推断态收尾：step-finish 需稳定 6 秒才复位——多步回合的步骤间隙也会
+    // 短暂以 step-finish 结尾，立即复位会把进行中的回合误停
+    if (busySource === 'inferred') {
+      if (finished) {
+        if (!finishedSince) finishedSince = Date.now();
+        if (Date.now() - finishedSince >= 6000) {
+          finishedSince = 0;
+          renderTail(msgs);
+          busySource = null;
+          setBusy(false);
+          notifyTaskState(false);
+          flushQueue();
+          loadAllSessions();
+          return;
+        }
+      } else {
+        finishedSince = 0;
+      }
     }
-    if (!busySource) {
+    if (!busySource && !busy) {
       busySource = 'inferred';
       busySince = Date.now();
       setBusy(true);
       notifyTaskState(true);
       startLiveTimers();
     }
-    renderTail(probe.messages ?? []);
+    renderTail(msgs);
+    // SSE 驱动的回合也可能断流：存储已收尾且流静默 30 秒 → 兜底复位
+    if (busy && busySource === 'sse' && finished && Date.now() - lastSseEventAt > 30000) {
+      busySource = null;
+      setBusy(false);
+      notifyTaskState(false);
+      flushQueue();
+      loadAllSessions();
+    }
   } catch (e) {
     // 服务端重启后引擎里没有这个会话（未 resume）：自动重新打开恢复
     if (/not active/i.test(String(e?.message ?? e))) ensureResumed();
@@ -1999,6 +2044,10 @@ async function openSession(sessionId, wsPath) {
     const body = sessionId ? { sessionId } : { sessionId: null, workspace: curWs };
     const r = await api('sessions', { method: 'POST', body: JSON.stringify(body) });
     curSession = r.sessionId;
+    // 计时基准全部按新会话重置，避免上一会话的静默/收尾状态串线
+    lastSseEventAt = Date.now();
+    lastActivity = Date.now();
+    finishedSince = 0;
     setSessionTitle(r.title);
     // 切换会话：清掉上一个会话残留的运行文案（运行态在下面按新会话实况恢复）
     setActivity('');
