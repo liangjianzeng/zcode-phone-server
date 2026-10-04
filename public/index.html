@@ -62,6 +62,14 @@
   }
   #todoBar .thead { display: flex; align-items: center; gap: 8px; }
   #todoBar .chev { color: var(--faint); flex: none; font-size: 11px; }
+  /* 「任务计划」标签：明示组件身份 + 可展开（点击切换） */
+  #todoBar .tlabel {
+    flex: none; font-size: 11px; font-weight: 650; letter-spacing: .04em;
+    color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    border-radius: 6px; padding: 1px 7px;
+  }
+  #todoBar .thint { flex: none; font-size: 11px; color: var(--faint); }
   #todoBar .tsum { flex: 1; min-width: 0; font-size: 12.5px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #todoBar .tnum { color: var(--accent); font-weight: 650; font-variant-numeric: tabular-nums; }
   #todoBar .titems { display: none; margin-top: 8px; flex-direction: column; gap: 3px; }
@@ -440,7 +448,7 @@
   </nav>
   <main id="chat">
     <div id="todoBar" role="button" aria-label="任务计划" title="点击展开/收起任务计划">
-      <div class="thead"><span class="chev">▸</span><span class="tsum"></span></div>
+      <div class="thead"><span class="chev">▸</span><span class="tlabel">任务计划</span><span class="tsum"></span><span class="thint">点击展开</span></div>
       <div class="titems"></div>
     </div>
     <div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2" id="heroTip">选择一个会话，下达你的第一个任务</div></div>
@@ -514,7 +522,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.20';
+const PAGE_BUILD = '2026-10-04.21';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -1404,6 +1412,7 @@ function renderTodoBar() {
   const done = curTodos.filter((t) => t.status === 'completed').length;
   bar.classList.toggle('open', todoOpen);
   bar.querySelector('.chev').textContent = todoOpen ? '▾' : '▸';
+  bar.querySelector('.thint').textContent = todoOpen ? '点击收起' : '点击展开';
   const cur = curTodos.find((t) => t.status === 'in_progress');
   const sum = cur ? `正在：${cur.content}` : (done === curTodos.length ? '全部完成' : '等待执行');
   bar.querySelector('.tsum').textContent = sum;
@@ -2109,6 +2118,21 @@ function renderTail(messages) {
     const mid = String(msg.info?.messageId ?? msg.info?.id ?? Math.random());
     if (role === 'user') dropMatchingUserEcho(messageText(msg));
     const m = ensureMsg(mid, role === 'user' ? 'user' : 'assistant');
+    // 直播思考块去重：存储里的思考"追平"了直播内容（同一段思考已完成落库）
+    // 才移除直播块——按内容长度比较而非"存在 reasoning 段就删"，否则多段
+    // 思考回合（思考→工具→思考…）里后续直播思考会被每次轮询误删（闪烁丢字）
+    const liveThink = m.partEls.get('__live-think');
+    if (liveThink) {
+      const liveLen = (liveThink.content?.textContent ?? '').length;
+      const storageLen = Math.max(0, ...(msg.parts ?? [])
+        .filter((p) => p.type === 'reasoning')
+        .map((p) => (p.text ?? '').length));
+      if (storageLen >= liveLen && storageLen > 0) {
+        liveThink.el.remove();
+        m.partEls.delete('__live-think');
+        thinkTimers.delete('__live-think');
+      }
+    }
     for (const part of msg.parts ?? []) {
       switch (part.type) {
         case 'text':
