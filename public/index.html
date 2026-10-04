@@ -456,7 +456,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.7';
+const PAGE_BUILD = '2026-10-04.8';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -1912,11 +1912,12 @@ async function pollTick() {
     const finished = turnLooksFinished(msgs);
     const quietMs = Date.now() - Math.max(lastActivity, lastSseEventAt);
     if (fp === lastFingerprint) {
-      // 无存储变化。推断态收敛主路径：step-finish 稳定 6 秒 → 复位。
-      // （此前该逻辑写在"指纹变化"分支里，指纹一稳定就永远走不到——
+      // 无存储变化。收敛主路径：step-finish 稳定 6 秒 → 复位（对 sse/inferred
+      // 一视同仁——SSE 断流后 turn.completed 丢失时同样 6 秒自愈，不必等 30 秒。
+      // 此前该逻辑写在「指纹变化」分支里，指纹一稳定就永远走不到——
       // turn.completed 复位后 pollTick 又把 busy 拉回来，实际收敛全靠
       // 30 秒静默兜底，实测转圈拖到 72 秒。）
-      if (busy && busySource === 'inferred' && finished) {
+      if (busy && finished) {
         if (!finishedSince) finishedSince = Date.now();
         if (Date.now() - finishedSince >= 6000) {
           finishedSince = 0;

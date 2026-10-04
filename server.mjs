@@ -841,6 +841,26 @@ function readBody(req, limit = 5 * 1024 * 1024) {
 
 async function handleApi(req, res, url) {
   const p = url.pathname;
+/** 会话是否已收尾（最后 assistant 消息以 step-finish 结尾），10 秒缓存。
+ * status=running 的会话若回合由外进程驱动，桥引擎收不到结束事件，
+ * status 永远停在 running（僵尸 running）——必须用共享存储核实。 */
+const finishedCache = new Map();
+async function sessionLooksFinished(sid) {
+  const c = finishedCache.get(sid);
+  if (c && Date.now() - c.t < 10000) return c.finished;
+  let finished = false;
+  try {
+    const r = await agent.request('session/messages', { sessionId: sid, limit: 1 });
+    const last = (r.messages ?? []).at(-1);
+    finished = !!last
+      && String(last.info?.role ?? '') === 'assistant'
+      && (last.parts ?? []).length > 0
+      && String(last.parts.at(-1)?.type ?? '') === 'step-finish';
+  } catch { finished = true; } // 会话未挂载/读取失败：不按 running 处理
+  finishedCache.set(sid, { t: Date.now(), finished });
+  return finished;
+}
+
   const seg = p.split('/').filter(Boolean); // ['api', ...]
 
   if (req.method === 'GET' && p === '/api/state') {
@@ -887,17 +907,21 @@ async function handleApi(req, res, url) {
       const now = Date.now();
       if (!allListCache || now - allListCache.t > 5000) {
         const r = await agent.request('session/list', { limit: 200, includeArchived: false });
-        const list = (r.sessions ?? []).map((s) => ({
+        const list = await Promise.all((r.sessions ?? []).map(async (s) => ({
           sessionId: s.sessionId,
-          title: String(s.title ?? '').includes('�') ? '' : s.title,
+          title: String(s.title ?? '').includes('\uFFFD') ? '' : s.title,
           status: s.status,
           mode: s.mode,
           updatedAt: s.updatedAt,
           createdAt: s.createdAt,
           workspacePath:
             s.workspace?.workspacePath ?? s.workspace?.workspaceKey ?? s.workspacePath ?? '',
-          busy: sessionState(s.sessionId).busy || String(s.status ?? '').toLowerCase() === 'running',
-        }));
+          // status=running 必须经存储核实：外进程驱动的回合结束后桥收不到
+          // 事件，status 永远 running（僵尸 running → 手机永久转圈点不动）
+          busy: sessionState(s.sessionId).busy
+            || (String(s.status ?? '').toLowerCase() === 'running'
+              && !(await sessionLooksFinished(s.sessionId))),
+        })));
         list.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
         allListCache = { t: now, list };
         for (const it of list) {
