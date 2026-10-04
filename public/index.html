@@ -1148,6 +1148,8 @@ function setBusy(on) {
     if (!elapsedTimer) elapsedTimer = setInterval(tickElapsed, 1000);
   } else {
     markThinkDurations();
+    // 回合收尾（含轮询推断的收尾）：所有思考都已完成，折叠展开中的思考行
+    collapseOpenThinks();
     busySince = 0;
     if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
     $('turnElapsed').textContent = '';
@@ -1230,10 +1232,19 @@ function ensureThink(m, partId) {
   pe = { kind: 'think', el: details, content: body };
   m.partEls.set(partId, pe);
   if (!thinkTimers.has(partId)) thinkTimers.set(partId, Date.now());
-  // 思考默认收起：思考文本常含命令行/尖括号片段（⏺ Bash(...)、<tag> 等），
-  // 展开挂在对话流里就是"括号命令代码夹杂"的观感；想看过程手动点开。
-  details.open = false;
+  // 最新思考自动展开跟看输出（用户要求：思考进行中要保持打开）；
+  // 思考完成（工具/正文部件到达、回合结束）时由 collapseOpenThinks() 折叠。
+  details.open = true;
+  if (openThinkDetails && openThinkDetails !== details) openThinkDetails.open = false;
+  openThinkDetails = details;
   return pe;
+}
+let openThinkDetails = null;
+
+// 折叠所有展开中的思考行：思考完成的时机 = 工具/正文部件到达 或 回合结束
+function collapseOpenThinks() {
+  for (const d of chat.querySelectorAll('details.think[open]')) d.open = false;
+  openThinkDetails = null;
 }
 
 // 工具卡片（官方扁平行：[icon] 名称 命令摘要 …… 状态）
@@ -1425,7 +1436,7 @@ function scheduleTodoRefresh() {
   }, 600);
 }
 
-function renderHistory(messages) {
+function renderHistory(messages, opts = {}) {
   chat.textContent = '';
   // 任务计划条是 chat 的常驻首子节点（sticky），全量重绘后补回
   chat.appendChild(todoBarEl);
@@ -1433,7 +1444,7 @@ function renderHistory(messages) {
   sseUserEchoes = []; // 全量重绘，SSE 回显气泡已随 DOM 清掉
   // 更新尾部指纹：轮询跟随以这里为准（打开会话/重连重同步/轮询全量拉取共用）
   lastFingerprint = fingerprint(messages);
-  // 思考块全部保持默认收起（ensureThink 不再展开，这里也不再重新展开）
+  // 思考块由 ensureThink 渲染（最新一条展开）；重绘收尾时若会话空闲则统一折叠（见函数末尾）
   const vis = visibleMessages(messages);
   if (!vis.length) {
     const hero = el('div', 'hero');
@@ -1457,6 +1468,8 @@ function renderHistory(messages) {
           const st = part.state ?? {};
           // TodoWrite 不渲染工具行，但刷新任务计划条
           if (String(part.tool ?? '').toLowerCase() === 'todowrite') { scheduleTodoRefresh(); break; }
+          // 工具行到达 = 之前的思考已完成：折叠展开中的思考
+          collapseOpenThinks();
           const card = toolCard(part.callId, part.tool, inputSummary(st.input) || st.title || '');
           const status = st.status ?? 'pending';
           const detail = status === 'error' ? st.error : st.output;
@@ -1470,6 +1483,9 @@ function renderHistory(messages) {
       }
     }
   }
+  // 全量重绘后：空闲会话的历史思考都已完成 → 全部折叠；
+  // 忙碌中（打开运行中的会话/断线重同步）则保留"最新思考展开"跟着输出
+  if (!busy && !opts.keepThinkOpen) collapseOpenThinks();
   scrollBottom();
 }
 
@@ -1799,7 +1815,10 @@ function handleZcodeEvent(ev) {
       const part = ev.payload?.part;
       if (!part?.messageId) break;
       const m = ensureMsg(String(part.messageId), 'assistant');
+      const isNewPart = !m.parts.has(part.partId);
       m.parts.set(part.partId, part);
+      // 思考完成 = 同一回合的下一个非思考部件到达：折叠所有展开中的思考
+      if (isNewPart && part.type !== 'reasoning') collapseOpenThinks();
       if (part.type === 'text') renderTextPart(m, String(part.partId), part.text ?? '');
       else if (part.type === 'reasoning') {
         const pe = ensureThink(m, String(part.partId));
@@ -1845,6 +1864,8 @@ function handleZcodeEvent(ev) {
       if (p.kind === 'batch') break;
       // TodoWrite 不渲染工具行，但刷新任务计划条
       if (String(p.toolName ?? '').toLowerCase() === 'todowrite') { scheduleTodoRefresh(); break; }
+      // 工具开始执行 = 之前的思考已完成：折叠展开中的思考
+      collapseOpenThinks();
       const id = p.toolCallId;
       const desc = inputSummary(p.input) || (p.toolName ?? '');
       toolCard(id, p.toolName, desc);
@@ -2104,6 +2125,8 @@ function renderTail(messages) {
           const st = part.state ?? {};
           // TodoWrite 不渲染工具行，但刷新任务计划条
           if (String(part.tool ?? '').toLowerCase() === 'todowrite') { scheduleTodoRefresh(); break; }
+          // 工具行到达 = 之前的思考已完成：折叠展开中的思考
+          collapseOpenThinks();
           const card = toolCard(part.callId, part.tool, inputSummary(st.input) || st.title || '');
           const status = st.status ?? 'pending';
           const detail = status === 'error' ? st.error : st.output;
@@ -2629,13 +2652,15 @@ async function openSession(sessionId, wsPath) {
     }
     syncComposerChrome();
     refreshSettings(false); // 异步补齐上下文环数据（projection 为 0 时走 goal 回退）
-    renderHistory(r.messages ?? []);
-    // 恢复会话时对齐运行态：服务端 ring 为空（重启过）也能正确显示"运行中"
+    // 运行态判断提前到 renderHistory 之前：全量重绘要据此决定是否保留
+    // "最新思考展开"（忙碌回合的思考要跟着输出，不能折叠）
     const st = String(r.status ?? '').toLowerCase();
     const running = r.busy === true || st === 'running' || st === 'busy' || st === 'executing';
     // 外部（桌面端）驱动的回合：引擎 status 恒为 idle，但从存储里
     // 最后一条消息未以 step-finish 收尾可推断出"运行中"
     const foreignRunning = !running && turnLooksRunning(r.messages ?? []);
+    renderHistory(r.messages ?? [], { keepThinkOpen: running || foreignRunning });
+    // 恢复会话时对齐运行态：服务端 ring 为空（重启过）也能正确显示"运行中"
     if (running && !busy) {
       busySource = 'sse';
       busySince = r.busySince ?? Date.now();
