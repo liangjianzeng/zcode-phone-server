@@ -71,6 +71,24 @@
     background: #1c1c24; padding: 1px 6px; border-radius: 6px; font-size: 13px;
     font-family: ui-monospace, Consolas, monospace;
   }
+  /* markdown 渲染（assistant 气泡内）：对齐与间距 */
+  .bubble .md-p { margin: 3px 0; line-height: 1.6; }
+  .bubble > .md-p:first-child, .bubble > .md-h1:first-child, .bubble > .md-h2:first-child,
+  .bubble > .md-h3:first-child, .bubble > .md-h4:first-child { margin-top: 0; }
+  .bubble > :last-child { margin-bottom: 0; }
+  .bubble .md-h1 { font-size: 17px; font-weight: 700; margin: 11px 0 5px; line-height: 1.35; }
+  .bubble .md-h2 { font-size: 15.5px; font-weight: 700; margin: 10px 0 4px; line-height: 1.35; }
+  .bubble .md-h3 { font-size: 14px; font-weight: 650; margin: 8px 0 3px; line-height: 1.4; }
+  .bubble .md-h4 { font-size: 13.5px; font-weight: 650; margin: 7px 0 3px; color: var(--dim); }
+  .bubble .md-list { margin: 3px 0; padding-left: 20px; }
+  .bubble .md-list li { margin: 2.5px 0; line-height: 1.55; }
+  .bubble .md-list li::marker { color: var(--faint); }
+  .bubble .md-quote { margin: 6px 0; padding: 3px 12px; border-left: 3px solid var(--line); color: var(--dim); }
+  .bubble .md-quote .md-p { margin: 3px 0; }
+  .bubble .md-hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
+  .bubble .mdlink { color: #7cb7ff; text-decoration: none; word-break: break-all; }
+  .bubble strong { font-weight: 650; color: var(--fg); }
+  .bubble em { font-style: italic; }
 
   /* ── 工具行（官方扁平样式：图标 + 名称/状态 + 命令摘要，点击展开输出）── */
   .tool { margin: 2px 0; border-radius: 9px; }
@@ -456,7 +474,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.8';
+const PAGE_BUILD = '2026-10-04.9';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -546,7 +564,89 @@ function el(tag, cls, text) {
   return e;
 }
 
-// 极简富文本：转义 + 反引号代码块/行内码，其余纯文本（安全优先，不引外部库）
+// ── Markdown 子集渲染（安全：全部 DOM 构造，零 innerHTML）──
+// 块级：```代码块 / # 标题 / - * + 无序列表 / 1. 有序列表 / > 引用 / --- 分隔线 / 段落
+// 行内：`行内码` / **粗体** / *斜体* / [文本](http链接)
+function mdInline(parent, text) {
+  const re = /`([^`]+)`|\*\*([^*]+)\*\*|\*([^*\s][^*]*)\*|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) parent.appendChild(document.createTextNode(text.slice(last, m.index)));
+    if (m[1] !== undefined) parent.appendChild(el('code', 'inline', m[1]));
+    else if (m[2] !== undefined) parent.appendChild(el('strong', '', m[2]));
+    else if (m[3] !== undefined) parent.appendChild(el('em', '', m[3]));
+    else if (m[4] !== undefined) {
+      const a = el('a', 'mdlink', m[4]);
+      a.href = m[5];
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      parent.appendChild(a);
+    }
+    last = re.lastIndex;
+  }
+  if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+}
+
+function mdBlocks(container, seg) {
+  const lines = String(seg).replace(/\r/g, '').split('\n');
+  let para = [];   // 当前段落行
+  let list = null; // 当前列表 {el, ordered}
+  let quote = null;
+  const flushPara = () => {
+    if (!para.length) return;
+    const p = el('div', 'md-p');
+    mdInline(p, para.join('\n'));
+    container.appendChild(p);
+    para = [];
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (!t) { flushPara(); list = null; quote = null; continue; }
+    let m = t.match(/^(#{1,4})\s+(.*)$/);
+    if (m) {
+      flushPara(); list = null; quote = null;
+      container.appendChild(el('div', 'md-h' + m[1].length, m[2].replace(/\s*#+\s*$/, '')));
+      continue;
+    }
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(t)) {
+      flushPara(); list = null; quote = null;
+      container.appendChild(el('hr', 'md-hr'));
+      continue;
+    }
+    m = t.match(/^>\s?(.*)$/);
+    if (m) {
+      flushPara(); list = null;
+      if (!quote) { quote = el('blockquote', 'md-quote'); container.appendChild(quote); }
+      const qp = el('div', 'md-p');
+      mdInline(qp, m[1]);
+      quote.appendChild(qp);
+      continue;
+    }
+    m = t.match(/^[-*+]\s+(.*)$/);
+    if (m) {
+      flushPara(); quote = null;
+      if (!list || list.ordered) { list = { el: el('ul', 'md-list'), ordered: false }; container.appendChild(list.el); }
+      const li = el('li');
+      mdInline(li, m[1].replace(/\[( |x)\]\s*/i, (mm, c) => (c.toLowerCase() === 'x' ? '✓ ' : '□ ')));
+      list.el.appendChild(li);
+      continue;
+    }
+    m = t.match(/^\d+[.)]\s+(.*)$/);
+    if (m) {
+      flushPara(); quote = null;
+      if (!list || !list.ordered) { list = { el: el('ol', 'md-list'), ordered: true }; container.appendChild(list.el); }
+      const li = el('li');
+      mdInline(li, m[1]);
+      list.el.appendChild(li);
+      continue;
+    }
+    para.push(lines[i]);
+    if (list) list = null; // 列表后的非列表行结束列表
+  }
+  flushPara();
+}
+
+// 富文本入口：代码块 + markdown 子集（安全优先，不引外部库）
 function richText(container, text) {
   const parts = String(text).split(/```/);
   parts.forEach((seg, i) => {
@@ -555,16 +655,7 @@ function richText(container, text) {
       pre.textContent = seg.replace(/^[a-zA-Z0-9_+-]*\n/, '');
       container.appendChild(pre);
     } else {
-      const lines = seg.split('\n');
-      lines.forEach((line, j) => {
-        if (j) container.appendChild(document.createElement('br'));
-        // 行内代码
-        const pieces = line.split(/`([^`]+)`/);
-        pieces.forEach((pc, k) => {
-          if (k % 2 === 1) { const c = el('code', 'inline', pc); container.appendChild(c); }
-          else container.appendChild(document.createTextNode(pc));
-        });
-      });
+      mdBlocks(container, seg);
     }
   });
 }
