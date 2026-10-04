@@ -1240,8 +1240,24 @@ let lastSseEventAt = 0;      // 最近一次收到 SSE 事件（检测流静默/
 let finishedSince = 0;       // 推断态首次见到"回合已收尾"指纹的时刻
 let pollTimer = null;
 
+// 引擎注入的合成消息（模型可见、UI 不可见）判定：TodoWrite 提醒、
+// <task-notification>、<subagent-message> 等都带 visibility:"model-only"
+// / semantics.uiVisibility:"hidden" 标记，页面上渲染出来就是
+// "对话里夹杂大量尖括号命令代码"的来源。
+function isHiddenMessage(info) {
+  if (!info) return false;
+  if (info.visibility === 'model-only' || info.metadata?.visibility === 'model-only') return true;
+  if (info.semantics?.uiVisibility === 'hidden') return true;
+  return false;
+}
+
+function visibleMessages(messages) {
+  return (messages ?? []).filter((m) => !isHiddenMessage(m?.info));
+}
+
 function lastBusyMessage(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
+    if (isHiddenMessage(messages[i]?.info)) continue; // 合成消息不参与运行态推断
     if ((messages[i].info?.role ?? 'assistant') !== 'user') return messages[i];
   }
   return null;
@@ -1290,11 +1306,12 @@ function renderHistory(messages) {
   const thinks = chat.querySelectorAll('.msg.assistant .think');
   thinks.forEach((t) => { t.open = false; });
   if (thinks.length) { thinks[thinks.length - 1].open = true; openThinkDetails = thinks[thinks.length - 1]; }
-  if (!messages.length) {
+  const vis = visibleMessages(messages);
+  if (!vis.length) {
     chat.innerHTML = '<div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2">这个会话还没有消息</div></div>';
     return;
   }
-  for (const msg of messages) {
+  for (const msg of vis) {
     const role = msg.info?.role ?? 'assistant';
     const mid = String(msg.info?.messageId ?? msg.info?.id ?? Math.random());
     const m = ensureMsg(mid, role === 'user' ? 'user' : 'assistant');
@@ -1919,6 +1936,14 @@ function dropMatchingUserEcho(text) {
 function renderTail(messages) {
   let changed = false;
   for (const msg of messages) {
+    // 合成消息（TodoWrite 提醒/<task-notification>/<subagent-message>）：
+    // 跳过渲染，并移除可能已被 SSE 实时路径画出来的气泡（自愈）
+    if (isHiddenMessage(msg?.info)) {
+      const hid = String(msg.info?.messageId ?? msg.info?.id ?? '');
+      const hm = hid && msgEls.get(hid);
+      if (hm) { hm.el.remove(); msgEls.delete(hid); changed = true; }
+      continue;
+    }
     const role = msg.info?.role ?? 'assistant';
     const mid = String(msg.info?.messageId ?? msg.info?.id ?? Math.random());
     if (role === 'user') dropMatchingUserEcho(messageText(msg));
