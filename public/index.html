@@ -350,19 +350,6 @@
     max-width: 86vw; text-align: center;
   }
 
-  /* Todo 计划折叠条（官方风格：输入框上方，运行中显示进度，点击展开） */
-  #todoBar { display: none; margin: 0 0 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); overflow: hidden; }
-  #todoBar .thead { display: flex; align-items: center; gap: 8px; padding: 7px 12px; font-size: 12.5px; color: var(--dim); cursor: pointer; user-select: none; }
-  #todoBar .thead .arr { flex: none; font-size: 10px; transition: transform .15s ease; }
-  #todoBar.open .thead .arr { transform: rotate(90deg); }
-  #todoBar .thead .prog { flex: none; font-variant-numeric: tabular-nums; color: var(--fg); }
-  #todoBar .thead .cur { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #7cb7ff; }
-  #todoBar .titems { display: none; border-top: 1px solid var(--line); padding: 3px 0; }
-  #todoBar.open .titems { display: block; }
-  #todoBar .titem { display: flex; gap: 8px; padding: 5px 12px; font-size: 12.5px; line-height: 1.35; color: var(--fg); }
-  #todoBar .titem .ic { flex: none; width: 15px; text-align: center; }
-  #todoBar .titem.done { color: var(--faint); text-decoration: line-through; }
-  #todoBar .titem.doing { color: #7cb7ff; }
   /* spinner 通用 */
   .spin { animation: rot 1s linear infinite; }
   @keyframes rot { to { transform: rotate(360deg); } }
@@ -376,9 +363,6 @@
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
     </button>
     <div class="title" id="sessTitle">选择会话</div>
-    <button id="btnUsage" class="iconbtn" title="用量 / 缓存" aria-label="用量">
-      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M13 2 4.5 13.5H11L9.5 22 19 10h-6.5L13 2z"/></svg>
-    </button>
     <button id="btnMore" class="iconbtn" title="更多" aria-label="更多">
       <svg class="ic" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>
     </button>
@@ -397,7 +381,7 @@
 <div id="modeMenu" class="pop"></div>
 <div id="modelMenu" class="pop"></div>
 <div id="thinkMenu" class="pop"></div>
-<input type="file" id="fileInput" multiple style="display:none">
+<input type="file" id="fileInput" style="display:none">
 
 <!-- 运行状态条：任务运行期间可见；哨兵词 span 仅在运行时存在（旧版 App 桥据此判定运行态） -->
 <div id="turnStatus" role="status" aria-live="polite">
@@ -410,7 +394,6 @@
 
 <footer>
   <div id="ctxPop" class="ctxpop"></div>
-  <div id="todoBar"></div>
   <div id="queueBar"></div>
   <div id="attachBar" style="display:none;align-items:center;gap:8px;margin:0 0 8px;padding:6px 10px;background:var(--card);border:1px solid var(--line);border-radius:12px;font-size:12.5px;">
     <span id="attachName" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
@@ -832,9 +815,42 @@ function renderModelMenu() {
     }));
   }
   pop.appendChild(popRow({
-    icon: SVG.gear, title: '管理模型', desc: '在桌面端 ZCode 设置中添加/管理',
-    onClick: () => { closePops(); toast('在桌面端 ZCode 设置中添加/管理模型'); },
+    icon: SVG.gear, title: '当前模型信息', desc: '查看/复制模型 ID（管理在桌面端）',
+    onClick: () => { closePops(); showModelInfo(); },
   }));
+}
+
+// 当前模型信息面板：手机端没有模型管理界面（添加/管理在桌面端 ZCode 设置），
+// 这里给出真实信息与复制入口，替代原先只弹 toast 的占位项
+function showModelInfo() {
+  openInfo('模型信息', () => {
+    const body = $('infoBody');
+    body.textContent = '';
+    const cur = sessionSettings?.model?.current ?? {};
+    const pid = String(cur.providerId ?? '');
+    const mid = String(cur.modelId ?? '');
+    const lvl = String(cur.reasoningLevel ?? '');
+    const rows = [['显示名', $('modelName').textContent || mid || '未知'], ['Provider', pid], ['模型 ID', mid]];
+    if (lvl) rows.push(['思考档位', lvl]);
+    for (const [k, v] of rows) {
+      const row = el('div', 'kv');
+      row.appendChild(el('div', 'k', k));
+      row.appendChild(el('div', 'v', v || '—'));
+      body.appendChild(row);
+    }
+    if (pid || mid) {
+      const wrap = el('div', 'kv');
+      const btn = el('button', 'primary', '复制完整模型 ID');
+      btn.addEventListener('click', async () => {
+        const full = [pid, mid].filter(Boolean).join('/') + (lvl ? `\$${lvl}` : '');
+        try { await navigator.clipboard.writeText(full); toast('已复制：' + full); }
+        catch { toast(full); }
+      });
+      wrap.appendChild(btn);
+      body.appendChild(wrap);
+    }
+    body.appendChild(el('div', 'sysline', '添加/管理模型请在桌面端 ZCode 设置中操作，手机端与引擎的模型列表实时同步。'));
+  });
 }
 
 async function pickModel(o) {
@@ -1100,7 +1116,14 @@ function fileChip(container, p) {
   b.setAttribute('title', p);
   b.addEventListener('click', (ev) => {
     ev.stopPropagation();
-    toast(`文件：${p}`);
+    // App 内：原生成果桥（artifactBridgeJs）会在文档级接管本点击，打开
+    // 查看器/下载流程；本监听在 target 阶段先于桥触发，此前只会弹 toast，
+    // 看起来像"点了没反应"。浏览器环境降级为复制完整路径。
+    if (window.__dshArtifactBridge) return;
+    const fallback = () => toast(`文件：${p}`);
+    try {
+      navigator.clipboard.writeText(p).then(() => toast(`路径已复制：${p}`), fallback);
+    } catch { fallback(); }
   });
   container.appendChild(b);
 }
@@ -1211,47 +1234,6 @@ let lastFingerprint = '';    // 最后渲染的消息尾部指纹（renderHistor
 // 存储渲染同文本用户消息时移除对应回显气泡（60 秒窗口，连发两条相同内容也各自对齐）。
 let sseUserEchoes = [];
 
-// ── Todo 计划折叠条（输入框上方）──
-// 数据源：TodoWrite 工具的 input.todos（完整列表，SSE 与存储渲染共用同一入口）。
-let curTodos = [];
-let todoOpen = false;
-
-function ingestTodos(toolName, input) {
-  if (toolName !== 'TodoWrite') return;
-  const todos = input?.todos;
-  if (Array.isArray(todos) && todos.length) {
-    curTodos = todos.map((t) => ({
-      content: String(t.content ?? ''),
-      status: String(t.status ?? 'pending'),
-    }));
-    renderTodoBar();
-  }
-}
-
-const TODO_IC = { completed: '✓', in_progress: '▶', pending: '○' };
-function renderTodoBar() {
-  const bar = $('todoBar');
-  if (!curTodos.length) { bar.style.display = 'none'; bar.classList.remove('open'); return; }
-  const done = curTodos.filter((t) => t.status === 'completed').length;
-  const cur = curTodos.find((t) => t.status === 'in_progress');
-  bar.style.display = 'block';
-  bar.textContent = '';
-  const head = el('div', 'thead');
-  head.appendChild(el('span', 'arr', '▶'));
-  head.appendChild(el('span', 'prog', `任务计划 ${done}/${curTodos.length}`));
-  if (cur) head.appendChild(el('span', 'cur', cur.content));
-  head.addEventListener('click', () => { todoOpen = !todoOpen; renderTodoBar(); });
-  bar.appendChild(head);
-  const box = el('div', 'titems');
-  for (const t of curTodos) {
-    const row = el('div', `titem${t.status === 'completed' ? ' done' : t.status === 'in_progress' ? ' doing' : ''}`);
-    row.appendChild(el('span', 'ic', TODO_IC[t.status] ?? '○'));
-    row.appendChild(el('span', '', t.content));
-    box.appendChild(row);
-  }
-  bar.appendChild(box);
-  bar.classList.toggle('open', todoOpen);
-}
 let busySource = null;       // 'sse' = 本引擎事件驱动；'inferred' = 轮询推断
 let lastActivity = 0;        // 推断运行态最近一次见到存储变化的时刻
 let lastSseEventAt = 0;      // 最近一次收到 SSE 事件（检测流静默/死亡）
@@ -1302,8 +1284,6 @@ function renderHistory(messages) {
   chat.textContent = '';
   msgEls.clear(); toolEls.clear(); thinkTimers.clear();
   sseUserEchoes = []; // 全量重绘，SSE 回显气泡已随 DOM 清掉
-  curTodos = [];      // todo 折叠条由本会话历史里的 TodoWrite 重新灌入
-  renderTodoBar();
   // 更新尾部指纹：轮询跟随以这里为准（打开会话/重连重同步/轮询全量拉取共用）
   lastFingerprint = fingerprint(messages);
   // 思考块：最后一条的默认展开，其余折叠
@@ -1328,8 +1308,7 @@ function renderHistory(messages) {
         }
         case 'tool': {
           const st = part.state ?? {};
-          ingestTodos(part.tool, st.input);
-          // TodoWrite 不渲染工具行（底部任务计划折叠条已承载进度）
+          // TodoWrite 不渲染工具行
           if (String(part.tool ?? '').toLowerCase() === 'todowrite') break;
           const card = toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
           const status = st.status ?? 'pending';
@@ -1411,14 +1390,13 @@ function openInfo(title, loader) {
 // 用量/上下文容量面板（对照官方：容量大卡 + 分类占比 + 统计 + 压缩入口）
 // 上下文/套餐弹卡（审批卡风格，锚在模型旁圆圈上方）：
 // 上下文容量（KV 占用）+ 账户套餐额度 + 本机统计。不开侧栏抽屉。
-// 打开/关闭由通用 togglePop（btnCtx/btnUsage）负责；这里只负责渲染内容。
+// 打开/关闭由通用 togglePop（btnCtx）负责；这里只负责渲染内容。
 async function loadUsage(silent = false) {
   const pop = $('ctxPop');
   if (silent && !pop.classList.contains('open')) return;
   if (!silent) { pop.textContent = ''; pop.appendChild(el('div', 'sysline', '加载中…')); }
-  let settings = null, usage = null, goal = null, plan = null, stats = null;
+  let settings = null, goal = null, plan = null, stats = null;
   try { settings = curSession ? await api(`sessions/${encodeURIComponent(curSession)}/settings`) : null; } catch { /* 降级 */ }
-  try { usage = curSession ? await api(`sessions/${encodeURIComponent(curSession)}/usage`) : null; } catch { /* 降级 */ }
   // projection 为 0（会话未在本进程激活过）时，goal 快照的 contextUsed 是更可靠来源
   if (!settings?.projection?.contextUsed) {
     try { goal = curSession ? await api(`sessions/${encodeURIComponent(curSession)}/goal`) : null; } catch { /* 降级 */ }
@@ -1490,23 +1468,6 @@ async function loadUsage(silent = false) {
     pop.appendChild(row('会话 / 回合', `${stats.totalSessions} / ${stats.totalTurns}`));
   } else {
     pop.appendChild(el('div', 'sub', stats?.unavailable ? `暂不可用：${stats.unavailable}` : '近 7 天暂无用量'));
-  }
-  // 会话内 token 明细（引擎按会话返回时补充展示）
-  if (usage && !usage.unavailable) {
-    const flat = {};
-    const walk = (o, prefix) => {
-      for (const [k, v] of Object.entries(o ?? {})) {
-        const key = prefix ? `${prefix}.${k}` : k;
-        if (v && typeof v === 'object') walk(v, key);
-        else flat[key] = v;
-      }
-    };
-    walk(usage, '');
-    const found = Object.entries(flat).find(([fk]) => fk === 'totalTokens' || fk.endsWith('.totalTokens'));
-    if (found && Number(found[1]) > 0) {
-      pop.appendChild(el('div', 's2', '当前会话'));
-      pop.appendChild(row('Token 总数', fmtWan(Number(found[1]))));
-    }
   }
   // ── 压缩上下文入口 ──
   if (curSession) {
@@ -1699,7 +1660,6 @@ function handleZcodeEvent(ev) {
       }
       else if (part.type === 'tool') {
         const st = part.state ?? {};
-        ingestTodos(part.tool, st.input);
         if (String(part.tool ?? '').toLowerCase() !== 'todowrite') {
           toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
           setToolStatus(part.callId, st.status ?? 'pending', undefined, st.status === 'error' ? st.error : st.output);
@@ -1734,8 +1694,7 @@ function handleZcodeEvent(ev) {
     case 'tool.updated': {
       const p = ev.payload ?? {};
       if (p.kind === 'batch') break;
-      ingestTodos(p.toolName, p.input);
-      // TodoWrite 不渲染工具行（底部任务计划折叠条已承载进度）
+      // TodoWrite 不渲染工具行
       if (String(p.toolName ?? '').toLowerCase() === 'todowrite') break;
       const id = p.toolCallId;
       const desc = inputSummary(p.input) || (p.toolName ?? '');
@@ -1759,10 +1718,15 @@ function handleZcodeEvent(ev) {
       setBusy(false);
       stopLiveTimers();
       notifyTaskState(false);
-      // 断流期间工具行可能停在 running：从存储补一次最终状态重绘
-      api(`sessions/${encodeURIComponent(curSession)}/messages?limit=10`)
-        .then((r) => renderTail(r.messages ?? []))
-        .catch(() => {});
+      // 断流期间工具行可能停在 running：从存储补一次最终状态重绘。
+      // 异步竞态守卫：await 期间用户切到别的会话时，旧会话的消息不得
+      // 渲染进新会话视图（串台）——回调里校验会话未变才补绘。
+      {
+        const sidForRedraw = curSession;
+        api(`sessions/${encodeURIComponent(curSession)}/messages?limit=10`)
+          .then((r) => { if (curSession === sidForRedraw) renderTail(r.messages ?? []); })
+          .catch(() => {});
+      }
       loadPlan();
       loadUsage(true);
       refreshSettings(false); // 回合结束后上下文占用变了：刷新模型旁的容量环
@@ -1923,8 +1887,12 @@ function connectStream(sessionId, afterSeq = -1) {
 
 async function resync() {
   if (!curSession) return;
+  const sid = curSession;
   try {
-    const r = await api(`sessions/${encodeURIComponent(curSession)}/messages`);
+    const r = await api(`sessions/${encodeURIComponent(sid)}/messages`);
+    // 异步竞态守卫：await 期间用户已切换会话 → 旧会话全量历史不得渲染进
+    // 新会话视图（串台）。SSE 断线重连瞬间正好叠加快速切换会话时必现。
+    if (curSession !== sid) return;
     renderHistory(r.messages ?? []);
   } catch { /* 下次重连再试 */ }
 }
@@ -1969,8 +1937,7 @@ function renderTail(messages) {
         }
         case 'tool': {
           const st = part.state ?? {};
-          ingestTodos(part.tool, st.input);
-          // TodoWrite 不渲染工具行（底部任务计划折叠条已承载进度）
+          // TodoWrite 不渲染工具行
           if (String(part.tool ?? '').toLowerCase() === 'todowrite') break;
           const card = toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
           const status = st.status ?? 'pending';
@@ -1999,6 +1966,9 @@ function renderTail(messages) {
 //   （工具执行期事件也在流，且存储里工具部件停在 running，finished=false）。
 async function pollTick() {
   if (!curSession) return;
+  // 本次探测的目标会话快照：await 之后凡是渲染/复位类副作用都必须确认
+  // 用户没有切走（切换会话后旧会话的探测结果落到新会话视图 = 串台）
+  const sid = curSession;
   if (document.hidden) return; // WebView 后台会暂停定时器，回前台自然补一次
   // 版本漂移检测（每 ~20 次探测一次，约 25 秒）：服务端页面更新后自动刷新，
   // 否则手机一直跑内存里的旧 JS，页面级修复永远到不了终端
@@ -2014,7 +1984,8 @@ async function pollTick() {
     } catch { /* 下次再试 */ }
   }
   try {
-    const probe = await api(`sessions/${encodeURIComponent(curSession)}/messages?limit=10`);
+    const probe = await api(`sessions/${encodeURIComponent(sid)}/messages?limit=10`);
+    if (curSession !== sid) return; // await 期间已切换会话：本次探测作废（防串台）
     const msgs = probe.messages ?? [];
     const fp = fingerprint(msgs);
     const finished = turnLooksFinished(msgs);
@@ -2085,6 +2056,7 @@ async function pollTick() {
       loadAllSessions();
     }
   } catch (e) {
+    if (curSession !== sid) return; // 旧会话探测的异常不驱动新会话的 resume/复位
     // 服务端重启后引擎里没有这个会话（未 resume）：自动重新打开恢复
     if (/not active/i.test(String(e?.message ?? e))) {
       ensureResumed();
@@ -2239,7 +2211,6 @@ $('fileInput').addEventListener('change', async (e) => {
   e.target.value = '';
   handleFilePicked(f);
 });
-$('btnUsage').addEventListener('click', (e) => { e.stopPropagation(); togglePop($('ctxPop'), e.currentTarget, () => loadUsage(false)); });
 $('btnInfoClose').addEventListener('click', () => $('info').classList.remove('open'));
 $('info').addEventListener('click', (e) => { if (e.target.id === 'info') $('info').classList.remove('open'); });
 // ⋯ 溢出菜单
