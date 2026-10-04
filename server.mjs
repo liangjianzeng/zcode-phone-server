@@ -24,6 +24,7 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -470,6 +471,28 @@ function modelRefToJson(ref) {
 }
 
 /**
+ * 引擎投影的 contextUsed 只在本进程内有活回合时才非 0——会话 resume 后处于
+ * idle 时恒报 0（2026-10-04 实测），页面就会显示「0 / 20万」这种错误容量。
+ * 从源头补：共享 DB（与桌面端同一个 sqlite）里该会话最后一次模型请求的
+ * input+output 就是当前上下文占用的真实值（实测与运行态投影吻合：
+ * 投影 126,275 ↔ 最后一请求 input 127,568，差一次回复长度）。
+ */
+const AGENT_DB_PATH = path.join(os.homedir(), '.zcode', 'cli', 'db', 'db.sqlite');
+let agentDbHandle = null;
+function dbContextUsage(sessionId) {
+  if (!sessionId) return null;
+  try {
+    if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
+    const row = agentDbHandle.prepare(
+      'SELECT input_tokens, output_tokens FROM model_usage WHERE session_id = ? ORDER BY started_at DESC, id DESC LIMIT 1'
+    ).get(sessionId);
+    if (!row) return null;
+    const used = Number(row.input_tokens ?? 0) + Number(row.output_tokens ?? 0);
+    return used > 0 ? used : null;
+  } catch { return null; }
+}
+
+/**
  * 把 session/create|resume|read 的快照投影成前端友好的设置对象：
  * model.current/available（含 reasoning 档位）、thoughtLevel、mode、slashCommands、
  * projection（上下文占用，供官方样式「上下文容量」卡片使用）。
@@ -479,6 +502,11 @@ function projectSettings(snapshot) {
   const model = st.model ?? {};
   const thought = st.thoughtLevel ?? {};
   const proj = snapshot?.projection ?? null;
+  const sid = String(snapshot?.session?.id ?? snapshot?.sessionId ?? '');
+  // 投影缺 0（idle/外进程驱动）时用共享 DB 的真实上下文占用补
+  const used = Number(proj?.contextUsed ?? 0) > 0
+    ? Number(proj.contextUsed)
+    : (dbContextUsage(sid) ?? 0);
   return {
     model: {
       current: modelRefToJson(model.current),
@@ -507,11 +535,11 @@ function projectSettings(snapshot) {
     },
     mode: { current: st.mode?.current ?? snapshot?.session?.mode ?? config.mode },
     slashCommands: Array.isArray(snapshot?.slashCommands) ? snapshot.slashCommands : [],
-    projection: proj ? {
-      contextUsed: proj.contextUsed ?? 0,
-      contextWindow: proj.contextWindow ?? 0,
-      totalTokenCount: proj.totalTokenCount ?? 0,
-      status: proj.status ?? '',
+    projection: (proj || used > 0) ? {
+      contextUsed: used,
+      contextWindow: Number(proj?.contextWindow ?? 0) > 0 ? Number(proj.contextWindow) : 200000,
+      totalTokenCount: proj?.totalTokenCount ?? 0,
+      status: proj?.status ?? '',
     } : null,
   };
 }
@@ -997,6 +1025,15 @@ async function handleApi(req, res, url) {
         const r = await agent.request('session/read', { sessionId: sid, messageLimit: 1 });
         return sendJson(res, 200, projectSettings(r ?? {}));
       } catch (e) {
+        // 会话不在本进程激活（引擎重启后未 resume）：模型/档位拿不到，但
+        // 上下文容量仍可从共享 DB 回答（页面弹卡需要它，不能整包 unavailable）
+        const used = dbContextUsage(sid);
+        if (used != null) {
+          return sendJson(res, 200, {
+            unavailable: String(e?.message ?? e).slice(0, 200),
+            projection: { contextUsed: used, contextWindow: 200000, totalTokenCount: 0, status: '' },
+          });
+        }
         return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
       }
     }

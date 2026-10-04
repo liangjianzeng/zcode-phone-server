@@ -442,7 +442,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.2';
+const PAGE_BUILD = '2026-10-04.3';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -861,7 +861,10 @@ async function refreshSettings(renderMenus = true) {
   if (!curSession) return;
   try {
     const s = await api(`sessions/${encodeURIComponent(curSession)}/settings`);
+    // unavailable（会话未在本进程激活）时服务端仍可能带共享 DB 回退的
+    // projection——只吸收 projection，模型/档位保持现有值
     if (s && !s.unavailable) sessionSettings = s;
+    else if (s?.projection && sessionSettings) sessionSettings.projection = s.projection;
   } catch { /* 保持现有设置 */ }
   // projection 为 0 时用 goal 快照回退：会话恢复后引擎的 projection 常报 0，
   // 而 goal 快照的 contextUsed/contextWindow 是真实值（用量面板同款回退）
@@ -1269,6 +1272,8 @@ async function loadUsage(silent = false) {
   };
   pop.textContent = '';
   // ── 上下文容量（本轮会话 KV 占用）──
+  // settings unavailable（会话未在本进程激活）时服务端也会带 projection
+  // （共享 DB 回退值），此时不可整包丢弃，只跳过模型/档位同步
   const proj = settings?.projection;
   const gctx = goal?.snapshot ?? {};
   const used = Number(proj?.contextUsed ?? gctx.contextUsed ?? 0);
