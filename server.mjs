@@ -566,6 +566,65 @@ function dbContextUsage(sessionId) {
   } catch { return null; }
 }
 
+// ── 会话管理（归档/删除/任务计划）：引擎无对应 RPC，桌面版同款做法是直接
+// 读写共享 db.sqlite（session.time_archived 列 + todo 表）。WAL 多进程写安全，
+// busy_timeout 防止与引擎写入互锁。
+let agentDbWriteHandle = null;
+function agentDbWrite() {
+  if (!agentDbWriteHandle) {
+    agentDbWriteHandle = new DatabaseSync(AGENT_DB_PATH);
+    agentDbWriteHandle.exec('PRAGMA busy_timeout=5000');
+    agentDbWriteHandle.exec('PRAGMA journal_mode=WAL');
+  }
+  return agentDbWriteHandle;
+}
+
+function dbSessionArchived(sid) {
+  try {
+    if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
+    const row = agentDbHandle.prepare('SELECT time_archived FROM session WHERE id = ?').get(sid);
+    return row ? row.time_archived != null : null;
+  } catch { return null; }
+}
+
+function dbArchiveSession(sid, archived) {
+  const db = agentDbWrite();
+  db.prepare('UPDATE session SET time_archived = ? WHERE id = ?')
+    .run(archived ? Date.now() : null, sid);
+}
+
+// 删除会话：先关引擎内激活实例，再连带清所有 session 维度数据行（只删该会话）
+const SESSION_SCOPED_TABLES = [
+  'part', 'message', 'todo', 'session_entry', 'session_input',
+  'model_usage', 'turn_usage', 'tool_usage', 'input_history',
+  'session_target',
+];
+function dbDeleteSession(sid) {
+  const db = agentDbWrite();
+  db.exec('BEGIN');
+  try {
+    // session_task_link 两列都可能指向该会话
+    db.prepare('DELETE FROM session_task_link WHERE child_session_id = ? OR parent_session_id = ?').run(sid, sid);
+    for (const t of SESSION_SCOPED_TABLES) {
+      db.prepare(`DELETE FROM ${t} WHERE session_id = ?`).run(sid);
+    }
+    db.prepare('DELETE FROM session WHERE id = ?').run(sid);
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* noop */ }
+    throw e;
+  }
+}
+
+function dbSessionTodos(sid) {
+  try {
+    if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
+    return agentDbHandle.prepare(
+      'SELECT content, status, priority, position FROM todo WHERE session_id = ? ORDER BY position'
+    ).all(sid);
+  } catch { return []; }
+}
+
 /**
  * z.ai Coding Plan 的 GLM-5.3 系列真实上下文窗口是 1M（100万 KV）：
  * 引擎内置 provider 目录写的是 200K 老默认值，且投影 contextUsed 实测已
@@ -1071,15 +1130,17 @@ async function sessionLooksFinished(sid) {
     // session/list 的 workspace 可选——不传即返回全部会话，每条带归属 workspace。
     if (url.searchParams.get('all') === '1') {
       const now = Date.now();
-      if (!allListCache || now - allListCache.t > 5000) {
-        const r = await agent.request('session/list', { limit: 200, includeArchived: false });
-        const list = await Promise.all((r.sessions ?? []).map(async (s) => ({
+      const wantArchived = url.searchParams.get('archived') === '1';
+      if (!allListCache || allListCache.archived !== wantArchived || now - allListCache.t > 5000) {
+        const r = await agent.request('session/list', { limit: 200, includeArchived: true });
+        const mapped = await Promise.all((r.sessions ?? []).map(async (s) => ({
           sessionId: s.sessionId,
           title: String(s.title ?? '').includes('\uFFFD') ? '' : s.title,
           status: s.status,
           mode: s.mode,
           updatedAt: s.updatedAt,
           createdAt: s.createdAt,
+          archived: dbSessionArchived(s.sessionId) === true,
           workspacePath:
             s.workspace?.workspacePath ?? s.workspace?.workspaceKey ?? s.workspacePath ?? '',
           // status=running 必须经存储核实：外进程驱动的回合结束后桥收不到
@@ -1088,8 +1149,9 @@ async function sessionLooksFinished(sid) {
             || (String(s.status ?? '').toLowerCase() === 'running'
               && !(await sessionLooksFinished(s.sessionId))),
         })));
+        const list = mapped.filter((s) => s.archived === wantArchived);
         list.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
-        allListCache = { t: now, list };
+        allListCache = { t: now, list, archived: wantArchived };
         // 双向同步：手机侧会话同步进桌面任务索引（桌面→手机本就走共享存储）
         syncTaskIndexRows(list).catch(() => {});
         for (const it of list) {
@@ -1231,6 +1293,27 @@ async function sessionLooksFinished(sid) {
       return sendJson(res, 200, { queue: sessionState(sid).queue });
     }
 
+    // 立即发出：把该项挪到队首并请求停止当前回合；停止完成后 flushQueue 优先补发
+    if (req.method === 'POST' && sub === 'queue/send-now') {
+      const body = await readBody(req);
+      const id = String(body.id ?? '');
+      const st = sessionState(sid);
+      const idx = st.queue.findIndex((q) => q.id === id);
+      if (idx < 0) return sendJson(res, 404, { error: '排队项不存在' });
+      if (idx > 0) {
+        const [item] = st.queue.splice(idx, 1);
+        st.queue.unshift(item);
+      }
+      st.flushOnStop = true;
+      if (st.lastSend?.timer) clearTimeout(st.lastSend.timer);
+      st.lastSend = null;
+      const r = await agent.request('session/stop', { sessionId: sid }).catch((e) => ({ error: e.message }));
+      // 停止请求已下：引擎收尾有间隙，短延迟试发 + queuePoll 3s 周期兜底
+      scheduleQueueFlush(sid, 2500);
+      startQueuePoll(sid);
+      return sendJson(res, 200, r ?? {});
+    }
+
     if (req.method === 'POST' && sub === 'queue/remove') {
       const body = await readBody(req);
       const id = String(body.id ?? '');
@@ -1281,6 +1364,44 @@ async function sessionLooksFinished(sid) {
       const r = await agent.request('session/close', { sessionId: sid }).catch((e) => ({ error: e.message }));
       sessions.delete(sid);
       return sendJson(res, 200, r ?? {});
+    }
+
+    // 归档 / 取消归档：直接写共享 DB 的 session.time_archived（桌面版同源数据）。
+    // 归档当前激活会话时顺带关闭引擎实例，避免僵尸 running。
+    if (req.method === 'POST' && sub === 'archive') {
+      const body = await readBody(req);
+      const archived = body.archived !== false;
+      dbArchiveSession(sid, archived);
+      allListCache = null;
+      if (archived) {
+        const st = sessionState(sid);
+        st.busy = false; st.busySince = 0;
+        agent.request('session/close', { sessionId: sid }).catch(() => {});
+        sessions.delete(sid);
+      }
+      return sendJson(res, 200, { archived, sessionId: sid });
+    }
+
+    // 删除会话：运行中拒绝；先关引擎实例再连带清全部 session 维度数据行。
+    if (req.method === 'POST' && sub === 'delete') {
+      const st = sessionState(sid);
+      if (st.busy || sessionState(sid).lastSend?.timer) {
+        return sendJson(res, 409, { error: '会话正在运行任务，先停止再删除' });
+      }
+      await agent.request('session/close', { sessionId: sid }).catch(() => {});
+      sessions.delete(sid);
+      try {
+        dbDeleteSession(sid);
+      } catch (e) {
+        return sendJson(res, 500, { error: String(e?.message ?? e).slice(0, 200) });
+      }
+      allListCache = null;
+      return sendJson(res, 200, { deleted: true, sessionId: sid });
+    }
+
+    // 任务计划（TodoWrite 落库的实时状态，桌面版同源数据）
+    if (req.method === 'GET' && sub === 'todos') {
+      return sendJson(res, 200, { todos: dbSessionTodos(sid) });
     }
 
     // 会话设置快照（session/read，消息取 1 条保持轻量）：模型菜单/思考档位/权限

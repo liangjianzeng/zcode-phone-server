@@ -28,14 +28,19 @@
   /* ── 顶栏已移除（会话名不再占一行，sessTitle 仅作 JS 数据位视觉隐藏）── */
   .vh2 { display: none; }
 
-  /* ── 左侧边栏区：常驻竖排功能按钮（后续新功能图标加在这里）── */
+  /* ── 左侧边栏区：常驻竖排功能按钮（后续新功能图标加在这里）──
+     栏体 fixed 贴左缘全高（顶→底），图标按钮仍在原位置；消息区与输入卡让出 46px */
   #mainRow { flex: 1; display: flex; min-height: 0; }
   #sideRail {
-    flex: none; width: 46px;
+    position: fixed; left: 0; top: 0; bottom: 0; z-index: 6;
+    width: 46px;
     display: flex; flex-direction: column; align-items: center; gap: 4px;
-    padding: calc(8px + env(safe-area-inset-top)) 0 8px; background: var(--panel); border-right: 1px solid var(--line);
+    padding: calc(8px + env(safe-area-inset-top)) 0 calc(8px + env(safe-area-inset-bottom));
+    background: var(--panel); border-right: 1px solid var(--line);
     overflow-y: auto; overflow-x: hidden;
   }
+  #mainRow, footer { margin-left: 46px; }
+  footer { border-top-left-radius: 0; }
   .railbtn {
     background: transparent; border: none; color: var(--dim); cursor: pointer;
     width: 36px; height: 36px; border-radius: 10px; padding: 0; flex: none;
@@ -45,6 +50,27 @@
   #sideRail .mname { display: none; } /* 模型名数据位保留（JS 读写），竖栏里只显示图标 */
   .railsep { flex: none; width: 22px; height: 1px; background: var(--line); margin: 3px 0; }
   #railFuture { flex: 1; min-height: 8px; } /* 弹性占位：后续按钮可顺次排在上方或锚定底部 */
+
+  /* ── 任务计划折叠条（官方桌面版 todo 面板同款：消息区顶部 sticky）── */
+  #todoBar {
+    position: sticky; top: 0; z-index: 4; display: none;
+    margin: -4px -6px 8px; padding: 8px 10px;
+    background: color-mix(in srgb, var(--panel) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--line); border-radius: 12px;
+    cursor: pointer;
+  }
+  #todoBar .thead { display: flex; align-items: center; gap: 8px; }
+  #todoBar .chev { color: var(--faint); flex: none; font-size: 11px; }
+  #todoBar .tsum { flex: 1; min-width: 0; font-size: 12.5px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #todoBar .tnum { color: var(--accent); font-weight: 650; font-variant-numeric: tabular-nums; }
+  #todoBar .titems { display: none; margin-top: 8px; flex-direction: column; gap: 3px; }
+  #todoBar.open .titems { display: flex; }
+  #todoBar .ti { display: flex; gap: 8px; font-size: 12.5px; line-height: 1.45; color: var(--dim); }
+  #todoBar .ti .mk { flex: none; width: 14px; text-align: center; }
+  #todoBar .ti.done { color: var(--faint); text-decoration: line-through; }
+  #todoBar .ti.cur { color: var(--fg); }
+  #todoBar .ti .mk.done { color: var(--ok); }
 
   /* ── 消息流 ── */
   main { flex: 1; min-width: 0; overflow-y: auto; padding: calc(14px + env(safe-area-inset-top)) 16px 10px; scroll-behavior: smooth; }
@@ -159,11 +185,14 @@
   }
   .qpill .qarr { color: var(--dim); flex: none; }
   .qpill .qtext { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .qpill .qx {
+  .qpill .qx, .qpill .qact {
     flex: none; background: transparent; border: none; color: var(--faint);
     width: 24px; height: 24px; border-radius: 999px; padding: 0; cursor: pointer;
     display: inline-flex; align-items: center; justify-content: center;
+    font-size: 12px;
   }
+  .qpill .qact { color: var(--dim); }
+  .qpill .qact:active, .qpill .qx:active { background: var(--bg); color: var(--fg); }
 
   /* ── 底部输入卡（官方：大圆角卡 + 底行图标/模型名/停止方块）── */
   footer {
@@ -270,6 +299,7 @@
   .sess { display: flex; align-items: center; gap: 8px; margin-left: 18px; }
   .sess .t { flex: 1; min-width: 0; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sess .time { flex: none; color: var(--faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .sess .time.running { color: var(--ok); }
   .sess .busy { display: flex; color: var(--ok); flex: none; }
   .morebtn {
     display: block; width: calc(100% - 26px); margin: 0 0 4px 18px; padding: 6px 8px;
@@ -277,6 +307,29 @@
     font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; border-radius: 8px;
   }
   .morebtn:active { background: var(--card); }
+  /* 会话行 ⋯ 菜单按钮 + 弹出操作单（打开/归档/删除） */
+  .sess .smore {
+    flex: none; width: 26px; height: 26px; border-radius: 7px; border: none;
+    background: transparent; color: var(--faint); cursor: pointer;
+    display: none; align-items: center; justify-content: center; padding: 0;
+    font-size: 15px; line-height: 1;
+  }
+  .sess:hover .smore, .sess:active .smore { display: inline-flex; }
+  .smore-pop {
+    position: fixed; z-index: 40; display: none; min-width: 128px; left: 0; top: 0;
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 5px; box-shadow: 0 8px 28px rgba(0,0,0,.5);
+  }
+  .smore-pop.open { display: block; }
+  .smore-pop button {
+    display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
+    background: transparent; border: none; padding: 9px 11px; border-radius: 8px;
+    font-size: 13.5px; color: var(--fg); cursor: pointer;
+  }
+  .smore-pop button:active { background: var(--panel); }
+  .smore-pop button.danger { color: var(--err); }
+  .archsect { padding: 6px 12px 2px; display: flex; align-items: center; gap: 6px; }
+  .archsect b { color: var(--faint); font-size: 11.5px; font-weight: 600; letter-spacing: .05em; flex: 1; }
   .sect { padding: 12px 12px 4px; font-size: 12px; color: var(--faint); font-weight: 600; letter-spacing: .05em; }
   .sess { padding: 10px 12px; border-radius: 10px; margin: 4px 0; cursor: pointer; border: 1px solid transparent; }
   .sess:active, .sess.cur { background: var(--card); border-color: var(--line); }
@@ -381,7 +434,13 @@
     <!-- 后续新功能按钮加在 railFuture 之上（跟随上方按钮顺排）；也可锚定到底部 -->
     <div id="railFuture"></div>
   </nav>
-  <main id="chat"><div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2" id="heroTip">选择一个会话，下达你的第一个任务</div></div></main>
+  <main id="chat">
+    <div id="todoBar" role="button" aria-label="任务计划" title="点击展开/收起任务计划">
+      <div class="thead"><span class="chev">▸</span><span class="tsum"></span></div>
+      <div class="titems"></div>
+    </div>
+    <div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2" id="heroTip">选择一个会话，下达你的第一个任务</div></div>
+  </main>
 </div>
 
 <footer>
@@ -441,6 +500,8 @@
     <div class="sheetbody" id="infoBody"><div class="sysline">加载中…</div></div>
   </div>
 </div>
+<!-- 会话行操作单（打开 / 归档或恢复 / 删除），锚定在 ⋯ 按钮旁 -->
+<div id="sessPop" class="smore-pop"></div>
 <div id="toast" class="toast"></div>
 
 <script>
@@ -449,7 +510,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.14';
+const PAGE_BUILD = '2026-10-04.15';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -1296,8 +1357,70 @@ function turnLooksRunning(messages) {
 }
 
 // 历史消息（/session/messages 的 MessageWithParts）
+// ── 任务计划（官方桌面版 todo 面板）：DB todos 实时状态 + TodoWrite 事件即时刷新 ──
+let curTodos = [];
+let todoOpen = false;
+// todoBar 的持久引用：renderHistory 的 textContent='' 会把节点从文档摘掉，
+// getElementById 对 detached 节点返回 null → appendChild(null) 崩溃（实测踩过）
+const todoBarEl = document.getElementById('todoBar');
+
+async function refreshTodos(sid) {
+  const target = sid ?? curSession;
+  if (!target) return;
+  try {
+    const r = await api(`sessions/${encodeURIComponent(target)}/todos`);
+    if (target !== curSession) return; // 会话已切换：丢弃过期结果
+    curTodos = (r.todos ?? []).map((t) => ({
+      content: String(t.content ?? ''),
+      status: String(t.status ?? 'pending'),
+    }));
+    renderTodoBar();
+  } catch { /* 端点缺失/会话未激活：保持现状 */ }
+}
+
+function renderTodoBar() {
+  const bar = todoBarEl;
+  if (!curSession || !curTodos.length) { bar.style.display = 'none'; return; }
+  bar.style.display = 'block';
+  const done = curTodos.filter((t) => t.status === 'completed').length;
+  bar.classList.toggle('open', todoOpen);
+  bar.querySelector('.chev').textContent = todoOpen ? '▾' : '▸';
+  const cur = curTodos.find((t) => t.status === 'in_progress');
+  const sum = cur ? `正在：${cur.content}` : (done === curTodos.length ? '全部完成' : '等待执行');
+  bar.querySelector('.tsum').textContent = sum;
+  bar.querySelector('.tsum').insertAdjacentHTML('beforeend',
+    ` <span class="tnum">${done}/${curTodos.length}</span>`);
+  const box = bar.querySelector('.titems');
+  box.textContent = '';
+  for (const t of curTodos) {
+    const row = el('div', 'ti' + (t.status === 'completed' ? ' done' : '') + (t.status === 'in_progress' ? ' cur' : ''));
+    const mk = el('span', 'mk' + (t.status === 'completed' ? ' done' : ''),
+      t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '●' : '○');
+    row.appendChild(mk);
+    row.appendChild(el('span', '', t.content));
+    box.appendChild(row);
+  }
+}
+
+todoBarEl.addEventListener('click', () => {
+  todoOpen = !todoOpen;
+  renderTodoBar();
+});
+
+// TodoWrite 工具事件到达：短延迟批量刷新（同一回合多次写入只刷一次）
+let todoRefreshTimer = null;
+function scheduleTodoRefresh() {
+  if (todoRefreshTimer) return;
+  todoRefreshTimer = setTimeout(() => {
+    todoRefreshTimer = null;
+    refreshTodos();
+  }, 600);
+}
+
 function renderHistory(messages) {
   chat.textContent = '';
+  // 任务计划条是 chat 的常驻首子节点（sticky），全量重绘后补回
+  chat.appendChild(todoBarEl);
   msgEls.clear(); toolEls.clear(); thinkTimers.clear();
   sseUserEchoes = []; // 全量重绘，SSE 回显气泡已随 DOM 清掉
   // 更新尾部指纹：轮询跟随以这里为准（打开会话/重连重同步/轮询全量拉取共用）
@@ -1308,7 +1431,9 @@ function renderHistory(messages) {
   if (thinks.length) { thinks[thinks.length - 1].open = true; openThinkDetails = thinks[thinks.length - 1]; }
   const vis = visibleMessages(messages);
   if (!vis.length) {
-    chat.innerHTML = '<div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2">这个会话还没有消息</div></div>';
+    const hero = el('div', 'hero');
+    hero.innerHTML = '<div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2">这个会话还没有消息</div>';
+    chat.appendChild(hero);
     return;
   }
   for (const msg of vis) {
@@ -1325,8 +1450,8 @@ function renderHistory(messages) {
         }
         case 'tool': {
           const st = part.state ?? {};
-          // TodoWrite 不渲染工具行
-          if (String(part.tool ?? '').toLowerCase() === 'todowrite') break;
+          // TodoWrite 不渲染工具行，但刷新任务计划条
+          if (String(part.tool ?? '').toLowerCase() === 'todowrite') { scheduleTodoRefresh(); break; }
           const card = toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
           const status = st.status ?? 'pending';
           const detail = status === 'error' ? st.error : st.output;
@@ -1677,7 +1802,9 @@ function handleZcodeEvent(ev) {
       }
       else if (part.type === 'tool') {
         const st = part.state ?? {};
-        if (String(part.tool ?? '').toLowerCase() !== 'todowrite') {
+        if (String(part.tool ?? '').toLowerCase() === 'todowrite') {
+          scheduleTodoRefresh();
+        } else {
           toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
           setToolStatus(part.callId, st.status ?? 'pending', undefined, st.status === 'error' ? st.error : st.output);
         }
@@ -1711,8 +1838,8 @@ function handleZcodeEvent(ev) {
     case 'tool.updated': {
       const p = ev.payload ?? {};
       if (p.kind === 'batch') break;
-      // TodoWrite 不渲染工具行
-      if (String(p.toolName ?? '').toLowerCase() === 'todowrite') break;
+      // TodoWrite 不渲染工具行，但刷新任务计划条
+      if (String(p.toolName ?? '').toLowerCase() === 'todowrite') { scheduleTodoRefresh(); break; }
       const id = p.toolCallId;
       const desc = inputSummary(p.input) || (p.toolName ?? '');
       toolCard(id, p.toolName, desc);
@@ -1964,8 +2091,8 @@ function renderTail(messages) {
         }
         case 'tool': {
           const st = part.state ?? {};
-          // TodoWrite 不渲染工具行
-          if (String(part.tool ?? '').toLowerCase() === 'todowrite') break;
+          // TodoWrite 不渲染工具行，但刷新任务计划条
+          if (String(part.tool ?? '').toLowerCase() === 'todowrite') { scheduleTodoRefresh(); break; }
           const card = toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
           const status = st.status ?? 'pending';
           const detail = status === 'error' ? st.error : st.output;
@@ -2132,11 +2259,12 @@ function renderQueue(queue) {
   bar.style.display = queue?.length ? 'flex' : 'none';
   for (const item of queue ?? []) {
     const pill = el('div', 'qpill');
-    pill.title = '点击取回到输入框（取消自动发送）';
     pill.appendChild(el('span', 'qarr', '→'));
     pill.appendChild(el('span', 'qtext', item.text));
-    // 点击 pill：取回——从队列移除并填回输入框，可改后重发或放弃
-    pill.addEventListener('click', async () => {
+    // ✎：取回到输入框编辑（取消自动发送），改完可再排队或立即发
+    const edit = el('button', 'qact', '✎');
+    edit.title = '编辑：取回到输入框';
+    edit.addEventListener('click', async () => {
       try {
         await api(`sessions/${encodeURIComponent(curSession)}/queue/remove`, { method: 'POST', body: JSON.stringify({ id: item.id }) });
       } catch { /* 队列已变：下次 ui 事件对齐 */ }
@@ -2144,8 +2272,20 @@ function renderQueue(queue) {
       composer.dispatchEvent(new Event('input'));
       composer.focus();
     });
+    pill.appendChild(edit);
+    // ⚡：立即发出——先停当前回合，服务端停止完成后补发该项（其余队列保留）
+    const zap = el('button', 'qact', '⚡');
+    zap.title = '立即发送：打断当前任务，优先发出这条';
+    zap.addEventListener('click', async () => {
+      try {
+        await api(`sessions/${encodeURIComponent(curSession)}/queue/send-now`, { method: 'POST', body: JSON.stringify({ id: item.id }) });
+        toast('已请求停止当前任务，将立即发出该消息');
+      } catch (e) { toast(`立即发送失败：${e.message}`); }
+    });
+    pill.appendChild(zap);
     // ✕：直接丢弃该排队项
     const x = el('button', 'qx', '✕');
+    x.title = '删除该排队项';
     x.addEventListener('click', async () => {
       try {
         await api(`sessions/${encodeURIComponent(curSession)}/queue/remove`, { method: 'POST', body: JSON.stringify({ id: item.id }) });
@@ -2286,20 +2426,79 @@ function fmtRel(ts) {
   return `${Math.floor(diff / 86400e3)}天`;
 }
 
+let archivedSessions = [];
+let archExpanded = false;
 async function loadAllSessions() {
   try {
     const r = await api('sessions?all=1');
     allSessions = r.sessions ?? [];
   } catch { /* 保留旧数据，下轮再试 */ }
+  try {
+    const r2 = await api('sessions?all=1&archived=1');
+    archivedSessions = r2.sessions ?? [];
+  } catch { archivedSessions = []; }
   renderProjectList();
+}
+
+// 会话行操作单：锚定 ⋯ 按钮弹出（打开 / 归档或恢复 / 删除）
+function closeSessPop() { $('sessPop').classList.remove('open'); }
+function openSessPop(anchor, s) {
+  const pop = $('sessPop');
+  pop.textContent = '';
+  const mk = (label, fn, cls) => {
+    const b = el('button', cls ?? '', label);
+    b.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      closeSessPop();
+      await fn();
+    });
+    pop.appendChild(b);
+  };
+  mk('打开', () => openSession(s.sessionId, s.workspacePath));
+  if (s.archived) mk('恢复', () => archiveSession(s.sessionId, false));
+  else mk('归档', () => archiveSession(s.sessionId, true));
+  mk('删除', async () => {
+    if (!confirm(`删除会话「${s.title || '未命名'}」？\n消息与记录将一并删除，不可恢复。`)) return;
+    if (s.sessionId === curSession) { openSession(null); }
+    try {
+      await api(`sessions/${encodeURIComponent(s.sessionId)}/delete`, { method: 'POST', body: '{}' });
+      toast('已删除');
+    } catch (e) { toast(`删除失败：${e.message}`); }
+    loadAllSessions();
+  }, 'danger');
+  const r = anchor.getBoundingClientRect();
+  // 视口内夹紧：drawer 内按钮也适用（fixed 相对视口）
+  const w = 138, h = 140;
+  pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + 'px';
+  pop.style.top = Math.max(8, Math.min(r.bottom + 4, window.innerHeight - h - 8)) + 'px';
+  pop.classList.add('open');
+}
+document.addEventListener('click', (e) => { if (!$('sessPop').contains(e.target)) closeSessPop(); });
+
+async function archiveSession(sid, archived) {
+  try {
+    await api(`sessions/${encodeURIComponent(sid)}/archive`, { method: 'POST', body: JSON.stringify({ archived }) });
+    if (sid === curSession && archived) openSession(null);
+    toast(archived ? '已归档' : '已恢复');
+  } catch (e) { toast(`${archived ? '归档' : '恢复'}失败：${e.message}`); }
+  loadAllSessions();
 }
 
 function sessRow(s, projectPath) {
   const running = s.busy || s.status === 'running';
   const item = el('div', 'sess' + (s.sessionId === curSession ? ' cur' : ''));
-  if (running) { const sp = el('span', 'busy'); sp.innerHTML = SVG.spin; item.appendChild(sp); }
-  item.appendChild(el('div', 't', s.title || '未命名会话'));
-  item.appendChild(el('span', 'time', fmtRel(s.updatedAt)));
+  if (running) {
+    const sp = el('span', 'busy'); sp.innerHTML = SVG.spin; sp.title = '任务运行中'; item.appendChild(sp);
+  }
+  const t = el('div', 't', s.title || '未命名会话');
+  if (running) t.style.color = 'var(--fg)';
+  item.appendChild(t);
+  const time = el('span', 'time' + (running ? ' running' : ''), running ? '运行中' : fmtRel(s.updatedAt));
+  item.appendChild(time);
+  const more = el('button', 'smore', '⋯');
+  more.title = '会话操作';
+  more.addEventListener('click', (ev) => { ev.stopPropagation(); openSessPop(more, s); });
+  item.appendChild(more);
   item.addEventListener('click', () => openSession(s.sessionId, projectPath));
   return item;
 }
@@ -2342,6 +2541,23 @@ function renderProjectList() {
       const less = el('button', 'morebtn', '收起');
       less.addEventListener('click', () => { projExpanded.set(p, false); renderProjectList(); });
       box.appendChild(less);
+    }
+  }
+  // 已归档会话：折叠分组（官方交互），恢复/删除走行内 ⋯ 菜单
+  if (archivedSessions.length) {
+    const head = el('div', 'archsect');
+    const chev = el('span', '', archExpanded ? '▾' : '▸');
+    chev.style.color = 'var(--faint)';
+    head.appendChild(chev);
+    head.appendChild(el('b', '', `已归档（${archivedSessions.length}）`));
+    head.style.cursor = 'pointer';
+    head.addEventListener('click', () => { archExpanded = !archExpanded; renderProjectList(); });
+    box.appendChild(head);
+    if (archExpanded) {
+      for (const s of archivedSessions.slice(0, 20)) {
+        const row = sessRow({ ...s, archived: true }, s.workspacePath);
+        box.appendChild(row);
+      }
     }
   }
 }
@@ -2426,6 +2642,7 @@ async function openSession(sessionId, wsPath) {
     // 只收新事件：历史已渲染，避免全量重放导致文本重复
     connectStream(curSession, r.lastSeq ?? -1);
     refreshQueue(curSession); // 排队消息（预备任务）随会话对齐
+    curTodos = []; todoOpen = false; renderTodoBar(); refreshTodos(); // 任务计划随会话对齐
     $('drawer').classList.remove('open');
     if (sessionId) toast('已恢复会话');
     renderProjectList();
