@@ -514,7 +514,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.18';
+const PAGE_BUILD = '2026-10-04.20';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -2290,6 +2290,11 @@ function startPolling() {
 
 // ── 排队消息（预备任务：运行中发送 → 服务端入队 → 回合结束自动补发）──
 
+// ✎ 编辑取回的原条目：重发时按原位置插回（queue/replace），而不是追加到队尾。
+// 取回会把条目从队列摘掉（避免回合结束被补发），所以位置要在取回前记住。
+let queueEditId = null;
+let queueEditIndex = 0;
+
 function renderQueue(queue) {
   const bar = $('queueBar');
   bar.textContent = '';
@@ -2298,13 +2303,21 @@ function renderQueue(queue) {
     const pill = el('div', 'qpill');
     pill.appendChild(el('span', 'qarr', '→'));
     pill.appendChild(el('span', 'qtext', item.text));
-    // ✎：取回到输入框编辑（取消自动发送），改完可再排队或立即发
+    // ✎：取回到输入框编辑（取消自动发送），改完重发按原位置插回
     const edit = el('button', 'qact', '✎');
-    edit.title = '编辑：取回到输入框';
+    edit.title = '编辑：取回到输入框，重发后回到原位置';
     edit.addEventListener('click', async () => {
+      let removed = true;
       try {
         await api(`sessions/${encodeURIComponent(curSession)}/queue/remove`, { method: 'POST', body: JSON.stringify({ id: item.id }) });
-      } catch { /* 队列已变：下次 ui 事件对齐 */ }
+      } catch {
+        removed = false; // 已不在队列（可能刚被发出）：同步药丸，避免残留死状态
+        refreshQueue();
+      }
+      if (removed) {
+        queueEditId = item.id;
+        queueEditIndex = (queue ?? []).findIndex((q) => q.id === item.id); // 取回前的原始位置
+      }
       composer.value = composer.value ? composer.value + '\n' + item.text : item.text;
       composer.dispatchEvent(new Event('input'));
       composer.focus();
@@ -2317,7 +2330,10 @@ function renderQueue(queue) {
       try {
         await api(`sessions/${encodeURIComponent(curSession)}/queue/send-now`, { method: 'POST', body: JSON.stringify({ id: item.id }) });
         toast('已请求停止当前任务，将立即发出该消息');
-      } catch (e) { toast(`立即发送失败：${e.message}`); }
+      } catch (e) {
+        toast(`立即发送失败：${e.message}`);
+        refreshQueue(); // 404=药丸已过期：立即对齐，别让用户对着幽灵条目点
+      }
     });
     pill.appendChild(zap);
     // ✕：直接丢弃该排队项
@@ -2326,7 +2342,7 @@ function renderQueue(queue) {
     x.addEventListener('click', async () => {
       try {
         await api(`sessions/${encodeURIComponent(curSession)}/queue/remove`, { method: 'POST', body: JSON.stringify({ id: item.id }) });
-      } catch { /* 同上 */ }
+      } catch { refreshQueue(); /* 药丸过期：同步服务端真实队列 */ }
     });
     pill.appendChild(x);
     bar.appendChild(pill);
@@ -2344,6 +2360,22 @@ async function refreshQueue(sid) {
 
 async function doSend(text, sid) {
   const target = sid ?? curSession;
+  // ✎ 编辑取回后的重发：原位替换原排队项（位置不变），而不是追加到队尾。
+  // 原条目已不在队列（回合刚好结束把它发出了）→ 降级为普通发送路径。
+  if (queueEditId && !sid) {
+    const editId = queueEditId;
+    const editIdx = queueEditIndex;
+    queueEditId = null;
+    try {
+      const r = await api(`sessions/${encodeURIComponent(target)}/queue/replace`, { method: 'POST', body: JSON.stringify({ id: editId, text, index: editIdx }) });
+      renderQueue(r.queue ?? []);
+      toast('已替换原排队项（位置不变）');
+      return true;
+    } catch (e) {
+      // 服务端异常才走这里（位置插回逻辑在服务端永远成功）：降级普通排队
+      toast(`替换失败，已按新消息排队：${e.message}`);
+    }
+  }
   try {
     const r = await api(`sessions/${encodeURIComponent(target)}/send`, { method: 'POST', body: JSON.stringify({ content: text }) });
     if (r?.queued) {
@@ -2682,6 +2714,7 @@ async function openSession(sessionId, wsPath) {
     connectStream(curSession, r.lastSeq ?? -1);
     refreshQueue(curSession); // 排队消息（预备任务）随会话对齐
     curTodos = []; todoOpen = false; renderTodoBar(); refreshTodos(); // 任务计划随会话对齐
+    queueEditId = null; // 编辑取回的原条目属于旧会话：清空替换追踪
     $('drawer').classList.remove('open');
     if (sessionId) toast('已恢复会话');
     renderProjectList();

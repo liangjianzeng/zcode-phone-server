@@ -471,11 +471,14 @@ async function flushQueue(sid) {
       if (!SEND_BUSY_RE.test(String(e?.message ?? e))) {
         // 真实失败（限流/余额等）：留在队首，页面提示，等用户处理
         pushSse(sid, { __ui: 'note', text: `排队消息发送失败：${String(e?.message ?? e).slice(0, 120)}（已保留在队列，可在输入框上方点击取回）` });
+        pushQueueState(sid); // 页面可能拿着旧药丸状态：推一次对齐，避免"删不掉/发不出"的死状态
         return;
       }
       await new Promise((r) => setTimeout(r, 1000));
     }
   }
+  // -32010 重试耗尽（回合实际还没停）：推一次状态，页面药丸与队列对齐
+  pushQueueState(sid);
 }
 
 function scheduleQueueFlush(sid, delay = 1500) {
@@ -1240,7 +1243,10 @@ async function sessionLooksFinished(sid) {
 
   if (seg[0] === 'api' && seg[1] === 'sessions' && seg[2]) {
     const sid = decodeURIComponent(seg[2]);
-    const sub = seg[3];
+    // 多段子路由：/queue/remove、/queue/send-now、/queue/replace 的
+    // seg[3] 只是 'queue'，必须拼接后续段才能匹配（此前永远 404——
+    // ✕ 删除静默失败、⚡ 报"发送失败"、✎ 取回后重发变追加，均源于此）
+    const sub = seg.slice(3).join('/');
 
     // 计划/目标（容错：引擎方法参数不符时返回 unavailable，前端优雅降级）
     if (req.method === 'GET' && sub === 'goal') {
@@ -1312,6 +1318,25 @@ async function sessionLooksFinished(sid) {
       scheduleQueueFlush(sid, 2500);
       startQueuePoll(sid);
       return sendJson(res, 200, r ?? {});
+    }
+
+    // 原位替换（✎ 编辑取回后重发）：条目还在队列则原位换文本；已被取回删除的
+    // 按记住的原位置插回（index 由页面在取回时记录，越界时夹到队尾）
+    if (req.method === 'POST' && sub === 'queue/replace') {
+      const body = await readBody(req);
+      const id = String(body.id ?? '');
+      const text = String(body.text ?? '').trim();
+      if (!text) return sendJson(res, 400, { error: '内容为空' });
+      const st = sessionState(sid);
+      const idx = st.queue.findIndex((q) => q.id === id);
+      if (idx >= 0) {
+        st.queue[idx] = { id, text, at: Date.now() };
+      } else {
+        const at = Math.max(0, Math.min(Number(body.index ?? st.queue.length) || 0, st.queue.length));
+        st.queue.splice(at, 0, { id: id || crypto.randomUUID(), text, at: Date.now() });
+      }
+      pushQueueState(sid);
+      return sendJson(res, 200, { ok: true, queue: st.queue });
     }
 
     if (req.method === 'POST' && sub === 'queue/remove') {
