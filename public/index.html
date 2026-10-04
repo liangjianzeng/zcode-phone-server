@@ -1226,13 +1226,11 @@ function ensureThink(m, partId) {
   pe = { kind: 'think', el: details, content: body };
   m.partEls.set(partId, pe);
   if (!thinkTimers.has(partId)) thinkTimers.set(partId, Date.now());
-  // 最新思考默认展开，其余自动收起（方便观察当前思考过程）
-  details.open = true;
-  if (openThinkDetails && openThinkDetails !== details) openThinkDetails.open = false;
-  openThinkDetails = details;
+  // 思考默认收起：思考文本常含命令行/尖括号片段（⏺ Bash(...)、<tag> 等），
+  // 展开挂在对话流里就是"括号命令代码夹杂"的观感；想看过程手动点开。
+  details.open = false;
   return pe;
 }
-let openThinkDetails = null;
 
 // 工具卡片（官方扁平行：[icon] 名称 命令摘要 …… 状态）
 function toolCard(toolCallId, toolName, desc) {
@@ -1425,10 +1423,7 @@ function renderHistory(messages) {
   sseUserEchoes = []; // 全量重绘，SSE 回显气泡已随 DOM 清掉
   // 更新尾部指纹：轮询跟随以这里为准（打开会话/重连重同步/轮询全量拉取共用）
   lastFingerprint = fingerprint(messages);
-  // 思考块：最后一条的默认展开，其余折叠
-  const thinks = chat.querySelectorAll('.msg.assistant .think');
-  thinks.forEach((t) => { t.open = false; });
-  if (thinks.length) { thinks[thinks.length - 1].open = true; openThinkDetails = thinks[thinks.length - 1]; }
+  // 思考块全部保持默认收起（ensureThink 不再展开，这里也不再重新展开）
   const vis = visibleMessages(messages);
   if (!vis.length) {
     const hero = el('div', 'hero');
