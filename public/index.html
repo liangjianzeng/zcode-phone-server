@@ -25,7 +25,7 @@
   svg.ic { width: 20px; height: 20px; flex: none; display: block; }
   svg.ic.sm { width: 15px; height: 15px; }
 
-  /* ── 顶栏单行：菜单 + 会话名 + 用量 + 更多（对齐官方 zcode.z.ai 布局）── */
+  /* ── 顶栏单行：会话名（功能按钮已整合进左侧边栏）── */
   header { background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
   .navrow {
     display: flex; align-items: center; gap: 4px;
@@ -42,8 +42,26 @@
   }
   .iconbtn:active { background: var(--card); color: var(--fg); }
 
+  /* ── 左侧边栏区：常驻竖排功能按钮（后续新功能图标加在这里）── */
+  #mainRow { flex: 1; display: flex; min-height: 0; }
+  #sideRail {
+    flex: none; width: 46px;
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+    padding: 8px 0; background: var(--panel); border-right: 1px solid var(--line);
+    overflow-y: auto; overflow-x: hidden;
+  }
+  .railbtn {
+    background: transparent; border: none; color: var(--dim); cursor: pointer;
+    width: 36px; height: 36px; border-radius: 10px; padding: 0; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .railbtn:active { background: var(--card); color: var(--fg); }
+  #sideRail .mname { display: none; } /* 模型名数据位保留（JS 读写），竖栏里只显示图标 */
+  .railsep { flex: none; width: 22px; height: 1px; background: var(--line); margin: 3px 0; }
+  #railFuture { flex: 1; min-height: 8px; } /* 弹性占位：后续按钮可顺次排在上方或锚定底部 */
+
   /* ── 消息流 ── */
-  main { flex: 1; overflow-y: auto; padding: 14px 16px 10px; scroll-behavior: smooth; }
+  main { flex: 1; min-width: 0; overflow-y: auto; padding: 14px 16px 10px; scroll-behavior: smooth; }
   .hero { display: flex; flex-direction: column; align-items: center; gap: 10px; margin: 16vh auto 0; color: var(--dim); }
   .hero .bigz {
     width: 60px; height: 60px; border-radius: 18px;
@@ -287,21 +305,6 @@
   .plug .d { color: var(--faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ctxbar { margin: 8px 12px 4px; }
 
-  /* ⋯ 溢出菜单 */
-  #moreMenu {
-    position: fixed; z-index: 30; display: none; min-width: 148px;
-    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-    padding: 5px; box-shadow: 0 8px 28px rgba(0,0,0,.5);
-  }
-  #moreMenu.open { display: block; }
-  #moreMenu button {
-    display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
-    background: transparent; border: none; padding: 9px 11px; border-radius: 8px;
-    font-size: 13.5px; color: var(--fg);
-  }
-  #moreMenu button:active { background: var(--panel); }
-  #moreMenu svg.ic { color: var(--dim); }
-
   /* ── 锚定弹层（添加 / 权限模式 / 模型 / 思考档位，对照官方浮层交互）── */
   .pop {
     position: fixed; z-index: 40; display: none; min-width: 216px; max-width: min(88vw, 340px);
@@ -359,22 +362,9 @@
 <body>
 <header>
   <div class="navrow">
-    <button id="btnMenu" class="iconbtn" title="会话与工作区" aria-label="会话与工作区">
-      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
-    </button>
     <div class="title" id="sessTitle">选择会话</div>
-    <button id="btnMore" class="iconbtn" title="更多" aria-label="更多">
-      <svg class="ic" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>
-    </button>
   </div>
 </header>
-
-<!-- ⋯ 溢出菜单：新会话 / 插件 / 计划 -->
-<div id="moreMenu">
-  <button id="miNew"><svg class="ic sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>新会话</button>
-  <button id="miPlugins"><svg class="ic sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M9 4.5A1.5 1.5 0 0 1 10.5 3h3A1.5 1.5 0 0 1 15 4.5V6h3.5A1.5 1.5 0 0 1 20 7.5V11h-1.5a1.5 1.5 0 0 0 0 3H20v3.5a1.5 1.5 0 0 1-1.5 1.5H15v-1.5a1.5 1.5 0 0 0-3 0V20H8.5A1.5 1.5 0 0 1 7 18.5V15H5.5a1.5 1.5 0 0 1 0-3H7V7.5A1.5 1.5 0 0 1 8.5 6H9V4.5z"/></svg>插件</button>
-  <button id="miPlan"><svg class="ic sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1.1" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.1" fill="currentColor" stroke="none"/></svg>计划 / 上下文</button>
-</div>
 
 <!-- 锚定弹层：添加 / 权限模式 / 模型 / 思考档位（内容由 JS 渲染） -->
 <div id="addMenu" class="pop"></div>
@@ -390,7 +380,27 @@
   <span class="elapsed" id="turnElapsed"></span>
 </div>
 
-<main id="chat"><div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2" id="heroTip">选择一个会话，下达你的第一个任务</div></div></main>
+<!-- 对话区：左侧功能边栏 + 消息流（底部输入框在 footer，独立不受影响） -->
+<div id="mainRow">
+  <nav id="sideRail" aria-label="功能栏">
+    <button id="btnMenu" class="railbtn" title="会话与工作区" aria-label="会话与工作区">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+    <button id="miNew" class="railbtn" title="新会话" aria-label="新会话">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+    </button>
+    <div class="railsep"></div>
+    <button id="miPlugins" class="railbtn" title="插件" aria-label="插件">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M9 4.5A1.5 1.5 0 0 1 10.5 3h3A1.5 1.5 0 0 1 15 4.5V6h3.5A1.5 1.5 0 0 1 20 7.5V11h-1.5a1.5 1.5 0 0 0 0 3H20v3.5a1.5 1.5 0 0 1-1.5 1.5H15v-1.5a1.5 1.5 0 0 0-3 0V20H8.5A1.5 1.5 0 0 1 7 18.5V15H5.5a1.5 1.5 0 0 1 0-3H7V7.5A1.5 1.5 0 0 1 8.5 6H9V4.5z"/></svg>
+    </button>
+    <button id="miPlan" class="railbtn" title="计划 / 上下文" aria-label="计划 / 上下文">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1.1" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.1" fill="currentColor" stroke="none"/></svg>
+    </button>
+    <!-- 后续新功能按钮加在 railFuture 之上（跟随上方按钮顺排）；也可锚定到底部 -->
+    <div id="railFuture"></div>
+  </nav>
+  <main id="chat"><div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2" id="heroTip">选择一个会话，下达你的第一个任务</div></div></main>
+</div>
 
 <footer>
   <div id="ctxPop" class="ctxpop"></div>
@@ -457,7 +467,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.10';
+const PAGE_BUILD = '2026-10-04.11';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -2265,20 +2275,10 @@ $('fileInput').addEventListener('change', async (e) => {
 });
 $('btnInfoClose').addEventListener('click', () => $('info').classList.remove('open'));
 $('info').addEventListener('click', (e) => { if (e.target.id === 'info') $('info').classList.remove('open'); });
-// ⋯ 溢出菜单
-const moreMenu = $('moreMenu');
-function closeMore() { moreMenu.classList.remove('open'); }
-$('btnMore').addEventListener('click', (e) => {
-  e.stopPropagation();
-  const r = e.currentTarget.getBoundingClientRect();
-  moreMenu.style.top = (r.bottom + 6) + 'px';
-  moreMenu.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
-  moreMenu.classList.toggle('open');
-});
-document.addEventListener('click', (e) => { if (!moreMenu.contains(e.target)) closeMore(); });
-$('miNew').addEventListener('click', () => { closeMore(); openSession(null); });
-$('miPlugins').addEventListener('click', () => { closeMore(); openInfo('⧩ 插件', loadPlugins); });
-$('miPlan').addEventListener('click', () => { closeMore(); openInfo('☰ 计划 / 上下文', loadPlan); });
+// 侧栏功能按钮：新会话 / 插件 / 计划（原溢出菜单已并入左侧边栏，直接铺开少一次点击）
+$('miNew').addEventListener('click', () => openSession(null));
+$('miPlugins').addEventListener('click', () => openInfo('⧩ 插件', loadPlugins));
+$('miPlan').addEventListener('click', () => openInfo('☰ 计划 / 上下文', loadPlan));
 
 // ── 项目 / 会话（官方 PC 侧边栏同款：按项目分组的单列表）──
 
