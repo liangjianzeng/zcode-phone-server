@@ -137,7 +137,11 @@
   }
   .tool.running .tstate, .tool.running .tico { color: var(--fg); }
   .tool.running .tdesc { color: var(--fg); }
-  .tool.completed .tdesc, .tool.completed .tname { color: var(--faint); }
+  /* 完成后隐藏命令摘要：一条回合几十个工具行、每行摊一条长命令，
+     对话流里就是"括号命令行夹杂"的观感。执行中/出错仍显示（观察进度与排错）；
+     点开完成的卡片，详情体首行有当时的命令摘要（见 setToolStatus）。 */
+  .tool.completed .tdesc { display: none; }
+  .tool.completed .tname { color: var(--faint); }
   .tool.error .tdesc, .tool.error .tname { color: var(--err); }
   .tool .tstate { flex: none; color: var(--faint); display: flex; align-items: center; }
   .tool .tbody { padding: 2px 10px 8px 30px; color: var(--dim); font-size: 12.5px; }
@@ -1272,6 +1276,12 @@ function setToolStatus(toolCallId, status, desc, detail) {
     status === 'error' || status === 'failed' ? SVG.cross : '';
   if (detail !== undefined && detail !== null && detail !== '') {
     t.body.textContent = '';
+    // 终态卡片的命令摘要不再显示在行内（CSS 隐藏 .completed .tdesc），
+    // 补进详情体首行，展开时仍能看到"这条输出来自哪条命令/哪个文件"。
+    if ((status === 'completed' || status === 'error' || status === 'failed') && t.desc.textContent) {
+      const cmd = el('pre'); cmd.textContent = t.desc.textContent;
+      t.body.appendChild(cmd);
+    }
     const pre = el('pre'); pre.textContent = String(detail).slice(0, 4000);
     t.body.appendChild(pre);
   }
@@ -1447,7 +1457,7 @@ function renderHistory(messages) {
           const st = part.state ?? {};
           // TodoWrite 不渲染工具行，但刷新任务计划条
           if (String(part.tool ?? '').toLowerCase() === 'todowrite') { scheduleTodoRefresh(); break; }
-          const card = toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
+          const card = toolCard(part.callId, part.tool, inputSummary(st.input) || st.title || '');
           const status = st.status ?? 'pending';
           const detail = status === 'error' ? st.error : st.output;
           setToolStatus(part.callId, status, undefined, detail);
@@ -1800,7 +1810,7 @@ function handleZcodeEvent(ev) {
         if (String(part.tool ?? '').toLowerCase() === 'todowrite') {
           scheduleTodoRefresh();
         } else {
-          toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
+          toolCard(part.callId, part.tool, inputSummary(st.input) || st.title || '');
           setToolStatus(part.callId, st.status ?? 'pending', undefined, st.status === 'error' ? st.error : st.output);
         }
       }
@@ -2089,7 +2099,7 @@ function renderTail(messages) {
           const st = part.state ?? {};
           // TodoWrite 不渲染工具行，但刷新任务计划条
           if (String(part.tool ?? '').toLowerCase() === 'todowrite') { scheduleTodoRefresh(); break; }
-          const card = toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
+          const card = toolCard(part.callId, part.tool, inputSummary(st.input) || st.title || '');
           const status = st.status ?? 'pending';
           const detail = status === 'error' ? st.error : st.output;
           setToolStatus(part.callId, status, undefined, detail);
