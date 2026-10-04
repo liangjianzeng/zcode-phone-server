@@ -332,6 +332,19 @@
     max-width: 86vw; text-align: center;
   }
 
+  /* Todo 计划折叠条（官方风格：输入框上方，运行中显示进度，点击展开） */
+  #todoBar { display: none; margin: 0 0 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); overflow: hidden; }
+  #todoBar .thead { display: flex; align-items: center; gap: 8px; padding: 7px 12px; font-size: 12.5px; color: var(--dim); cursor: pointer; user-select: none; }
+  #todoBar .thead .arr { flex: none; font-size: 10px; transition: transform .15s ease; }
+  #todoBar.open .thead .arr { transform: rotate(90deg); }
+  #todoBar .thead .prog { flex: none; font-variant-numeric: tabular-nums; color: var(--fg); }
+  #todoBar .thead .cur { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #7cb7ff; }
+  #todoBar .titems { display: none; border-top: 1px solid var(--line); padding: 3px 0; }
+  #todoBar.open .titems { display: block; }
+  #todoBar .titem { display: flex; gap: 8px; padding: 5px 12px; font-size: 12.5px; line-height: 1.35; color: var(--fg); }
+  #todoBar .titem .ic { flex: none; width: 15px; text-align: center; }
+  #todoBar .titem.done { color: var(--faint); text-decoration: line-through; }
+  #todoBar .titem.doing { color: #7cb7ff; }
   /* spinner 通用 */
   .spin { animation: rot 1s linear infinite; }
   @keyframes rot { to { transform: rotate(360deg); } }
@@ -379,6 +392,7 @@
 
 <footer>
   <div id="ctxPop" class="ctxpop"></div>
+  <div id="todoBar"></div>
   <div id="queueBar"></div>
   <div id="attachBar" style="display:none;align-items:center;gap:8px;margin:0 0 8px;padding:6px 10px;background:var(--card);border:1px solid var(--line);border-radius:12px;font-size:12.5px;">
     <span id="attachName" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
@@ -442,7 +456,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.4';
+const PAGE_BUILD = '2026-10-04.5';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -1100,6 +1114,48 @@ let lastFingerprint = '';    // 最后渲染的消息尾部指纹（renderHistor
 // renderHistory 会用存储 messageId 重画同一条消息——不清理就是"发出一条回显两条"。
 // 存储渲染同文本用户消息时移除对应回显气泡（60 秒窗口，连发两条相同内容也各自对齐）。
 let sseUserEchoes = [];
+
+// ── Todo 计划折叠条（输入框上方）──
+// 数据源：TodoWrite 工具的 input.todos（完整列表，SSE 与存储渲染共用同一入口）。
+let curTodos = [];
+let todoOpen = false;
+
+function ingestTodos(toolName, input) {
+  if (toolName !== 'TodoWrite') return;
+  const todos = input?.todos;
+  if (Array.isArray(todos) && todos.length) {
+    curTodos = todos.map((t) => ({
+      content: String(t.content ?? ''),
+      status: String(t.status ?? 'pending'),
+    }));
+    renderTodoBar();
+  }
+}
+
+const TODO_IC = { completed: '✓', in_progress: '▶', pending: '○' };
+function renderTodoBar() {
+  const bar = $('todoBar');
+  if (!curTodos.length) { bar.style.display = 'none'; bar.classList.remove('open'); return; }
+  const done = curTodos.filter((t) => t.status === 'completed').length;
+  const cur = curTodos.find((t) => t.status === 'in_progress');
+  bar.style.display = 'block';
+  bar.textContent = '';
+  const head = el('div', 'thead');
+  head.appendChild(el('span', 'arr', '▶'));
+  head.appendChild(el('span', 'prog', `任务计划 ${done}/${curTodos.length}`));
+  if (cur) head.appendChild(el('span', 'cur', cur.content));
+  head.addEventListener('click', () => { todoOpen = !todoOpen; renderTodoBar(); });
+  bar.appendChild(head);
+  const box = el('div', 'titems');
+  for (const t of curTodos) {
+    const row = el('div', `titem${t.status === 'completed' ? ' done' : t.status === 'in_progress' ? ' doing' : ''}`);
+    row.appendChild(el('span', 'ic', TODO_IC[t.status] ?? '○'));
+    row.appendChild(el('span', '', t.content));
+    box.appendChild(row);
+  }
+  bar.appendChild(box);
+  bar.classList.toggle('open', todoOpen);
+}
 let busySource = null;       // 'sse' = 本引擎事件驱动；'inferred' = 轮询推断
 let lastActivity = 0;        // 推断运行态最近一次见到存储变化的时刻
 let lastSseEventAt = 0;      // 最近一次收到 SSE 事件（检测流静默/死亡）
@@ -1150,6 +1206,8 @@ function renderHistory(messages) {
   chat.textContent = '';
   msgEls.clear(); toolEls.clear(); thinkTimers.clear();
   sseUserEchoes = []; // 全量重绘，SSE 回显气泡已随 DOM 清掉
+  curTodos = [];      // todo 折叠条由本会话历史里的 TodoWrite 重新灌入
+  renderTodoBar();
   // 更新尾部指纹：轮询跟随以这里为准（打开会话/重连重同步/轮询全量拉取共用）
   lastFingerprint = fingerprint(messages);
   if (!messages.length) {
@@ -1170,6 +1228,7 @@ function renderHistory(messages) {
         }
         case 'tool': {
           const st = part.state ?? {};
+          ingestTodos(part.tool, st.input);
           const card = toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
           const status = st.status ?? 'pending';
           const detail = status === 'error' ? st.error : st.output;
@@ -1538,6 +1597,7 @@ function handleZcodeEvent(ev) {
       }
       else if (part.type === 'tool') {
         const st = part.state ?? {};
+        ingestTodos(part.tool, st.input);
         toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
         setToolStatus(part.callId, st.status ?? 'pending', undefined, st.status === 'error' ? st.error : st.output);
       }
@@ -1570,6 +1630,7 @@ function handleZcodeEvent(ev) {
     case 'tool.updated': {
       const p = ev.payload ?? {};
       if (p.kind === 'batch') break;
+      ingestTodos(p.toolName, p.input);
       const id = p.toolCallId;
       const desc = inputSummary(p.input) || (p.toolName ?? '');
       toolCard(id, p.toolName, desc);
@@ -1802,6 +1863,7 @@ function renderTail(messages) {
         }
         case 'tool': {
           const st = part.state ?? {};
+          ingestTodos(part.tool, st.input);
           const card = toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
           const status = st.status ?? 'pending';
           const detail = status === 'error' ? st.error : st.output;
