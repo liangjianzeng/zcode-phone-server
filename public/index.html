@@ -514,7 +514,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.17';
+const PAGE_BUILD = '2026-10-04.18';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -1929,12 +1929,17 @@ function handleZcodeEvent(ev) {
       // 文本部件要到回合结束才持久化）。text_delta → 正文直播累积；
       // reasoning_delta → 思考行直播。回合结束 purgeLiveStream 清理直播元素，
       // 由存储渲染的真实部件接管。
+      // ⚠️ 只认 text_delta / reasoning_delta：tool_input_delta 等其余 kind 是
+      // 工具参数 JSON 直播（引擎 kind 全集含 tool_input_start/delta/end、
+      // tool_call 等），落进正文就是对话流里的 {"command":...} 夹杂。
       const p = ev.payload ?? {};
       const delta = String(p.delta ?? '');
       const mid = String(p.assistantMessageId ?? '');
       if (!delta || !mid) break;
+      const kind = String(p.kind ?? 'text_delta');
+      if (kind !== 'text_delta' && kind !== 'reasoning_delta') break;
       const m = ensureMsg(mid, 'assistant');
-      if (p.kind === 'reasoning_delta') {
+      if (kind === 'reasoning_delta') {
         const pe = ensureThink(m, '__live-think');
         pe.content.textContent += delta;
       } else {
@@ -2161,6 +2166,7 @@ async function pollTick() {
         if (Date.now() - finishedSince >= 6000) {
           finishedSince = 0;
           renderTail(msgs);
+          purgeLiveStream(); // SSE 断流错过 turn.completed：直播残留（如误渲染的工具参数）在此清掉
           busySource = null;
           setBusy(false);
           notifyTaskState(false);
@@ -2173,6 +2179,7 @@ async function pollTick() {
       // 修正断流期间停留在 running 的工具行）
       if (busy && finished && quietMs > 30000) {
         renderTail(msgs);
+        purgeLiveStream();
         busySource = null;
         setBusy(false);
         notifyTaskState(false);
@@ -2186,6 +2193,7 @@ async function pollTick() {
       // 长工具会短暂显示空闲——下一条存储写入即恢复运行态，可自愈
       if (busy && quietMs > 45000) {
         renderTail(msgs);
+        purgeLiveStream();
         busySource = null;
         setBusy(false);
         notifyTaskState(false);
