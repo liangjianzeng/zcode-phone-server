@@ -25,29 +25,15 @@
   svg.ic { width: 20px; height: 20px; flex: none; display: block; }
   svg.ic.sm { width: 15px; height: 15px; }
 
-  /* ── 顶栏单行：会话名（功能按钮已整合进左侧边栏）── */
-  header { background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
-  .navrow {
-    display: flex; align-items: center; gap: 4px;
-    padding: 6px 10px; padding-top: calc(6px + env(safe-area-inset-top));
-  }
-  .navrow .title {
-    flex: 1; min-width: 0; font-size: 16px; font-weight: 650; letter-spacing: .01em;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .iconbtn {
-    background: transparent; border: none; color: var(--dim);
-    width: 36px; height: 36px; border-radius: 10px; padding: 0;
-    display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
-  }
-  .iconbtn:active { background: var(--card); color: var(--fg); }
+  /* ── 顶栏已移除（会话名不再占一行，sessTitle 仅作 JS 数据位视觉隐藏）── */
+  .vh2 { display: none; }
 
   /* ── 左侧边栏区：常驻竖排功能按钮（后续新功能图标加在这里）── */
   #mainRow { flex: 1; display: flex; min-height: 0; }
   #sideRail {
     flex: none; width: 46px;
     display: flex; flex-direction: column; align-items: center; gap: 4px;
-    padding: 8px 0; background: var(--panel); border-right: 1px solid var(--line);
+    padding: calc(8px + env(safe-area-inset-top)) 0 8px; background: var(--panel); border-right: 1px solid var(--line);
     overflow-y: auto; overflow-x: hidden;
   }
   .railbtn {
@@ -61,7 +47,7 @@
   #railFuture { flex: 1; min-height: 8px; } /* 弹性占位：后续按钮可顺次排在上方或锚定底部 */
 
   /* ── 消息流 ── */
-  main { flex: 1; min-width: 0; overflow-y: auto; padding: 14px 16px 10px; scroll-behavior: smooth; }
+  main { flex: 1; min-width: 0; overflow-y: auto; padding: calc(14px + env(safe-area-inset-top)) 16px 10px; scroll-behavior: smooth; }
   .hero { display: flex; flex-direction: column; align-items: center; gap: 10px; margin: 16vh auto 0; color: var(--dim); }
   .hero .bigz {
     width: 60px; height: 60px; border-radius: 18px;
@@ -360,11 +346,7 @@
 </style>
 </head>
 <body>
-<header>
-  <div class="navrow">
-    <div class="title" id="sessTitle">选择会话</div>
-  </div>
-</header>
+<header class="vh2"><div class="title" id="sessTitle">选择会话</div></header>
 
 <!-- 锚定弹层：添加 / 权限模式 / 模型 / 思考档位（内容由 JS 渲染） -->
 <div id="addMenu" class="pop"></div>
@@ -467,7 +449,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.11';
+const PAGE_BUILD = '2026-10-04.12';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
