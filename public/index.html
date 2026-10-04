@@ -473,8 +473,9 @@ let elapsedTimer = null;
 const msgEls = new Map();
 const toolEls = new Map();  // toolCallId → {el, status, name, desc, body}
 const thinkTimers = new Map(); // partId → 起始时间（思考行耗时统计）
-// 排队消息：运行中输入先入队，回合结束后自动发出（官方「排队后续修改」交互）
-const sendQueue = [];
+// 排队消息（预备任务）：运行中发送 → 服务端入队，回合结束后由服务端自动
+// 补发为下一回合。队列数据源在服务端（刷新不丢、页面关着也补发），
+// 页面只做展示与取回（GET /queue + __ui:'queue' 事件同步）。
 
 // ── App 桥协议 v2 ──
 // 页面主动向 App 上报事件；App 可调用 window.__zcode 上的函数。
@@ -1044,9 +1045,22 @@ function markThinkDurations() {
 
 // busy 切换：
 // - #turnStatus 显隐 + 哨兵词增删（旧版 App 桥据 DOM 中哨兵词判定运行态，必须随任务出现/消失）
-// - 发送按钮 ⇄ 停止方块（官方交互）
+// - 发送按钮三态：空闲=发送；运行中且有输入=排队发送（预备任务）；运行中且空=停止
 // - 流末尾转圈指示
 // - 已运行时长计时
+function updateSendButton() {
+  const btnSend = $('btnSend');
+  const hasText = !!(composer.value.trim() || pendingImage);
+  const mode = busy ? (hasText ? 'queue' : 'stop') : 'send';
+  const stopSvg = '<svg class="ic" viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>';
+  const sendSvg = '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V6M6 12l6-6 6 6"/></svg>';
+  btnSend.classList.toggle('stop', mode === 'stop');
+  const label = mode === 'stop' ? '停止' : mode === 'queue' ? '排队发送' : '发送';
+  btnSend.setAttribute('aria-label', label);
+  btnSend.title = label;
+  btnSend.innerHTML = mode === 'stop' ? stopSvg : sendSvg;
+}
+
 function setBusy(on) {
   busy = on;
   const status = $('turnStatus');
@@ -1059,13 +1073,7 @@ function setBusy(on) {
   } else if (!on && sent) {
     sent.remove();
   }
-  const btnSend = $('btnSend');
-  btnSend.classList.toggle('stop', on);
-  btnSend.setAttribute('aria-label', on ? '停止' : '发送');
-  btnSend.title = on ? '停止' : '发送';
-  btnSend.innerHTML = on
-    ? '<svg class="ic" viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>'
-    : '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V6M6 12l6-6 6 6"/></svg>';
+  updateSendButton();
   $('crow').classList.toggle('busy', on);
   let spinRow = document.getElementById('streamSpin');
   if (on && !spinRow) {
@@ -1748,7 +1756,7 @@ function handleZcodeEvent(ev) {
       loadUsage(true);
       refreshSettings(false); // 回合结束后上下文占用变了：刷新模型旁的容量环
       loadAllSessions();
-      flushQueue();
+      refreshQueue();
       break;
     case 'turn.failed': {
       purgeLiveStream();
@@ -1867,6 +1875,8 @@ function handleUiEvent(p) {
     chat.appendChild(note); scrollBottom();
     toast(p.text);
   }
+  // 队列状态对齐（入队/补发/取回都由服务端推送）
+  if (p.kind === 'queue') renderQueue(p.queue ?? []);
   if (p.expired) toast('交互请求已超时自动拒绝');
 }
 
@@ -2029,7 +2039,7 @@ async function pollTick() {
           busySource = null;
           setBusy(false);
           notifyTaskState(false);
-          flushQueue();
+          refreshQueue();
           loadAllSessions();
           return;
         }
@@ -2041,7 +2051,7 @@ async function pollTick() {
         busySource = null;
         setBusy(false);
         notifyTaskState(false);
-        flushQueue();
+        refreshQueue();
         loadAllSessions();
         return;
       }
@@ -2054,7 +2064,7 @@ async function pollTick() {
         busySource = null;
         setBusy(false);
         notifyTaskState(false);
-        flushQueue();
+        refreshQueue();
         loadAllSessions();
         return;
       }
@@ -2077,7 +2087,7 @@ async function pollTick() {
       busySource = null;
       setBusy(false);
       notifyTaskState(false);
-      flushQueue();
+      refreshQueue();
       loadAllSessions();
     }
   } catch (e) {
@@ -2093,7 +2103,7 @@ async function pollTick() {
         busySource = null;
         setBusy(false);
         notifyTaskState(false);
-        flushQueue();
+        refreshQueue();
       }
     }
   }
@@ -2122,45 +2132,63 @@ function startPolling() {
   pollTimer = setInterval(pollTick, 1200);
 }
 
-// ── 排队消息（官方「继续输入以排队后续修改」）──
+// ── 排队消息（预备任务：运行中发送 → 服务端入队 → 回合结束自动补发）──
 
-function renderQueue() {
+function renderQueue(queue) {
   const bar = $('queueBar');
   bar.textContent = '';
-  bar.style.display = sendQueue.length ? 'flex' : 'none';
-  for (let i = 0; i < sendQueue.length; i++) {
+  bar.style.display = queue?.length ? 'flex' : 'none';
+  for (const item of queue ?? []) {
     const pill = el('div', 'qpill');
+    pill.title = '点击取回到输入框（取消自动发送）';
     pill.appendChild(el('span', 'qarr', '→'));
-    pill.appendChild(el('span', 'qtext', sendQueue[i].text));
+    pill.appendChild(el('span', 'qtext', item.text));
+    // 点击 pill：取回——从队列移除并填回输入框，可改后重发或放弃
+    pill.addEventListener('click', async () => {
+      try {
+        await api(`sessions/${encodeURIComponent(curSession)}/queue/remove`, { method: 'POST', body: JSON.stringify({ id: item.id }) });
+      } catch { /* 队列已变：下次 ui 事件对齐 */ }
+      composer.value = composer.value ? composer.value + '\n' + item.text : item.text;
+      composer.dispatchEvent(new Event('input'));
+      composer.focus();
+    });
+    // ✕：直接丢弃该排队项
     const x = el('button', 'qx', '✕');
-    x.addEventListener('click', () => { sendQueue.splice(i, 1); renderQueue(); });
+    x.addEventListener('click', async () => {
+      try {
+        await api(`sessions/${encodeURIComponent(curSession)}/queue/remove`, { method: 'POST', body: JSON.stringify({ id: item.id }) });
+      } catch { /* 同上 */ }
+    });
     pill.appendChild(x);
     bar.appendChild(pill);
   }
 }
 
+async function refreshQueue(sid) {
+  const target = sid ?? curSession;
+  if (!target) return;
+  try {
+    const r = await api(`sessions/${encodeURIComponent(target)}/queue`);
+    if (target === curSession) renderQueue(r.queue ?? []);
+  } catch { /* 服务端旧版本无此端点：忽略 */ }
+}
+
 async function doSend(text, sid) {
   const target = sid ?? curSession;
   try {
-    await api(`sessions/${encodeURIComponent(target)}/send`, { method: 'POST', body: JSON.stringify({ content: text }) });
+    const r = await api(`sessions/${encodeURIComponent(target)}/send`, { method: 'POST', body: JSON.stringify({ content: text }) });
+    if (r?.queued) {
+      renderQueue(r.queue ?? []);
+      toast('已排队：当前任务结束后自动发送（点击队列可取回）');
+      return true;
+    }
     busySince = Date.now();
     setBusy(true);
     return true;
   } catch (e) {
-    toast(/409|运行/.test(e.message) ? '该会话正在运行（可能桌面端开着它），等它完成或点 ☰ 换个会话' : `发送失败：${e.message}`);
+    toast(`发送失败：${e.message}`);
     return false;
   }
-}
-
-function flushQueue() {
-  if (busy || !sendQueue.length || !curSession) return;
-  // 每条排队消息记录入队时的会话：切换会话后补发仍归原会话，
-  // 不会把排队内容误发进后来打开的别的会话（串台）
-  const item = sendQueue.shift();
-  renderQueue();
-  doSend(item.text, item.sid).then((ok) => {
-    if (!ok) { sendQueue.unshift(item); renderQueue(); }
-  });
 }
 
 // ── 发送 ──
@@ -2171,6 +2199,7 @@ async function send() {
   if (!text && !pendingImage) return;
   composer.value = '';
   composer.style.height = 'auto';
+  updateSendButton(); // 已清空：运行中按钮回到停止态
   // 待发附件：先上传到当前工作区，消息里带上文件路径（模型工具可直接读取该文件）
   if (pendingImage) {
     const img = pendingImage;
@@ -2184,12 +2213,7 @@ async function send() {
       return;
     }
   }
-  if (busy) {
-    // 运行中：入队（记录入队时的会话），回合结束后自动发回原会话（官方排队交互）
-    sendQueue.push({ text, sid: curSession });
-    renderQueue();
-    return;
-  }
+  // 忙碌与否都直接走服务端：服务端运行中自动入队（引擎 -32010 也会转排队）
   const ok = await doSend(text);
   if (!ok) {
     composer.value = text;
@@ -2200,10 +2224,10 @@ async function send() {
 // ── 事件绑定 ──
 
 $('btnSend').addEventListener('click', () => {
-  if (busy) {
-    // 运行中发送按钮即停止按钮（官方交互）。
+  if (!curSession) { toast('先选择一个会话'); return; }
+  if (busy && !composer.value.trim() && !pendingImage) {
+    // 运行中 + 无输入：按钮即停止（打断当前回合）。
     // 注意：桌面端驱动的回合，stop 只能发给桥引擎（no-op）——提示里说明
-    if (!curSession) return;
     api(`sessions/${encodeURIComponent(curSession)}/stop`, { method: 'POST', body: '{}' })
       .then(() => toast(busySource === 'inferred'
         ? '已请求停止（该回合由桌面端驱动，请在桌面端停止）'
@@ -2211,14 +2235,17 @@ $('btnSend').addEventListener('click', () => {
       .catch((e) => toast(`停止失败：${e.message}`));
     return;
   }
+  // 运行中 + 有输入：排队为下一轮预备任务（回合结束自动补发；队列可点击取回）
   send();
 });
 composer.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!busy) send(); }
+  // 运行中 Enter 也入队（预备任务），与发送按钮行为一致
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
 });
 composer.addEventListener('input', () => {
   composer.style.height = 'auto';
   composer.style.height = Math.min(composer.scrollHeight, 140) + 'px';
+  updateSendButton(); // 运行中：有输入=排队发送，空=停止
 });
 $('btnMenu').addEventListener('click', () => { loadAllSessions(); $('drawer').classList.add('open'); });
 $('btnClose').addEventListener('click', () => $('drawer').classList.remove('open'));
@@ -2416,6 +2443,7 @@ async function openSession(sessionId, wsPath) {
     }
     // 只收新事件：历史已渲染，避免全量重放导致文本重复
     connectStream(curSession, r.lastSeq ?? -1);
+    refreshQueue(curSession); // 排队消息（预备任务）随会话对齐
     $('drawer').classList.remove('open');
     if (sessionId) toast('已恢复会话');
     renderProjectList();

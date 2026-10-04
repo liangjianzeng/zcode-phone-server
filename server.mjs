@@ -323,7 +323,8 @@ const knownWorkspaces = new Set();
 function sessionState(id) {
   let s = sessions.get(id);
   if (!s) {
-    s = { subs: new Set(), ring: [], busy: false, busySince: 0, title: '', lastSeq: 0 };
+    s = { subs: new Set(), ring: [], busy: false, busySince: 0, title: '', lastSeq: 0,
+          queue: [], queueFlush: null, queuePoll: null };
     sessions.set(id, s);
   }
   return s;
@@ -366,7 +367,11 @@ agent.onEvent = (event) => {
   // 回合可能由外部（桌面端）驱动、桥进程错过 turn.started：见到回合内
   // 活动事件也标记 busy，会话列表的"运行中"才不撒谎；completed/failed 复位。
   if (event.type === 'tool.updated' && !s.busy) { s.busy = true; if (!s.busySince) s.busySince = Date.now(); }
-  if (event.type === 'turn.completed' || event.type === 'turn.failed') { s.busy = false; s.busySince = 0; }
+  if (event.type === 'turn.completed' || event.type === 'turn.failed') {
+    s.busy = false; s.busySince = 0;
+    // 本回合结束：若有排队消息，稍候自动补发为下一回合（预备任务语义）
+    scheduleQueueFlush(event.sessionId, 1500);
+  }
   // 429 限流自动重试：桌面端与手机共用同一账户，桌面跑任务期间手机新回合
   // 大概率撞并发限流；而桌面在工具执行间隙账户是空闲的，退避重试基本能过。
   // 只重试手机发起的发送（lastSend），最多 5 次、间隔 20 秒。
@@ -404,6 +409,7 @@ function scheduleRateLimitRetry(sid, error) {
   const n = ls.retries;
   pushSse(sid, { __ui: 'note', text: `模型账户限流（429），${n}/5 次，20 秒后自动重试…` });
   ls.timer = setTimeout(async () => {
+    ls.timer = null; // 已触发：排队补发的 pending-重试守卫据此放行
     const cur = sessionState(sid);
     if (cur.busy || cur.lastSend !== ls) return; // 用户已停止或发了新消息
     try {
@@ -417,6 +423,73 @@ function scheduleRateLimitRetry(sid, error) {
       pushSse(sid, { __ui: 'note', text: `限流重试失败：${e?.message ?? e}` });
     }
   }, 20000);
+}
+
+// ────────────────────────── 排队消息（预备任务）──────────────────────────
+// 协议层 session/send 在回合运行中会抛 -32010 "A prompt is already running"，
+// 引擎没有排队/插话能力。桥在此自建每会话队列：
+//   运行中收到 send → 入队（页面可取回编辑/删除）；回合结束（completed/
+//   failed 事件）后自动补发队首为下一回合。
+// 桌面端驱动的回合桥收不到结束事件（SSE 是进程内的），由 queuePoll 每 3s
+// 用共享存储核实回合确已收尾（sessionLooksFinished）后补发，页面关着也生效。
+
+const SEND_BUSY_RE = /-32010|already running/i;
+
+function pushQueueState(sid) {
+  pushSse(sid, { __ui: 'queue', sessionId: sid, queue: sessionState(sid).queue });
+}
+
+function startQueuePoll(sid) {
+  const s = sessionState(sid);
+  if (s.queuePoll) return;
+  s.queuePoll = setInterval(async () => {
+    if (!s.queue.length) { clearInterval(s.queuePoll); s.queuePoll = null; return; }
+    if (s.busy || s.lastSend?.timer) return; // 回合运行中 / 限流重试待发：都不补发
+    try {
+      // status=running 但存储显示回合已收尾（外进程驱动）→ 可以补发下一轮
+      if (await sessionLooksFinished(sid)) await flushQueue(sid);
+    } catch { /* 下个周期再试 */ }
+  }, 3000);
+}
+
+async function flushQueue(sid) {
+  const s = sessionState(sid);
+  if (!s.queue.length || s.busy || s.lastSend?.timer) return;
+  const item = s.queue[0];
+  // -32010 重试：回合刚结束引擎清理有间隙；连续被拒说明仍有回合在跑，放弃本轮
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await agent.request('session/send', { sessionId: sid, content: item.text, inputId: crypto.randomUUID() }, 120000);
+      s.queue.shift();
+      s.busy = true;
+      if (!s.busySince) s.busySince = Date.now();
+      if (s.lastSend?.timer) clearTimeout(s.lastSend.timer);
+      s.lastSend = { content: item.text, at: Date.now(), retries: 0, timer: null };
+      pushQueueState(sid);
+      return;
+    } catch (e) {
+      if (!SEND_BUSY_RE.test(String(e?.message ?? e))) {
+        // 真实失败（限流/余额等）：留在队首，页面提示，等用户处理
+        pushSse(sid, { __ui: 'note', text: `排队消息发送失败：${String(e?.message ?? e).slice(0, 120)}（已保留在队列，可在输入框上方点击取回）` });
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+}
+
+function scheduleQueueFlush(sid, delay = 1500) {
+  const s = sessionState(sid);
+  if (!s.queue.length) return;
+  if (s.queueFlush) clearTimeout(s.queueFlush);
+  s.queueFlush = setTimeout(() => { s.queueFlush = null; flushQueue(sid).catch(() => {}); }, delay);
+}
+
+function enqueueMessage(sid, content) {
+  const s = sessionState(sid);
+  s.queue.push({ id: crypto.randomUUID(), text: content, at: Date.now() });
+  startQueuePoll(sid);
+  pushQueueState(sid);
 }
 
 agent.onReset = () => {
@@ -595,6 +668,99 @@ function workspaceRef(overridePath) {
   }
   return { workspacePath: wp, workspaceKey: wp };
 }
+
+// ────────────────────────── 桌面任务索引双向同步 ──────────────────────────
+// 桌面端 UI 的会话列表不读 session/list，而是读自己的任务索引
+// ~/.zcode/v2/tasks-index.sqlite（tasks 表，task_id = sessionId），只有桌面
+// 自己创建/打开过的会话才有记录——手机建的会话因此"桌面不可见"。
+// 桥把手机会话 upsert 进该表（会话正文本就落在共享 db.sqlite，桌面点开
+// 即可正常加载），实现 双向可见：桌面→手机本来就走共享存储，无需处理。
+const TASKS_DB_PATH = path.join(os.homedir(), '.zcode', 'v2', 'tasks-index.sqlite');
+let tasksDbHandle = null;
+
+function tasksDb() {
+  if (!tasksDbHandle) {
+    tasksDbHandle = new DatabaseSync(TASKS_DB_PATH);
+    tasksDbHandle.exec('PRAGMA busy_timeout=3000');
+  }
+  return tasksDbHandle;
+}
+
+/** 把会话列表（/api/sessions?all=1 的映射行）同步进桌面任务索引。
+ *  只增改不删：桌面侧删除/归档/手动改题的记录一律尊重（deleted/archived/
+ *  title_overridden 不回写覆盖）。同步失败绝不影响主流程。 */
+async function syncTaskIndexRows(list) {
+  const rows = (list ?? []).filter((s) => s.sessionId && !String(s.sessionId).startsWith('sess_subagent'));
+  if (!rows.length) return 0;
+  let changed = 0;
+  try {
+    const db = tasksDb();
+    const existing = new Map();
+    for (const r of db.prepare('SELECT task_id, title, task_status, mode, updated_at, deleted, archived, title_overridden, meta_json FROM tasks').all()) {
+      existing.set(r.task_id, r);
+    }
+    const ins = db.prepare(
+      'INSERT INTO tasks (workspace_key, workspace_path, workspace_identity, task_id, title, task_status, provider, mode, model, created_at, updated_at, pinned, archived, deleted, title_overridden, meta_json, searchable_text) ' +
+      'VALUES (?, ?, NULL, ?, ?, ?, \'glm\', ?, NULL, ?, ?, 0, 0, 0, 0, ?, ?)',
+    );
+    const upd = db.prepare('UPDATE tasks SET title=?, task_status=?, mode=?, updated_at=?, meta_json=? WHERE task_id=?');
+    for (const s of rows) {
+      const status = String(s.status ?? '').toLowerCase() === 'running' ? 'running' : 'completed';
+      const ws = String(s.workspacePath ?? '').replace(/\//g, '\\');
+      if (!ws) continue;
+      const createdAt = Number(s.createdAt ?? s.updatedAt ?? Date.now());
+      const updatedAt = Number(s.updatedAt ?? Date.now());
+      const old = existing.get(s.sessionId);
+      if (!old) {
+        const meta = {
+          taskId: s.sessionId, traceId: crypto.randomUUID(), title: String(s.title ?? ''),
+          workspacePath: ws, createdAt, updatedAt, mode: String(s.mode ?? ''),
+          provider: 'glm', status, target: null, titleOverridden: false,
+        };
+        ins.run(ws, ws, s.sessionId, String(s.title ?? ''), status, String(s.mode ?? ''),
+          createdAt, updatedAt, JSON.stringify(meta), String(s.title ?? ''));
+        changed++;
+        continue;
+      }
+      if (Number(old.deleted) || Number(old.archived)) continue; // 桌面已删/归档：尊重
+      const titleOverridden = Number(old.title_overridden);
+      const newTitle = titleOverridden ? old.title : String(s.title ?? old.title ?? '');
+      if (old.title === newTitle && Number(old.updated_at) === updatedAt && old.task_status === status) continue;
+      let meta = {};
+      try { meta = JSON.parse(old.meta_json ?? '{}'); } catch { /* 空对象兜底 */ }
+      meta.taskId = s.sessionId;
+      meta.traceId = meta.traceId ?? crypto.randomUUID();
+      meta.title = newTitle;
+      meta.workspacePath = ws;
+      meta.createdAt = Number(meta.createdAt ?? createdAt);
+      meta.updatedAt = updatedAt;
+      meta.mode = String(s.mode ?? old.mode ?? '');
+      meta.provider = meta.provider ?? 'glm';
+      meta.status = status;
+      meta.titleOverridden = !!titleOverridden;
+      upd.run(newTitle, status, String(s.mode ?? old.mode ?? ''), updatedAt, JSON.stringify(meta), s.sessionId);
+      changed++;
+    }
+  } catch (e) {
+    logLine('task-sync', `同步桌面任务索引失败：${String(e?.message ?? e).slice(0, 200)}`);
+  }
+  return changed;
+}
+
+// 桌面标题自动生成有延迟、页面也未必开着：每 60s 全量对账一次
+setInterval(() => {
+  agent.request('session/list', { limit: 200, includeArchived: false })
+    .then((r) => syncTaskIndexRows((r.sessions ?? []).map((s) => ({
+      sessionId: s.sessionId,
+      title: String(s.title ?? '').includes('\uFFFD') ? '' : s.title,
+      status: s.status,
+      mode: s.mode,
+      createdAt: s.createdAt,
+      updatedAt: s.updatedAt,
+      workspacePath: s.workspace?.workspacePath ?? s.workspace?.workspaceKey ?? s.workspacePath ?? '',
+    }))))
+    .catch(() => { /* 引擎未就绪：下个周期再试 */ });
+}, 60000).unref();
 
 // ────────────────────────── 共享凭据（与桌面端同文件同密钥）──────────────────────────
 // 依据：adapters/src/auth/credential-cipher.ts + shared-credentials.ts
@@ -924,6 +1090,8 @@ async function sessionLooksFinished(sid) {
         })));
         list.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
         allListCache = { t: now, list };
+        // 双向同步：手机侧会话同步进桌面任务索引（桌面→手机本就走共享存储）
+        syncTaskIndexRows(list).catch(() => {});
         for (const it of list) {
           if (it.workspacePath) knownWorkspaces.add(path.resolve(it.workspacePath));
         }
@@ -994,6 +1162,18 @@ async function sessionLooksFinished(sid) {
       // 供官方样式的模型选择、思考档位、权限模式菜单与上下文容量卡使用
       settings: projectSettings(snap, sid),
     });
+    // 新会话尽快在桌面任务列表可见（标题生成后的更新由 60s 周期对账覆盖）
+    setTimeout(() => {
+      syncTaskIndexRows([{
+        sessionId: sid,
+        title: snap?.session?.title ?? '',
+        status: snap?.session?.status ?? 'idle',
+        mode: config.mode,
+        createdAt: snap?.session?.createdAt ?? Date.now(),
+        updatedAt: snap?.session?.updatedAt ?? Date.now(),
+        workspacePath: wsRef.workspacePath,
+      }]).catch(() => {});
+    }, 2000).unref();
   }
 
   if (seg[0] === 'api' && seg[1] === 'sessions' && seg[2]) {
@@ -1047,19 +1227,46 @@ async function sessionLooksFinished(sid) {
       return;
     }
 
+    if (req.method === 'GET' && sub === 'queue') {
+      return sendJson(res, 200, { queue: sessionState(sid).queue });
+    }
+
+    if (req.method === 'POST' && sub === 'queue/remove') {
+      const body = await readBody(req);
+      const id = String(body.id ?? '');
+      const st = sessionState(sid);
+      const idx = st.queue.findIndex((q) => q.id === id);
+      if (idx < 0) return sendJson(res, 404, { error: '排队项不存在' });
+      const [item] = st.queue.splice(idx, 1);
+      pushQueueState(sid);
+      return sendJson(res, 200, { ok: true, removed: item, queue: st.queue });
+    }
+
     if (req.method === 'POST' && sub === 'send') {
       const body = await readBody(req);
       const content = String(body.content ?? '').trim();
       if (!content) return sendJson(res, 400, { error: 'content 为空' });
-      if (sessionState(sid).busy) return sendJson(res, 409, { error: '当前回合仍在运行，请先停止或等待完成' });
-      const r = await agent.request('session/send', { sessionId: sid, content, inputId: crypto.randomUUID() }, 120000);
       const st = sessionState(sid);
-      st.busy = true;
-      if (!st.busySince) st.busySince = Date.now();
-      // 记录本次发送：回合若因 429 限流失败可自动重试（见 scheduleRateLimitRetry）
-      if (st.lastSend?.timer) clearTimeout(st.lastSend.timer);
-      st.lastSend = { content, at: Date.now(), retries: 0, timer: null };
-      return sendJson(res, 200, r);
+      if (!st.busy) {
+        try {
+          const r = await agent.request('session/send', { sessionId: sid, content, inputId: crypto.randomUUID() }, 120000);
+          st.busy = true;
+          if (!st.busySince) st.busySince = Date.now();
+          // 记录本次发送：回合若因 429 限流失败可自动重试（见 scheduleRateLimitRetry）
+          if (st.lastSend?.timer) clearTimeout(st.lastSend.timer);
+          st.lastSend = { content, at: Date.now(), retries: 0, timer: null };
+          return sendJson(res, 200, r);
+        } catch (e) {
+          // 回合由外进程（桌面端）驱动时本进程 busy 标记是 false，但引擎同样
+          // 拒绝并发 send（-32010）——此时转入队，而非把错误抛给页面
+          if (!SEND_BUSY_RE.test(String(e?.message ?? e))) throw e;
+          st.busy = true;
+          if (!st.busySince) st.busySince = Date.now();
+        }
+      }
+      // 运行中：入队为"下一轮预备任务"，回合结束后由 flushQueue 自动补发
+      enqueueMessage(sid, content);
+      return sendJson(res, 200, { queued: true, queue: st.queue });
     }
 
     if (req.method === 'POST' && sub === 'stop') {
