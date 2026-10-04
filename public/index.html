@@ -456,7 +456,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.6';
+const PAGE_BUILD = '2026-10-04.7';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -1912,7 +1912,24 @@ async function pollTick() {
     const finished = turnLooksFinished(msgs);
     const quietMs = Date.now() - Math.max(lastActivity, lastSseEventAt);
     if (fp === lastFingerprint) {
-      // 无存储变化：busy 超过 30 秒且回合已收尾 → 复位（补一次尾部重绘，
+      // 无存储变化。推断态收敛主路径：step-finish 稳定 6 秒 → 复位。
+      // （此前该逻辑写在"指纹变化"分支里，指纹一稳定就永远走不到——
+      // turn.completed 复位后 pollTick 又把 busy 拉回来，实际收敛全靠
+      // 30 秒静默兜底，实测转圈拖到 72 秒。）
+      if (busy && busySource === 'inferred' && finished) {
+        if (!finishedSince) finishedSince = Date.now();
+        if (Date.now() - finishedSince >= 6000) {
+          finishedSince = 0;
+          renderTail(msgs);
+          busySource = null;
+          setBusy(false);
+          notifyTaskState(false);
+          flushQueue();
+          loadAllSessions();
+          return;
+        }
+      }
+      // busy 超过 30 秒且回合已收尾 → 兜底复位（补一次尾部重绘，
       // 修正断流期间停留在 running 的工具行）
       if (busy && finished && quietMs > 30000) {
         renderTail(msgs);
@@ -1933,26 +1950,10 @@ async function pollTick() {
       return;
     }
     lastActivity = Date.now();
-    // 推断态收尾：step-finish 需稳定 6 秒才复位——多步回合的步骤间隙也会
-    // 短暂以 step-finish 结尾，立即复位会把进行中的回合误停
-    if (busySource === 'inferred') {
-      if (finished) {
-        if (!finishedSince) finishedSince = Date.now();
-        if (Date.now() - finishedSince >= 6000) {
-          finishedSince = 0;
-          renderTail(msgs);
-          busySource = null;
-          setBusy(false);
-          notifyTaskState(false);
-          flushQueue();
-          loadAllSessions();
-          return;
-        }
-      } else {
-        finishedSince = 0;
-      }
-    }
-    if (!busySource && !busy) {
+    // 指纹变化但回合已收尾：不进入运行态（回合结束落库的那次指纹变化
+    // 若触发置 busy，会与 turn.completed 的复位打架，转圈永不停止）
+    if (!finished) finishedSince = 0;
+    if (!busySource && !busy && !finished) {
       busySource = 'inferred';
       busySince = Date.now();
       setBusy(true);
@@ -1970,7 +1971,19 @@ async function pollTick() {
     }
   } catch (e) {
     // 服务端重启后引擎里没有这个会话（未 resume）：自动重新打开恢复
-    if (/not active/i.test(String(e?.message ?? e))) ensureResumed();
+    if (/not active/i.test(String(e?.message ?? e))) {
+      ensureResumed();
+      // resume 窗口/失败期间 probe 全部抛异常，上方各"静默复位"分支根本
+      // 执行不到——busy 会永久卡死（看桌面驱动会话、桥重启后必经此路径）。
+      // 兜底：busy 且无任何活动超过 45 秒直接复位；resume 成功且会话复活
+      // 后指纹变化会重新进入运行态，不会误伤真实运行中的任务
+      if (busy && Date.now() - Math.max(lastActivity, lastSseEventAt) > 45000) {
+        busySource = null;
+        setBusy(false);
+        notifyTaskState(false);
+        flushQueue();
+      }
+    }
   }
 }
 
