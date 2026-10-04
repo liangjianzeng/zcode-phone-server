@@ -484,12 +484,26 @@ function dbContextUsage(sessionId) {
   try {
     if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
     const row = agentDbHandle.prepare(
-      'SELECT input_tokens, output_tokens FROM model_usage WHERE session_id = ? ORDER BY started_at DESC, id DESC LIMIT 1'
+      'SELECT provider_id, model_id, input_tokens, output_tokens FROM model_usage WHERE session_id = ? ORDER BY started_at DESC, id DESC LIMIT 1'
     ).get(sessionId);
     if (!row) return null;
     const used = Number(row.input_tokens ?? 0) + Number(row.output_tokens ?? 0);
-    return used > 0 ? used : null;
+    if (used <= 0) return null;
+    return { used, providerId: String(row.provider_id ?? ''), modelId: String(row.model_id ?? '') };
   } catch { return null; }
+}
+
+/**
+ * z.ai Coding Plan 的 GLM-5.3 系列真实上下文窗口是 1M（100万 KV）：
+ * 引擎内置 provider 目录写的是 200K 老默认值，且投影 contextUsed 实测已
+ * 冲到 20.3 万任务仍正常跑（context_exceeded 从未触发），200K 显然错误。
+ * 非 GLM-5.3 或非 z.ai 账户返回 null（沿用引擎值）。
+ */
+function realContextWindow(providerId, modelId) {
+  if (/^account:/.test(String(providerId ?? '')) && /glm-5\.3/i.test(String(modelId ?? ''))) {
+    return 1_000_000;
+  }
+  return null;
 }
 
 /**
@@ -503,27 +517,36 @@ function projectSettings(snapshot) {
   const thought = st.thoughtLevel ?? {};
   const proj = snapshot?.projection ?? null;
   const sid = String(snapshot?.session?.id ?? snapshot?.sessionId ?? '');
-  // 投影缺 0（idle/外进程驱动）时用共享 DB 的真实上下文占用补
-  const used = Number(proj?.contextUsed ?? 0) > 0
-    ? Number(proj.contextUsed)
-    : (dbContextUsage(sid) ?? 0);
+  const cur = modelRefToJson(model.current);
+  // 投影缺 0（idle/外进程驱动）时用共享 DB 的真实上下文占用补；
+  // DB 回退还能带回该会话实际用的模型（provider/model），用于修正窗口
+  const dbCtx = Number(proj?.contextUsed ?? 0) > 0
+    ? null
+    : dbContextUsage(sid);
+  const used = Number(proj?.contextUsed ?? 0) > 0 ? Number(proj.contextUsed) : (dbCtx?.used ?? 0);
+  // 窗口修正：引擎内置目录的 GLM-5.3 是 200K 老默认值，真实 1M。
+  // 优先看会话实际用的模型，再看当前选中模型。
+  const winOverride = realContextWindow(dbCtx?.providerId, dbCtx?.modelId)
+    ?? realContextWindow(cur.providerId, cur.modelId);
+  const available = (Array.isArray(model.available) ? model.available : []).map((o) => ({
+    providerId: o.ref?.providerId ?? '',
+    modelId: o.ref?.modelId ?? '',
+    reasoningLevel: o.ref?.options?.reasoningLevel ?? '',
+    label: o.label ?? o.ref?.modelId ?? '',
+    providerLabel: o.providerLabel ?? '',
+    description: o.description ?? '',
+    contextWindow: realContextWindow(o.ref?.providerId, o.ref?.modelId)
+      ?? (o.contextWindow ?? 0),
+    reasoningLevels: (o.reasoning?.levels ?? []).map((l) => ({
+      value: l.value, label: l.label, description: l.description ?? '',
+    })),
+    defaultReasoningLevel: o.reasoning?.defaultLevel ?? '',
+    disabledReason: o.disabledReason ?? '',
+  }));
   return {
     model: {
-      current: modelRefToJson(model.current),
-      available: (Array.isArray(model.available) ? model.available : []).map((o) => ({
-        providerId: o.ref?.providerId ?? '',
-        modelId: o.ref?.modelId ?? '',
-        reasoningLevel: o.ref?.options?.reasoningLevel ?? '',
-        label: o.label ?? o.ref?.modelId ?? '',
-        providerLabel: o.providerLabel ?? '',
-        description: o.description ?? '',
-        contextWindow: o.contextWindow ?? 0,
-        reasoningLevels: (o.reasoning?.levels ?? []).map((l) => ({
-          value: l.value, label: l.label, description: l.description ?? '',
-        })),
-        defaultReasoningLevel: o.reasoning?.defaultLevel ?? '',
-        disabledReason: o.disabledReason ?? '',
-      })),
+      current: cur,
+      available,
     },
     thoughtLevel: {
       enabled: !!thought.enabled,
@@ -537,7 +560,8 @@ function projectSettings(snapshot) {
     slashCommands: Array.isArray(snapshot?.slashCommands) ? snapshot.slashCommands : [],
     projection: (proj || used > 0) ? {
       contextUsed: used,
-      contextWindow: Number(proj?.contextWindow ?? 0) > 0 ? Number(proj.contextWindow) : 200000,
+      contextWindow: winOverride
+        ?? (Number(proj?.contextWindow ?? 0) > 0 ? Number(proj.contextWindow) : 0),
       totalTokenCount: proj?.totalTokenCount ?? 0,
       status: proj?.status ?? '',
     } : null,
@@ -1027,11 +1051,16 @@ async function handleApi(req, res, url) {
       } catch (e) {
         // 会话不在本进程激活（引擎重启后未 resume）：模型/档位拿不到，但
         // 上下文容量仍可从共享 DB 回答（页面弹卡需要它，不能整包 unavailable）
-        const used = dbContextUsage(sid);
-        if (used != null) {
+        const dbCtx = dbContextUsage(sid);
+        if (dbCtx) {
           return sendJson(res, 200, {
             unavailable: String(e?.message ?? e).slice(0, 200),
-            projection: { contextUsed: used, contextWindow: 200000, totalTokenCount: 0, status: '' },
+            projection: {
+              contextUsed: dbCtx.used,
+              contextWindow: realContextWindow(dbCtx.providerId, dbCtx.modelId) ?? 200000,
+              totalTokenCount: 0,
+              status: '',
+            },
           });
         }
         return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
