@@ -1468,10 +1468,26 @@ async function sessionLooksFinished(sid) {
       if (!['plan', 'build', 'edit', 'yolo', 'auto'].includes(mode)) {
         return sendJson(res, 400, { error: `mode 不支持：${mode}` });
       }
+      // 只改当前会话的模式（session/setMode 是会话级持久化，引擎落库）。
+      // 之前这里连带 config.mode = mode 写全局默认——切某个会话的盾牌档位
+      // 会悄悄改掉之后所有新建会话的默认模式，是两件不该耦合的事。
       await agent.request('session/setMode', { sessionId: sid, mode });
-      config.mode = mode;
-      saveConfig(config);
       return sendJson(res, 200, { ok: true, mode });
+    }
+
+    // 交互应答开关（审批是否落到手机端）：allow=自动放行权限请求/自动采纳
+    // 提问第一选项；ask=推到手机端审批卡人工处理（30 分钟无应答自动拒绝）。
+    // 运行时可改（config 对象内存生效 + saveConfig 落盘），无需重启服务。
+    if (req.method === 'POST' && p === '/api/autoAnswer') {
+      const body = await readBody(req);
+      const v = String(body.autoAnswer ?? '').trim();
+      if (!['allow', 'ask'].includes(v)) {
+        return sendJson(res, 400, { error: `autoAnswer 不支持：${v}（仅 allow/ask）` });
+      }
+      config.autoAnswer = v;
+      saveConfig(config);
+      logLine('config', `autoAnswer -> ${v}`);
+      return sendJson(res, 200, { ok: true, autoAnswer: v });
     }
 
     // 压缩上下文（对照官方容量卡的主动收缩入口）
