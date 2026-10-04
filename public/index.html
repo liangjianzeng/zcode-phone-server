@@ -474,7 +474,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.9';
+const PAGE_BUILD = '2026-10-04.10';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -1142,8 +1142,13 @@ function ensureThink(m, partId) {
   pe = { kind: 'think', el: details, content: body };
   m.partEls.set(partId, pe);
   if (!thinkTimers.has(partId)) thinkTimers.set(partId, Date.now());
+  // 最新思考默认展开，其余自动收起（方便观察当前思考过程）
+  details.open = true;
+  if (openThinkDetails && openThinkDetails !== details) openThinkDetails.open = false;
+  openThinkDetails = details;
   return pe;
 }
+let openThinkDetails = null;
 
 // 工具卡片（官方扁平行：[icon] 名称 命令摘要 …… 状态）
 function toolCard(toolCallId, toolName, desc) {
@@ -1301,6 +1306,10 @@ function renderHistory(messages) {
   renderTodoBar();
   // 更新尾部指纹：轮询跟随以这里为准（打开会话/重连重同步/轮询全量拉取共用）
   lastFingerprint = fingerprint(messages);
+  // 思考块：最后一条的默认展开，其余折叠
+  const thinks = chat.querySelectorAll('.msg.assistant .think');
+  thinks.forEach((t) => { t.open = false; });
+  if (thinks.length) { thinks[thinks.length - 1].open = true; openThinkDetails = thinks[thinks.length - 1]; }
   if (!messages.length) {
     chat.innerHTML = '<div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2">这个会话还没有消息</div></div>';
     return;
@@ -1320,6 +1329,8 @@ function renderHistory(messages) {
         case 'tool': {
           const st = part.state ?? {};
           ingestTodos(part.tool, st.input);
+          // TodoWrite 不渲染工具行（底部任务计划折叠条已承载进度）
+          if (String(part.tool ?? '').toLowerCase() === 'todowrite') break;
           const card = toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
           const status = st.status ?? 'pending';
           const detail = status === 'error' ? st.error : st.output;
@@ -1689,8 +1700,10 @@ function handleZcodeEvent(ev) {
       else if (part.type === 'tool') {
         const st = part.state ?? {};
         ingestTodos(part.tool, st.input);
-        toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
-        setToolStatus(part.callId, st.status ?? 'pending', undefined, st.status === 'error' ? st.error : st.output);
+        if (String(part.tool ?? '').toLowerCase() !== 'todowrite') {
+          toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
+          setToolStatus(part.callId, st.status ?? 'pending', undefined, st.status === 'error' ? st.error : st.output);
+        }
       }
       scrollBottom();
       break;
@@ -1722,6 +1735,8 @@ function handleZcodeEvent(ev) {
       const p = ev.payload ?? {};
       if (p.kind === 'batch') break;
       ingestTodos(p.toolName, p.input);
+      // TodoWrite 不渲染工具行（底部任务计划折叠条已承载进度）
+      if (String(p.toolName ?? '').toLowerCase() === 'todowrite') break;
       const id = p.toolCallId;
       const desc = inputSummary(p.input) || (p.toolName ?? '');
       toolCard(id, p.toolName, desc);
@@ -1955,6 +1970,8 @@ function renderTail(messages) {
         case 'tool': {
           const st = part.state ?? {};
           ingestTodos(part.tool, st.input);
+          // TodoWrite 不渲染工具行（底部任务计划折叠条已承载进度）
+          if (String(part.tool ?? '').toLowerCase() === 'todowrite') break;
           const card = toolCard(part.callId, part.tool, st.title ?? inputSummary(st.input));
           const status = st.status ?? 'pending';
           const detail = status === 'error' ? st.error : st.output;
@@ -2032,12 +2049,18 @@ async function pollTick() {
         loadAllSessions();
         return;
       }
-      // 推断运行态长时间无任何变化：回合可能异常中断，兜底收尾
-      if (busySource === 'inferred' && Date.now() - lastActivity > 120000) {
+      // 收敛兜底：存储指纹稳定 45 秒仍 busy → 复位。覆盖"被取消/中断的
+      // 回合最后部件永远停在 tool:running"的场景（取消不写 step-finish，
+      // finished 永远 false）。代价：桌面驱动回合里超 45 秒无存储写入的
+      // 长工具会短暂显示空闲——下一条存储写入即恢复运行态，可自愈
+      if (busy && quietMs > 45000) {
+        renderTail(msgs);
         busySource = null;
         setBusy(false);
         notifyTaskState(false);
         flushQueue();
+        loadAllSessions();
+        return;
       }
       return;
     }
@@ -2181,10 +2204,13 @@ async function send() {
 
 $('btnSend').addEventListener('click', () => {
   if (busy) {
-    // 运行中发送按钮即停止按钮（官方交互）
+    // 运行中发送按钮即停止按钮（官方交互）。
+    // 注意：桌面端驱动的回合，stop 只能发给桥引擎（no-op）——提示里说明
     if (!curSession) return;
     api(`sessions/${encodeURIComponent(curSession)}/stop`, { method: 'POST', body: '{}' })
-      .then(() => toast('已请求停止'))
+      .then(() => toast(busySource === 'inferred'
+        ? '已请求停止（该回合由桌面端驱动，请在桌面端停止）'
+        : '已请求停止'))
       .catch((e) => toast(`停止失败：${e.message}`));
     return;
   }
