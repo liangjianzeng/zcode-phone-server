@@ -272,14 +272,14 @@
   .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; z-index: 20; }
   .overlay.open { display: block; }
   #drawer .sheet {
-    position: absolute; left: 0; top: 0; bottom: 0; width: min(82vw, 340px);
+    position: absolute; left: 0; top: 0; bottom: 0; width: min(72vw, 280px);
     background: var(--panel); border-right: 1px solid var(--line);
     display: flex; flex-direction: column;
   }
   #drawer .sheet .head { padding: 14px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
   #drawer .sheet .head b { flex: 1; }
   #info .sheet {
-    position: absolute; right: 0; top: 0; bottom: 0; width: min(94vw, 440px);
+    position: absolute; right: 0; top: 0; bottom: 0; width: min(84vw, 360px);
     background: var(--panel); border-left: 1px solid var(--line);
     display: flex; flex-direction: column;
   }
@@ -510,7 +510,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.15';
+const PAGE_BUILD = '2026-10-04.17';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -1976,6 +1976,7 @@ function purgeLiveStream() {
 function handleUiEvent(p) {
   // 会话守卫：异会话的交互事件不渲染进当前视图（串台）
   if (p.sessionId && curSession && p.sessionId !== curSession) return;
+  // 服务端 ui 推送以 __ui 标记类型（历史字段 kind 仅权限事件携带，两者都查）
   if (p.kind === 'permission' && p.pending) {
     const card = el('div', 'ask');
     card.appendChild(el('div', 'q', `权限请求：${p.toolName ?? ''} ${p.reason ?? ''}`));
@@ -1987,15 +1988,15 @@ function handleUiEvent(p) {
     chat.appendChild(card); scrollBottom();
   }
   // 服务端自动重试提示（429 限流退避等）
-  if (p.kind === 'note' && p.text) {
+  if ((p.kind === 'note' || p.__ui === 'note') && p.text) {
     chat.querySelectorAll('.sysline[data-retry]').forEach((n) => n.remove());
     const note = el('div', 'sysline', p.text);
     note.dataset.retry = '1';
     chat.appendChild(note); scrollBottom();
     toast(p.text);
   }
-  // 队列状态对齐（入队/补发/取回都由服务端推送）
-  if (p.kind === 'queue') renderQueue(p.queue ?? []);
+  // 队列状态对齐（入队/补发/取回/删除都由服务端推送 __ui:'queue'）
+  if (p.kind === 'queue' || p.__ui === 'queue') renderQueue(p.queue ?? []);
   if (p.expired) toast('交互请求已超时自动拒绝');
 }
 
