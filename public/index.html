@@ -456,7 +456,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.5';
+const PAGE_BUILD = '2026-10-04.6';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -1892,6 +1892,19 @@ function renderTail(messages) {
 async function pollTick() {
   if (!curSession) return;
   if (document.hidden) return; // WebView 后台会暂停定时器，回前台自然补一次
+  // 版本漂移检测（每 ~20 次探测一次，约 25 秒）：服务端页面更新后自动刷新，
+  // 否则手机一直跑内存里的旧 JS，页面级修复永远到不了终端
+  if (++pollCount % 20 === 0) {
+    try {
+      const st = await api('state');
+      if (serverBuildHash === null) serverBuildHash = st.pageBuild;
+      else if (st.pageBuild && st.pageBuild !== serverBuildHash) {
+        toast('页面已更新，正在刷新…');
+        setTimeout(() => location.reload(), 600);
+        return;
+      }
+    } catch { /* 下次再试 */ }
+  }
   try {
     const probe = await api(`sessions/${encodeURIComponent(curSession)}/messages?limit=10`);
     const msgs = probe.messages ?? [];
@@ -1964,6 +1977,8 @@ async function pollTick() {
 // 服务重启/引擎丢会话后自动 resume 当前会话（30 秒冷却防循环）
 let resumingSession = false;
 let lastResumeAt = 0;
+let pollCount = 0;          // 轮询计数（版本漂移检测分频用）
+let serverBuildHash = null; // 首次探测到的服务端页面指纹，变化即自动刷新
 async function ensureResumed() {
   if (resumingSession || !curSession) return;
   if (Date.now() - lastResumeAt < 30000) return;

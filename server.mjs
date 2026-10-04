@@ -511,12 +511,14 @@ function realContextWindow(providerId, modelId) {
  * model.current/available（含 reasoning 档位）、thoughtLevel、mode、slashCommands、
  * projection（上下文占用，供官方样式「上下文容量」卡片使用）。
  */
-function projectSettings(snapshot) {
+function projectSettings(snapshot, fallbackSid = '') {
   const st = snapshot?.settings ?? {};
   const model = st.model ?? {};
   const thought = st.thoughtLevel ?? {};
   const proj = snapshot?.projection ?? null;
-  const sid = String(snapshot?.session?.id ?? snapshot?.sessionId ?? '');
+  // session/read 快照不带 session 对象（2026-10-04 实测），路由侧补传 sid，
+  // 否则 DB 回退查不到 model_usage，容量恒显 0
+  const sid = String(snapshot?.session?.id ?? snapshot?.sessionId ?? fallbackSid ?? '');
   const cur = modelRefToJson(model.current);
   // 投影缺 0（idle/外进程驱动）时用共享 DB 的真实上下文占用补；
   // DB 回退还能带回该会话实际用的模型（provider/model），用于修正窗口
@@ -795,6 +797,10 @@ function pushAccountConfig() {
 // ────────────────────────── HTTP 服务 ──────────────────────────
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
+/** index.html 内容指纹（md5 前 8 位）：页面经 /api/state 比对，变了自动 reload。 */
+const PAGE_BUILD_FINGERPRINT = crypto.createHash('md5')
+  .update(fs.readFileSync(path.join(PUBLIC_DIR, 'index.html')))
+  .digest('hex').slice(0, 8);
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
 
 function timingSafeEqual(a, b) {
@@ -844,6 +850,10 @@ async function handleApi(req, res, url) {
       model: config.model,
       autoAnswer: config.autoAnswer,
       agentRunning: !!agent.child,
+      // 页面构建指纹（index.html 内容 md5 前 8 位）：页面轮询对比，服务端
+      // 更新页面后客户端自动 reload——否则手机一直跑内存里的旧 JS，
+      // 所有页面级修复都到不了终端（2026-10-04 卡死/容量环教训）
+      pageBuild: PAGE_BUILD_FINGERPRINT,
     });
   }
 
@@ -958,7 +968,7 @@ async function handleApi(req, res, url) {
       busySince: sessionState(sid).busySince || undefined,
       // 会话设置（模型列表/思考档位/权限模式/slash 命令/上下文投影）：
       // 供官方样式的模型选择、思考档位、权限模式菜单与上下文容量卡使用
-      settings: projectSettings(snap),
+      settings: projectSettings(snap, sid),
     });
   }
 
@@ -1047,7 +1057,8 @@ async function handleApi(req, res, url) {
     if (req.method === 'GET' && sub === 'settings') {
       try {
         const r = await agent.request('session/read', { sessionId: sid, messageLimit: 1 });
-        return sendJson(res, 200, projectSettings(r ?? {}));
+        const ps = projectSettings(r ?? {}, sid);
+        return sendJson(res, 200, ps);
       } catch (e) {
         // 会话不在本进程激活（引擎重启后未 resume）：模型/档位拿不到，但
         // 上下文容量仍可从共享 DB 回答（页面弹卡需要它，不能整包 unavailable）
