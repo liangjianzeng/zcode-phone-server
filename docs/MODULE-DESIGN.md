@@ -319,6 +319,7 @@ approval 高优通知）。页面 v2 通知与 DOM 桥**双通道并存**，通�
 | 19 | 用户输入的消息也重复显示（不止输出） | part 处理器把一切部件事件当 assistant 画（`ensureMsg(mid,'assistant')` 写死）；现代引擎对用户输入文本部件也实时推 part 事件 → 回显之外再多一份副本 | 记录最近自己发出的输入（doSend/turn.started），part 事件命中即标记 `ownPart` 不渲染、就地纠正为 user 角色；`dropMatchingUserEcho` 扩展按文本对齐清理 ownPart 副本；ensureMsg 支持存储确认后的角色就地升级 | 输入单份、身份样式正确 |
 | 20 | 页面自己"一抖一抖"（消息区高度反复变化+滚动跳动） | 四层叠加，全在消息区渲染热路径：①复制/分享操作行在每个部件事件/每次轮询都无条件迁移；②轮询 renderTail 对最近 10 条消息的正文**无条件整段清空重建**（markdown 全量重解析），哪怕内容未变；③操作行迁移的"持有者判断"挡不住轮询——renderTail 处理旧消息时把行从最新消息抢走再一路搬回；④streamRich 合帧定时器异步重绘改高度后无人对齐滚动 | ①操作行两道纪律：持有者真正变化才动 DOM + **非最新消息一律不迁移**（`msgs[last] !== m.el` 直接跳过）；②renderTextPart 内容未变（`pe.raw` 比对）直接跳过重建；③part.upserted/renderTail 的正文增长改走 streamRich 合帧（权威重建由回合收尾 renderTextPart 兜底，chips 不丢）；④合帧渲染后补 scrollBottom | 强刷后流式期间消息区无抖动（App 原生层月相/天气动效另计） |
 | 21 | App（Zcode 模式）里点产出 chip 毫无反应，无法查看/下载；产出卡跨回合反复积累 | ①页面 fileChip 监听器无条件 `stopPropagation()`，而 artifactBridgeJs 挂在 document **冒泡阶段**——事件永远到不了桥；②各置 busy 路径都先改 busySince 再调 setBusy(true)，`!busySince` 清空条件永不触发，且旧产出卡不删除 | ①fileChip 检测到 `__dshArtifactBridge` 时直接放行（不拦截不阻断）；②产出收集改以 setBusy 的 false→true 真边界清空（wasBusy），新卡渲染前移除旧 `.turnarts` 卡；③richText 代码块补 `language-xxx` class 供 App 查看器识别语言；Windows 盘符路径由 Dart 侧 SFTP 兼容（tunnel_service 已有） | App 内点 chip 打开查看器/下载页；对话中只保留当轮产出卡 |
+| 22 | 回复里的 markdown 表格按原文吐管道符（md 样式） | mdBlocks 渲染子集没实现表格语法；顺带缺 ~~删除线~~ 与裸链接自动识别 | mdBlocks 增加表格块（thead/tbody + 对齐标记 + 窄屏横向滚动 .md-tblwrap）；mdInline 增加 ~~…~~ 与裸 URL 自动成链 | puppeteer 实测：表格/对齐/删除线/自动链接全部渲染 |
 
 ---
 
