@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0e">
+<title>zcode-phone-server · 技术架构简版</title>
+<style>
+:root{--bg:#f5f5f7;--fg:#1c1c22;--dim:#66666f;--line:#e2e2e9;--card:#ffffff;--accent:#6a4df0;--accent2:#0b62d6;--code-bg:#f0f0f4}
+@media(prefers-color-scheme:dark){:root{--bg:#0b0b0e;--fg:#e9e9ee;--dim:#9a9aa4;--line:#2b2b34;--card:#181820;--accent:#8b74ff;--accent2:#5aa2ff;--code-bg:#08080b}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,"Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+#deck{height:100svh;overflow-y:auto;scroll-snap-type:y mandatory;-webkit-overflow-scrolling:touch}
+.pg{min-height:100svh;scroll-snap-align:start;scroll-snap-stop:always;padding:24px 18px 58px;display:flex;flex-direction:column;gap:12px}
+.top{display:flex;justify-content:space-between;align-items:center}
+.kicker{font-size:11px;letter-spacing:.13em;color:var(--accent);font-weight:800}
+.n{font-size:15px;font-weight:800;color:var(--accent);opacity:.9}
+h2{font-size:24px;line-height:1.25;margin:2px 0 0;font-weight:800}
+.sub{font-size:12.5px;color:var(--dim);margin:0}
+.rule{height:4px;width:52px;border-radius:2px;background:linear-gradient(90deg,var(--accent),var(--accent2));margin:2px 0 2px}
+.statband{display:flex;gap:9px}
+.stat{flex:1;background:linear-gradient(165deg,color-mix(in srgb,var(--accent) 14%,var(--card)),var(--card));border:1px solid var(--line);border-radius:13px;padding:9px 6px 8px;text-align:center}
+.stat b{display:block;font-size:20px;font-weight:800;color:var(--accent);line-height:1.2}
+.stat span{font-size:10.5px;color:var(--dim)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:11px 13px}
+.card h3{margin:0 0 3px;font-size:14.5px}
+.card p,.card li{font-size:12.8px;color:var(--dim);margin:2px 0}
+.hl{color:var(--fg);font-weight:700}
+ul.clean{list-style:none;margin:0;padding:0}
+ul.clean li{padding-left:15px;position:relative;font-size:13px;color:var(--dim);margin:5px 0}
+ul.clean li::before{content:'▸';position:absolute;left:0;color:var(--accent)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.mono{display:block;margin-top:5px;font:10.5px/1.5 ui-monospace,Consolas,monospace;color:var(--accent);background:var(--code-bg);border-radius:7px;padding:3px 8px;word-break:break-all}
+svg.f{width:100%;max-width:392px;display:block;margin:0 auto;height:auto}
+.foot{margin-top:auto;font-size:11.5px;color:var(--faint);border-top:1px dashed var(--line);padding-top:9px}
+a{color:var(--accent);text-decoration:none;word-break:break-all}
+.dots{position:fixed;bottom:12px;left:0;right:0;display:flex;justify-content:center;gap:7px;z-index:9}
+.dots b{width:7px;height:7px;border-radius:50%;background:var(--line);transition:.25s;cursor:pointer}
+.dots b.on{background:var(--accent);width:19px;border-radius:4px}
+</style>
+</head>
+<body>
+<main id="deck">
+
+<!-- P1 封面 -->
+<section class="pg">
+  <div class="top"><span class="kicker">ZCODE-PHONE-SERVER · 技术架构简版</span><span class="n">01 / 09</span></div>
+  <div style="margin:auto 0 6px;padding:26px 0 10px">
+    <div style="font-size:40px;font-weight:800;letter-spacing:-.01em;background:linear-gradient(120deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent">zcode-phone-server</div>
+    <p style="font-size:18px;font-weight:700;margin:10px 0 6px">给 ZCode 引擎做一套移动可用的协议桥。</p>
+    <p style="font-size:13px;color:var(--dim);margin:0">stdio ND-JSON（ZCode Protocol）→ token 鉴权 HTTP/SSE → 移动聊天页；桌面引擎与手机之间的全部胶水层。</p>
+  </div>
+  <div class="statband">
+    <div class="stat"><b>0</b><span>npm 依赖</span></div>
+    <div class="stat"><b>≥22.5</b><span>Node（node:sqlite）</span></div>
+    <div class="stat"><b>60ms</b><span>delta 合帧</span></div>
+    <div class="stat"><b>127.0.0.1</b><span>只监听回环</span></div>
+  </div>
+  <div class="foot">v0.0.1 · 与桌面端共享凭据文件与会话库（sqlite）· 手机经 SSH 隧道接入</div>
+</section>
+
+<!-- P2 总体架构 + 基础事实 -->
+<section class="pg">
+  <div class="top"><span class="kicker">总体架构</span><span class="n">02 / 09</span></div>
+  <div><h2>四层链路与四条基础事实</h2><p class="sub">所有设计决定由 F1–F4 推导</p></div>
+  <div class="rule"></div>
+  <svg class="f" viewBox="0 0 360 190">
+    <rect x="30" y="4" width="300" height="32" rx="10" fill="var(--card)" stroke="var(--line)" opacity=".85"/><text x="180" y="25" text-anchor="middle" font-size="11.5" fill="currentColor" opacity=".85">消费方：DSH-Phone App（WebView + JS 桥）</text>
+    <line x1="180" y1="36" x2="180" y2="48" stroke="var(--dim)" stroke-width="1.3"/><text x="192" y="47" font-size="10" fill="var(--dim)">SSH 隧道（仅回环）</text>
+    <rect x="30" y="48" width="300" height="34" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="2"/><text x="180" y="70" text-anchor="middle" font-size="12" fill="currentColor">zcode-phone-server（token HTTP/SSE · 聊天页）</text>
+    <line x1="180" y1="82" x2="180" y2="94" stroke="var(--dim)" stroke-width="1.3"/><text x="192" y="93" font-size="10" fill="var(--dim)">stdio ND-JSON（无 jsonrpc 字段）</text>
+    <rect x="30" y="94" width="300" height="32" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="180" y="115" text-anchor="middle" font-size="11.5" fill="currentColor">zcode.cjs app-server（ZCode 引擎）</text>
+    <line x1="180" y1="126" x2="180" y2="138" stroke="var(--dim)" stroke-width="1.3"/><text x="192" y="137" font-size="10" fill="var(--dim)">HTTPS · 凭据直通</text>
+    <rect x="30" y="138" width="300" height="32" rx="10" fill="var(--card)" stroke="var(--line)" opacity=".85"/><text x="180" y="159" text-anchor="middle" font-size="11.5" fill="currentColor" opacity=".85">模型提供方（z.ai / bigmodel Coding Plan）</text>
+  </svg>
+  <div class="grid2">
+    <div class="card"><h3>F1 会话库共享</h3><p>部件粒度实时落盘 → 任意进程可读他人回合进度（轮询跟随的依据）</p></div>
+    <div class="card"><h3>F2 SSE 进程内</h3><p>引擎只推自己执行的回合 → 桌面驱动回合只能轮询存储</p></div>
+    <div class="card"><h3>F3 凭据共享</h3><p>credentials.json（aes-256-gcm）→ 桥解密桌面登录态</p></div>
+    <div class="card"><h3>F4 存活边界</h3><p>未落库会话重启即失 → 存在性以共享库为权威源</p></div>
+  </div>
+</section>
+
+<!-- P3 功能架构 -->
+<section class="pg">
+  <div class="top"><span class="kicker">服务端功能架构</span><span class="n">03 / 09</span></div>
+  <div><h2>接入层 → 六大功能模块 → 引擎与数据</h2><p class="sub">每条外部能力都对应引擎不自带的服务端补齐</p></div>
+  <div class="rule"></div>
+  <div class="statband">
+    <div class="stat"><b>1000</b><span>重放环上限</span></div>
+    <div class="stat"><b>5×20s</b><span>限流重试</span></div>
+    <div class="stat"><b>2s→15s</b><span>崩溃拉起退避</span></div>
+    <div class="stat"><b>30min</b><span>幽灵行宽限</span></div>
+  </div>
+  <svg class="f" viewBox="0 0 360 274">
+    <rect x="14" y="4" width="160" height="34" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="94" y="26" text-anchor="middle" font-size="10.5" fill="currentColor">HTTP /api/*（token 鉴权）</text>
+    <rect x="186" y="4" width="160" height="34" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="266" y="26" text-anchor="middle" font-size="10.5" fill="currentColor">SSE 流（重放环 · 心跳）</text>
+    <rect x="14" y="52" width="160" height="42" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="94" y="69" text-anchor="middle" font-size="10.5" fill="currentColor">引擎桥 ZcodeAgent</text><text x="94" y="84" text-anchor="middle" font-size="10" fill="var(--dim)">stdio · 反向应答 · 崩溃拉起</text>
+    <rect x="186" y="52" width="160" height="42" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="266" y="69" text-anchor="middle" font-size="10.5" fill="currentColor">delta 合帧</text><text x="266" y="84" text-anchor="middle" font-size="10" fill="var(--dim)">60ms · 相邻同键 · FIFO</text>
+    <rect x="14" y="104" width="160" height="42" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="94" y="121" text-anchor="middle" font-size="10.5" fill="currentColor">发送队列（预备任务）</text><text x="94" y="136" text-anchor="middle" font-size="10" fill="var(--dim)">-32010 单飞 → 入队补发</text>
+    <rect x="186" y="104" width="160" height="42" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="266" y="121" text-anchor="middle" font-size="10.5" fill="currentColor">限流自动重试</text><text x="266" y="136" text-anchor="middle" font-size="10" fill="var(--dim)">429×5 · 1113 不重试</text>
+    <rect x="14" y="156" width="160" height="42" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="94" y="173" text-anchor="middle" font-size="10.5" fill="currentColor">任务索引同步</text><text x="94" y="188" text-anchor="middle" font-size="10" fill="var(--dim)">sqlite 对账 · 幽灵行清理</text>
+    <rect x="186" y="156" width="160" height="42" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="266" y="173" text-anchor="middle" font-size="10.5" fill="currentColor">交互应答</text><text x="266" y="188" text-anchor="middle" font-size="10" fill="var(--dim)">权限/提问/凭据 headers</text>
+    <line x1="180" y1="198" x2="180" y2="222" stroke="var(--dim)" stroke-width="1.3"/><text x="192" y="214" font-size="10" fill="var(--dim)">驱动 · 对账 · 解密</text>
+    <rect x="14" y="226" width="106" height="40" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="2"/><text x="67" y="243" text-anchor="middle" font-size="10.5" fill="currentColor">ZCode 引擎</text><text x="67" y="257" text-anchor="middle" font-size="10" fill="var(--dim)">app-server</text>
+    <rect x="127" y="226" width="106" height="40" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="180" y="243" text-anchor="middle" font-size="10.5" fill="currentColor">共享会话库</text><text x="180" y="257" text-anchor="middle" font-size="10" fill="var(--dim)">db.sqlite</text>
+    <rect x="240" y="226" width="106" height="40" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="293" y="243" text-anchor="middle" font-size="10.5" fill="currentColor">桌面凭据</text><text x="293" y="257" text-anchor="middle" font-size="10" fill="var(--dim)">credentials.json</text>
+  </svg>
+  <p class="sub">协议依据开源仓库 zai-org/ZCode 的 zcode-protocol schema（strict，帧不带 jsonrpc 字段）。</p>
+</section>
+
+<!-- P4 SSE 枢纽与合帧 -->
+<section class="pg">
+  <div class="top"><span class="kicker">SSE 枢纽</span><span class="n">04 / 09</span></div>
+  <div><h2>重放环、例外与合帧</h2><p class="sub">每会话 subs + ring ≤1000 + busy 状态</p></div>
+  <div class="rule"></div>
+  <div class="statband">
+    <div class="stat"><b>60ms</b><span>合帧窗口</span></div>
+    <div class="stat"><b>数千→数十</b><span>长回复帧量</span></div>
+    <div class="stat"><b>0</b><span>顺序重排</span></div>
+  </div>
+  <div class="card"><h3>事件分类</h3><p><span class="hl">常规事件</span>：进重放环（断线按 afterSeq 续传）+ 直播订阅者；<span class="hl">model.streaming</span>：只直播不进环（百余 chunk 会挤占环且重放语义不对）；<span class="hl">ui/reset</span>：桥注入事件与服务重启信号。</p></div>
+  <div class="card"><h3>delta 合帧（严格 FIFO）</h3><p>model.streaming / part.delta 相邻同键 chunk 合并成一帧；只允许与队尾待发 delta 同键合并，其余事件先冲刷再入队——<b>顺序绝不重排</b>。合并帧携带首个 chunk 的 seq，重连重放语义不变。</p><span class="tech">key = 助手消息id+kind ｜ 消息id+partId+field</span></div>
+  <div class="card"><h3>页面自更新</h3><p>index.html 内容 md5 前 8 位作为构建指纹，经 /api/state 下发；页面轮询比对自动 reload——改页面无需重启服务。</p></div>
+</section>
+
+<!-- P5 渲染 -->
+<section class="pg">
+  <div class="top"><span class="kicker">页面渲染</span><span class="n">05 / 09</span></div>
+  <div><h2>双通道跟随，一个事实来源</h2><p class="sub">三条路径汇入渲染层，重复与抖动根治</p></div>
+  <div class="rule"></div>
+  <div class="statband">
+    <div class="stat"><b>1.2s</b><span>轮询周期</span></div>
+    <div class="stat"><b>60ms</b><span>渲染合帧</span></div>
+    <div class="stat"><b>4000</b><span>工具输出截断</span></div>
+  </div>
+  <svg class="f" viewBox="0 0 360 232">
+    <rect x="8" y="4" width="210" height="36" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="1.8"/><text x="113" y="20" text-anchor="middle" font-size="10.5" fill="currentColor">① 部件落库事件</text><text x="113" y="34" text-anchor="middle" font-size="10" fill="var(--dim)">part.upserted / part.delta（SSE）</text>
+    <rect x="8" y="54" width="210" height="36" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="113" y="70" text-anchor="middle" font-size="10.5" fill="currentColor">② token 直播 model.streaming</text><text x="113" y="84" text-anchor="middle" font-size="10" fill="var(--dim)">直播块 __live-*（legacy 兜底）</text>
+    <rect x="8" y="104" width="210" height="36" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="113" y="120" text-anchor="middle" font-size="10.5" fill="currentColor">③ 存储轮询 renderTail</text><text x="113" y="134" text-anchor="middle" font-size="10" fill="var(--dim)">指纹比对 · 未变化跳过</text>
+    <line x1="218" y1="22" x2="238" y2="60" stroke="var(--dim)" stroke-width="1.4"/><line x1="218" y1="72" x2="238" y2="76" stroke="var(--dim)" stroke-width="1.4"/><line x1="218" y1="122" x2="238" y2="92" stroke="var(--dim)" stroke-width="1.4"/>
+    <rect x="244" y="40" width="108" height="96" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="2"/><text x="298" y="62" text-anchor="middle" font-size="10.5" fill="currentColor">渲染层</text><text x="298" y="78" text-anchor="middle" font-size="10" fill="var(--dim)">msgEls / toolEls</text><text x="298" y="94" text-anchor="middle" font-size="10" fill="var(--dim)">部件 =</text><text x="298" y="108" text-anchor="middle" font-size="10" fill="var(--dim)">唯一事实来源</text>
+    <line x1="298" y1="136" x2="298" y2="164" stroke="var(--dim)" stroke-width="1.4"/><text x="310" y="154" font-size="10" fill="var(--dim)">未变化跳过</text>
+    <rect x="244" y="164" width="108" height="44" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="298" y="181" text-anchor="middle" font-size="10" fill="currentColor">增长走 60ms 合帧</text><text x="298" y="196" text-anchor="middle" font-size="10" fill="var(--dim)">滚动对齐 nearBottom</text>
+    <text x="8" y="176" font-size="10" fill="var(--dim)">② → ①：settleLiveText 追平交接；</text>
+    <text x="8" y="190" font-size="10" fill="var(--dim)">hasReal 数据层守卫防直播块重建；</text>
+    <text x="8" y="204" font-size="10" fill="var(--dim)">ownPart 识别杜绝用户输入重复</text>
+  </svg>
+  <div class="card"><h3>防抖两道纪律</h3><p>renderTextPart 内容未变（pe.raw 比对）直接跳过整段重建；操作行只在持有者变化且为最新消息时迁移——轮询高频入口零 DOM 压力。</p></div>
+</section>
+
+<!-- P6 状态机 -->
+<section class="pg">
+  <div class="top"><span class="kicker">运行态状态机</span><span class="n">06 / 09</span></div>
+  <div><h2>任何运行态都必须能退出</h2><p class="sub">收敛全部以共享存储为事实源（F1）</p></div>
+  <div class="rule"></div>
+  <div class="statband">
+    <div class="stat"><b>4</b><span>置位路径</span></div>
+    <div class="stat"><b>4</b><span>收敛路径</span></div>
+    <div class="stat"><b>45s</b><span>兜底上限</span></div>
+  </div>
+  <svg class="f" viewBox="0 0 360 272">
+    <rect x="8" y="4" width="82" height="28" rx="8" fill="var(--card)" stroke="var(--line)"/><text x="49" y="22" text-anchor="middle" font-size="10" fill="currentColor">turn.started</text>
+    <rect x="98" y="4" width="82" height="28" rx="8" fill="var(--card)" stroke="var(--line)"/><text x="139" y="22" text-anchor="middle" font-size="10" fill="currentColor">活动事件推断</text>
+    <rect x="188" y="4" width="82" height="28" rx="8" fill="var(--card)" stroke="var(--line)"/><text x="229" y="22" text-anchor="middle" font-size="10" fill="currentColor">openSession 恢复</text>
+    <rect x="278" y="4" width="74" height="28" rx="8" fill="var(--card)" stroke="var(--line)"/><text x="315" y="22" text-anchor="middle" font-size="10" fill="currentColor">doSend</text>
+    <line x1="49" y1="32" x2="49" y2="52" stroke="var(--dim)" stroke-width="1.2"/><line x1="139" y1="32" x2="139" y2="52" stroke="var(--dim)" stroke-width="1.2"/><line x1="229" y1="32" x2="229" y2="52" stroke="var(--dim)" stroke-width="1.2"/><line x1="315" y1="32" x2="315" y2="52" stroke="var(--dim)" stroke-width="1.2"/>
+    <rect x="40" y="58" width="280" height="40" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="2"/><text x="180" y="76" text-anchor="middle" font-size="12" fill="currentColor">busy 运行中</text><text x="180" y="91" text-anchor="middle" font-size="10" fill="var(--dim)">busySource = sse | inferred</text>
+    <line x1="180" y1="98" x2="180" y2="118" stroke="var(--dim)" stroke-width="1.4"/><text x="192" y="113" font-size="10" fill="var(--dim)">收敛（存储事实源）</text>
+    <rect x="14" y="124" width="160" height="32" rx="9" fill="var(--card)" stroke="var(--line)"/><text x="94" y="145" text-anchor="middle" font-size="10.5" fill="currentColor">SSE turn.completed / failed</text>
+    <rect x="186" y="124" width="160" height="32" rx="9" fill="var(--card)" stroke="var(--line)"/><text x="266" y="145" text-anchor="middle" font-size="10.5" fill="currentColor">step-finish 稳定 6 秒</text>
+    <rect x="14" y="166" width="160" height="32" rx="9" fill="var(--card)" stroke="var(--line)"/><text x="94" y="187" text-anchor="middle" font-size="10.5" fill="currentColor">finished + 静默 30 秒</text>
+    <rect x="186" y="166" width="160" height="32" rx="9" fill="var(--card)" stroke="var(--line)"/><text x="266" y="187" text-anchor="middle" font-size="10.5" fill="currentColor">无变化静默 45 秒（兜底）</text>
+    <line x1="180" y1="198" x2="180" y2="218" stroke="var(--dim)" stroke-width="1.4"/>
+    <rect x="40" y="222" width="280" height="34" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="2"/><text x="180" y="244" text-anchor="middle" font-size="11.5" fill="currentColor">空闲——不永久转圈</text>
+  </svg>
+  <p class="sub">串台四道防线：openSeq 代际守卫 · 事件会话守卫 · 排队绑定会话 · boot 优先级 busy&gt;lastSession&gt;最近。</p>
+</section>
+
+<!-- P7 桥接契约 -->
+<section class="pg">
+  <div class="top"><span class="kicker">桥接契约</span><span class="n">07 / 09</span></div>
+  <div><h2>DOM 约定 = App 功能的接口</h2><p class="sub">改页面逐条核对，违反即静默失效</p></div>
+  <div class="rule"></div>
+  <div class="card"><h3>运行哨兵词</h3><p><code>[role=status][aria-live=polite]</code> 含 <b>Deep diving</b>，仅 busy 期间存在；taskBridgeJs 据此驱动熄屏通知。</p></div>
+  <div class="card"><h3>成果 chip</h3><p><code>.fileMention</code> + <code>title=完整路径</code>；artifactBridgeJs 在 document 冒泡阶段接管，按 typeOfPath 分流查看器（viewable 后缀）/下载页（resource 后缀）；页面侧禁止 stopPropagation。</p></div>
+  <div class="card"><h3>审批与输入</h3><p>权限卡片按钮短文案 <b>批准 / 拒绝</b>；原生 <code>textarea#composer</code> + <code>data-composer-card</code> 放行注入区。</p></div>
+  <div class="card"><h3>两代 App 桥并存</h3><p>v2 通知（onTaskState: running/settled/approval）与 DOM 哨兵双通道，通知 id 相同自然去重；boot 优先级 <b>busy &gt; lastSession &gt; 最近</b>。</p></div>
+  <div class="foot">markdown 渲染子集：代码块（language-xxx 供 App 查看器）/ 标题 / 列表（含任务勾选）/ 表格 / 引用 / 删除线 / 裸链接自动成链</div>
+</section>
+
+<!-- P8 问题档案 -->
+<section class="pg">
+  <div class="top"><span class="kicker">问题档案 · 21 条全记录</span><span class="n">08 / 09</span></div>
+  <div><h2>踩坑精华：根因与修复</h2><p class="sub">现象 → 根因 → 修复，每条都实测验证过</p></div>
+  <div class="rule"></div>
+  <div class="card"><h3>#8 会话历史串台</h3><p>openSession 竞态 + 排队错投 + 旧流泄漏 + boot 漂移 → 代际守卫/绑定/守卫/优先级四道防线。</p></div>
+  <div class="card"><h3>#9 永久转圈</h3><p>SSE 断流丢 turn.completed → 存储事实源自愈：finished + 静默 30s 强制复位并补绘。</p></div>
+  <div class="card"><h3>#14 桌面列表幽灵行</h3><p>标题只写落库层 + 首回合完成才落库 → 未落库不 INSERT，行龄 &gt;30min 清理。</p></div>
+  <div class="card"><h3>#15/#19 正文与输入重复</h3><p>token 直播与部件落库双路同画 → 部件通道唯一事实来源 + ownPart 识别用户输入。</p></div>
+  <div class="card"><h3>#20 页面抖动</h3><p>轮询无条件整段重建 + 操作行误迁移 → pe.raw 未变跳过、非最新消息不迁移、增长走合帧。</p></div>
+  <div class="foot">#21 chip 失效（stopPropagation 拦死冒泡桥）→ 已修；验证方法库：SSE 捕获 / 竞态测试 / 存储手术三备份</div>
+</section>
+
+<!-- P9 边界与仓库 -->
+<section class="pg">
+  <div class="top"><span class="kicker">边界 · 风险 · 仓库</span><span class="n">09 / 09</span></div>
+  <div><h2>已知边界（架构级）</h2><p class="sub">诚实标注，不藏着</p></div>
+  <div class="rule"></div>
+  <ul class="clean">
+    <li>桌面驱动回合：无 SSE 事件、updatedAt 不变——秒级轮询跟随，无 token 流</li>
+    <li>model.streaming 不进环：断流重连后断点前文本由落库补齐</li>
+    <li>sqlite 直写（清库）绕过引擎：需备份三件套 + 白名单 + 孤儿清理</li>
+    <li>双代 App 桥并存：全量升级 v2 后可撤 DOM 哨兵兼容</li>
+  </ul>
+  <div class="repo"><div class="av" style="background:linear-gradient(135deg,#0b62d6,#3fb950)">Z</div><div><b>zcode-phone-server</b> · v0.0.1<br><a href="https://github.com/liangjianzeng/zcode-phone-server">github.com/liangjianzeng/zcode-phone-server</a></div></div>
+  <div class="repo"><div class="av" style="background:linear-gradient(135deg,#6a4df0,#0b62d6)">D</div><div><b>DSH-Phone</b> · 手机 App<br><a href="https://github.com/liangjianzeng/DSH-Phone">github.com/liangjianzeng/DSH-Phone</a></div></div>
+  <div class="foot">完整设计：/MODULE-DESIGN.html · 使用手册：/README.html · 产品简版：/slides.html · 协议依据：zai-org/ZCode 开源仓库</div>
+</section>
+
+</main>
+<nav class="dots" id="dots"></nav>
+<script>
+const deck = document.getElementById('deck');
+const pages = document.querySelectorAll('.pg');
+const dots = document.getElementById('dots');
+pages.forEach((_, i) => { const b = document.createElement('b'); b.onclick = () => pages[i].scrollIntoView({behavior:'smooth'}); dots.appendChild(b); });
+function sync() {
+  const i = Math.min(pages.length - 1, Math.round(deck.scrollTop / deck.clientHeight));
+  dots.querySelectorAll('b').forEach((b, j) => b.classList.toggle('on', j === i));
+}
+deck.addEventListener('scroll', sync, {passive:true}); sync();
+</script>
+</body>
+</html>
