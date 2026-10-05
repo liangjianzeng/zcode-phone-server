@@ -505,7 +505,33 @@ agent.onReset = () => {
   }
 };
 
-function pushSse(sessionId, obj) {
+// ── 流式 delta 合帧（服务端节流）──
+// 引擎一个长回复会推几千个 model.streaming / part.delta chunk，SSE 一帧帧
+// 透传在手机蜂窝网络下既费流量又把页面渲染打碎。按会话把相邻同键 delta
+// 合并成一帧（60ms 或非 delta 事件到达时冲刷）。严格 FIFO：只允许与
+// "队尾待发 delta"同键合并，其余事件先冲刷再入队——顺序绝不重排；
+// 合并帧携带首个 chunk 的 seq，重连重放语义不变。
+const SSE_DELTA_FLUSH_MS = 60;
+function sseDeltaKey(obj) {
+  if (obj?.type === 'model.streaming') {
+    const p = obj.payload ?? {};
+    return `ms:${p.assistantMessageId ?? ''}:${p.kind ?? ''}`;
+  }
+  if (obj?.type === 'part.delta') {
+    const p = obj.payload ?? {};
+    return `pd:${p.messageId ?? ''}:${p.partId ?? ''}:${p.field ?? ''}`;
+  }
+  return null;
+}
+function flushSseDelta(sessionId) {
+  const s = sessionState(sessionId);
+  if (s.deltaTimer) { clearTimeout(s.deltaTimer); s.deltaTimer = null; }
+  if (!s.deltaPending) return;
+  const { frame } = s.deltaPending;
+  s.deltaPending = null;
+  writeSseFrame(sessionId, frame);
+}
+function writeSseFrame(sessionId, obj) {
   const s = sessionState(sessionId);
   const isEvent = !obj.__ui;
   const streamOnly = isEvent && isStreamOnlyEvent(obj);
@@ -520,6 +546,32 @@ function pushSse(sessionId, obj) {
       res.write(`event: ${obj.__ui ? 'ui' : 'zcode'}\ndata: ${data}\n\n`);
     } catch { /* 断开的连接由 close 事件清理 */ }
   }
+}
+function pushSse(sessionId, obj) {
+  const key = sseDeltaKey(obj);
+  const s = sessionState(sessionId);
+  if (key) {
+    if (s.deltaPending && s.deltaPending.key === key) {
+      // 同键相邻 delta：只拼 delta 字符串。后续 chunk 的 done 等标志被
+      // 丢弃——页面本就把空 delta 当 no-op，最终状态以落库部件为准
+      const d = obj.payload?.delta;
+      if (typeof d === 'string' && d) s.deltaPending.frame.payload.delta += d;
+      return;
+    }
+    flushSseDelta(sessionId);
+    s.deltaPending = { key, frame: obj };
+    if (!s.deltaTimer) s.deltaTimer = setTimeout(() => {
+      s.deltaTimer = null;
+      if (!s.deltaPending) return;
+      const { frame } = s.deltaPending;
+      s.deltaPending = null;
+      writeSseFrame(sessionId, frame);
+    }, SSE_DELTA_FLUSH_MS);
+    return;
+  }
+  // 非 delta 事件：先冲掉待发 delta（保持引擎事件顺序），再原样推
+  flushSseDelta(sessionId);
+  writeSseFrame(sessionId, obj);
 }
 
 function parseModelSelection(value) {
@@ -587,6 +639,20 @@ function dbSessionArchived(sid) {
     if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
     const row = agentDbHandle.prepare('SELECT time_archived FROM session WHERE id = ?').get(sid);
     return row ? row.time_archived != null : null;
+  } catch { return null; }
+}
+
+/**
+ * 共享库里的会话行（title/存在性）。引擎 session/list 对本进程内创建的会话
+ * 返回的 title 恒为空串（标题只在落库层写 first_input，内存快照不回填，
+ * 2026-10-04 实测），同步桌面任务索引必须用库里标题补齐；
+ * 返回 null = 会话从未落库（首回合未完成就被重启丢掉，或已被直删）。
+ */
+function dbSessionMeta(sid) {
+  try {
+    if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
+    const row = agentDbHandle.prepare('SELECT title, time_archived FROM session WHERE id = ?').get(sid);
+    return row ? { title: String(row.title ?? ''), archived: row.time_archived != null } : null;
   } catch { return null; }
 }
 
@@ -737,6 +803,13 @@ function workspaceRef(overridePath) {
 // 自己创建/打开过的会话才有记录——手机建的会话因此"桌面不可见"。
 // 桥把手机会话 upsert 进该表（会话正文本就落在共享 db.sqlite，桌面点开
 // 即可正常加载），实现 双向可见：桌面→手机本来就走共享存储，无需处理。
+//
+// 两条硬边界（2026-10-04，问题档案 #14）：
+// 1. 标题以共享库为准——引擎 session/list 对本进程内新建会话的 title 恒空
+//    （落库层写 first_input，内存快照不回填），不同步库里标题桌面永远显示"新任务"。
+// 2. 只同步已落库会话（dbSessionMeta 非空才允许 INSERT）——引擎把会话存在内存、
+//    首回合完成才落库；未落库就重启=会话彻底丢失，若已插索引行桌面点开必报
+//    "Session is not active and not persisted"（幽灵行）。
 const TASKS_DB_PATH = path.join(os.homedir(), '.zcode', 'v2', 'tasks-index.sqlite');
 let tasksDbHandle = null;
 
@@ -772,21 +845,28 @@ async function syncTaskIndexRows(list) {
       if (!ws) continue;
       const createdAt = Number(s.createdAt ?? s.updatedAt ?? Date.now());
       const updatedAt = Number(s.updatedAt ?? Date.now());
+      const meta0 = dbSessionMeta(s.sessionId);
       const old = existing.get(s.sessionId);
       if (!old) {
+        // 未落库的会话不进索引：桌面点开必报错（见头部硬边界 2）
+        if (!meta0) continue;
+        const title = String(s.title ?? '').trim() || meta0.title;
         const meta = {
-          taskId: s.sessionId, traceId: crypto.randomUUID(), title: String(s.title ?? ''),
+          taskId: s.sessionId, traceId: crypto.randomUUID(), title,
           workspacePath: ws, createdAt, updatedAt, mode: String(s.mode ?? ''),
           provider: 'glm', status, target: null, titleOverridden: false,
         };
-        ins.run(ws, ws, s.sessionId, String(s.title ?? ''), status, String(s.mode ?? ''),
-          createdAt, updatedAt, JSON.stringify(meta), String(s.title ?? ''));
+        ins.run(ws, ws, s.sessionId, title, status, String(s.mode ?? ''),
+          createdAt, updatedAt, JSON.stringify(meta), title);
         changed++;
         continue;
       }
       if (Number(old.deleted) || Number(old.archived)) continue; // 桌面已删/归档：尊重
       const titleOverridden = Number(old.title_overridden);
-      const newTitle = titleOverridden ? old.title : String(s.title ?? old.title ?? '');
+      // 引擎标题为空时用共享库标题补齐（内存快照不回填 first_input 标题）
+      const engineTitle = String(s.title ?? '').trim();
+      const dbTitle = meta0 ? meta0.title : '';
+      const newTitle = titleOverridden ? old.title : (engineTitle || dbTitle || old.title || '');
       if (old.title === newTitle && Number(old.updated_at) === updatedAt && old.task_status === status) continue;
       let meta = {};
       try { meta = JSON.parse(old.meta_json ?? '{}'); } catch { /* 空对象兜底 */ }
@@ -809,18 +889,53 @@ async function syncTaskIndexRows(list) {
   return changed;
 }
 
+// ── 幽灵行清理：索引行指向的会话既不在引擎列表也不在共享库 = 桌面点开必报
+// "Session is not active and not persisted"（首回合未完成引擎重启丢失，或手机端
+// 直删后索引残留）。仅清理手机侧自己工作区的行、行龄超 30 分钟（给桌面侧
+// 尚未落库的活动草稿留缓冲），绝不碰 deleted/archived 标记之外的其他项目行。
+const GHOST_GRACE_MS = 30 * 60 * 1000;
+function cleanupGhostIndexRows(engineIds) {
+  const own = new Set(
+    [config.workspacePath, ...(config.workspaces ?? []).map((w) => w.path)]
+      .map((p) => path.resolve(String(p))),
+  );
+  if (!own.size) return 0;
+  let removed = 0;
+  try {
+    const db = tasksDb();
+    const del = db.prepare('DELETE FROM tasks WHERE task_id = ?');
+    for (const r of db.prepare('SELECT task_id, workspace_path, updated_at FROM tasks').all()) {
+      const ws = path.resolve(String(r.workspace_path ?? ''));
+      if (!own.has(ws)) continue;
+      if (engineIds.has(r.task_id)) continue;
+      if (dbSessionMeta(r.task_id)) continue; // 已落库：桌面可正常打开，保留
+      if (Date.now() - Number(r.updated_at ?? 0) < GHOST_GRACE_MS) continue;
+      del.run(r.task_id);
+      removed++;
+    }
+    if (removed) logLine('task-sync', `清理桌面索引幽灵行 ${removed} 条（会话已不存在，点开必报错）`);
+  } catch (e) {
+    logLine('task-sync', `清理桌面索引幽灵行失败：${String(e?.message ?? e).slice(0, 200)}`);
+  }
+  return removed;
+}
+
 // 桌面标题自动生成有延迟、页面也未必开着：每 60s 全量对账一次
 setInterval(() => {
   agent.request('session/list', { limit: 200, includeArchived: false })
-    .then((r) => syncTaskIndexRows((r.sessions ?? []).map((s) => ({
-      sessionId: s.sessionId,
-      title: String(s.title ?? '').includes('\uFFFD') ? '' : s.title,
-      status: s.status,
-      mode: s.mode,
-      createdAt: s.createdAt,
-      updatedAt: s.updatedAt,
-      workspacePath: s.workspace?.workspacePath ?? s.workspace?.workspaceKey ?? s.workspacePath ?? '',
-    }))))
+    .then((r) => {
+      const sessions = (r.sessions ?? []);
+      syncTaskIndexRows(sessions.map((s) => ({
+        sessionId: s.sessionId,
+        title: String(s.title ?? '').includes('\uFFFD') ? '' : s.title,
+        status: s.status,
+        mode: s.mode,
+        createdAt: s.createdAt,
+        updatedAt: s.updatedAt,
+        workspacePath: s.workspace?.workspacePath ?? s.workspace?.workspaceKey ?? s.workspacePath ?? '',
+      })));
+      cleanupGhostIndexRows(new Set(sessions.map((s) => s.sessionId)));
+    })
     .catch(() => { /* 引擎未就绪：下个周期再试 */ });
 }, 60000).unref();
 
@@ -1223,22 +1338,13 @@ async function sessionLooksFinished(sid) {
       // 运行态恢复：页面刷新/重开后能立即回到"运行中"并接续计时
       busy: sessionState(sid).busy,
       busySince: sessionState(sid).busySince || undefined,
-      // 会话设置（模型列表/思考档位/权限模式/slash 命令/上下文投影）：
+      // 会话设置（模型列表/思考档位/权限模式/上下文投影）：
       // 供官方样式的模型选择、思考档位、权限模式菜单与上下文容量卡使用
       settings: projectSettings(snap, sid),
     });
-    // 新会话尽快在桌面任务列表可见（标题生成后的更新由 60s 周期对账覆盖）
-    setTimeout(() => {
-      syncTaskIndexRows([{
-        sessionId: sid,
-        title: snap?.session?.title ?? '',
-        status: snap?.session?.status ?? 'idle',
-        mode: config.mode,
-        createdAt: snap?.session?.createdAt ?? Date.now(),
-        updatedAt: snap?.session?.updatedAt ?? Date.now(),
-        workspacePath: wsRef.workspacePath,
-      }]).catch(() => {});
-    }, 2000).unref();
+    // 注意：这里不再插桌面索引占位行——新会话在首回合完成落库前，引擎重启即
+    // 彻底丢失，占位行会变成桌面点开必报错的"新任务"幽灵行（问题档案 #14）。
+    // 可见性由 60s 对账覆盖：首回合完成后下一周期带真实标题入索引。
   }
 
   if (seg[0] === 'api' && seg[1] === 'sessions' && seg[2]) {
@@ -1420,6 +1526,9 @@ async function sessionLooksFinished(sid) {
       } catch (e) {
         return sendJson(res, 500, { error: String(e?.message ?? e).slice(0, 200) });
       }
+      // 桌面任务索引同行删除：手机删了桌面列表还挂着会变成点开必报错的幽灵行
+      // （30 分钟宽限期清理兜底，这里立即删是主路径）
+      try { tasksDb().prepare('DELETE FROM tasks WHERE task_id = ?').run(sid); } catch { /* 索引忙时由周期清理兜底 */ }
       allListCache = null;
       return sendJson(res, 200, { deleted: true, sessionId: sid });
     }

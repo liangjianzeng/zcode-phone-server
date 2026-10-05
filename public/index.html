@@ -3,15 +3,46 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="theme-color" id="metaTheme" content="#0b0b0e">
+<script>
+// 主题预应用：脚本主体在 body 末尾才执行，这里先把解析好的主题落到根
+// 元素，避免浅色用户每次加载都闪一下深色（偏好存 localStorage，见下方
+// "外观主题"模块；auto = 跟随系统 prefers-color-scheme）
+(function () {
+  try {
+    var t = localStorage.getItem('dshTheme') || 'auto';
+    var sys = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    document.documentElement.dataset.theme = (t === 'auto') ? sys : t;
+  } catch (e) { document.documentElement.dataset.theme = 'dark'; }
+})();
+</script>
 <title>ZCode · 任务会话</title>
 <style>
-  /* ── ZCode 官方风格设计令牌：近黑底 / 紫点缀 / 扁平行 ── */
+  /* ── ZCode 官方风格设计令牌：近黑底 / 紫点缀 / 扁平行 ──
+     深色为默认（无 data-theme 时）；浅色由 html[data-theme=light] 覆盖。
+     data-theme 由 JS 解析 localStorage（auto/light/dark，auto=跟随系统
+     matchMedia）后落到根元素，head 里的预应用脚本保证首帧不闪错主题。 */
   :root {
     --bg: #0b0b0e; --panel: #111114; --card: #191920; --line: #26262e;
     --fg: #e9e9ee; --dim: #85858f; --faint: #5c5c66;
     --accent: #7c5cff; --ok: #3fb950; --warn: #d29922; --err: #f85149;
     --bubble-user: #1f1f28;
+    --code-bg: #08080b; --code-inline: #1c1c24;
+    --chip-fg: #b7a5ff; --link: #7cb7ff;
+    --btn-muted: #2c2c36; --btn-muted-2: #3a3a46;
+    --shadow: 0 10px 34px rgba(0,0,0,.55);
     color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f5f7; --panel: #ffffff; --card: #ffffff; --line: #e2e2e9;
+    --fg: #1c1c22; --dim: #66666f; --faint: #9a9aa3;
+    --accent: #6a4df0; --ok: #1a7f37; --warn: #9a6700; --err: #cf222e;
+    --bubble-user: #ececf2;
+    --code-bg: #f0f0f4; --code-inline: #e8e8ee;
+    --chip-fg: #5b3df0; --link: #0b62d6;
+    --btn-muted: #e7e7ee; --btn-muted-2: #d9d9e2;
+    --shadow: 0 10px 34px rgba(0,0,0,.18);
+    color-scheme: light;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { height: 100%; }
@@ -101,12 +132,12 @@
   }
   .msg.assistant .bubble { word-break: break-word; overflow-wrap: anywhere; }
   .bubble pre {
-    background: #08080b; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px;
     padding: 9px 11px; overflow-x: auto; font-size: 12.5px; margin: 8px 0;
     font-family: ui-monospace, Consolas, "Cascadia Mono", monospace; line-height: 1.5;
   }
   .bubble code.inline {
-    background: #1c1c24; padding: 1px 6px; border-radius: 6px; font-size: 13px;
+    background: var(--code-inline); padding: 1px 6px; border-radius: 6px; font-size: 13px;
     font-family: ui-monospace, Consolas, monospace;
   }
   /* markdown 渲染（assistant 气泡内）：对齐与间距 */
@@ -124,9 +155,18 @@
   .bubble .md-quote { margin: 6px 0; padding: 3px 12px; border-left: 3px solid var(--line); color: var(--dim); }
   .bubble .md-quote .md-p { margin: 3px 0; }
   .bubble .md-hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
-  .bubble .mdlink { color: #7cb7ff; text-decoration: none; word-break: break-all; }
+  .bubble .mdlink { color: var(--link); text-decoration: none; word-break: break-all; }
   .bubble strong { font-weight: 650; color: var(--fg); }
   .bubble em { font-style: italic; }
+
+  /* 消息操作行（复制/分享）：助手气泡尾部 + 工具输出体内，弱化样式不抢内容 */
+  .msgacts { display: flex; gap: 6px; margin: 4px 0 6px; }
+  .msgacts button {
+    display: inline-flex; align-items: center; gap: 4px;
+    background: transparent; border: 1px solid var(--line); color: var(--dim);
+    border-radius: 999px; padding: 3px 10px; font-size: 11.5px; cursor: pointer;
+  }
+  .msgacts button:active { background: var(--card); color: var(--fg); }
 
   /* ── 工具行（官方扁平样式：图标 + 名称/状态 + 命令摘要，点击展开输出）── */
   .tool { margin: 2px 0; border-radius: 9px; }
@@ -145,16 +185,17 @@
   }
   .tool.running .tstate, .tool.running .tico { color: var(--fg); }
   .tool.running .tdesc { color: var(--fg); }
-  /* 完成后隐藏命令摘要：一条回合几十个工具行、每行摊一条长命令，
-     对话流里就是"括号命令行夹杂"的观感。执行中/出错仍显示（观察进度与排错）；
-     点开完成的卡片，详情体首行有当时的命令摘要（见 setToolStatus）。 */
-  .tool.completed .tdesc { display: none; }
+  /* 完成后的工具行保留命令/目标摘要（对齐官方桌面：图标+名称+摘要+✓）。
+     之前"完成后隐藏摘要"让一回合只剩"终端✓/思考"占位，手机上完全看不出
+     智能体在做什么；摘要超长走省略号（.tdesc 基础样式），完整输入仍在
+     展开卡片里，完成态整行压暗弱化视觉噪音。 */
+  .tool.completed .tdesc { color: var(--faint); }
   .tool.completed .tname { color: var(--faint); }
   .tool.error .tdesc, .tool.error .tname { color: var(--err); }
   .tool .tstate { flex: none; color: var(--faint); display: flex; align-items: center; }
   .tool .tbody { padding: 2px 10px 8px 30px; color: var(--dim); font-size: 12.5px; }
   .tool .tbody pre {
-    max-height: 220px; overflow: auto; margin: 4px 0; background: #08080b;
+    max-height: 220px; overflow: auto; margin: 4px 0; background: var(--code-bg);
     border: 1px solid var(--line); border-radius: 8px; padding: 8px;
     font-family: ui-monospace, Consolas, monospace; font-size: 12px;
   }
@@ -170,17 +211,30 @@
     padding: 2px 10px 8px 30px; color: var(--faint); font-size: 13px;
     white-space: pre-wrap; word-break: break-word;
   }
+  /* 折叠态首行预览：折叠时能看出这段思考大概在想什么，展开后隐藏不重复 */
+  details.think .tprev {
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 12.5px; color: var(--faint);
+  }
+  details.think[open] .tprev { display: none; }
 
   /* 流末尾运行指示（官方：✳ 转圈） */
   .streamspin { padding: 8px 6px; color: var(--dim); display: flex; align-items: center; }
 
   .fileMention {
     display: inline-block; margin: 3px 6px 1px 0; padding: 3px 11px; border-radius: 999px;
-    border: 1px solid rgba(124,92,255,.45); color: #b7a5ff; background: rgba(124,92,255,.10);
+    border: 1px solid rgba(124,92,255,.45); color: var(--chip-fg); background: rgba(124,92,255,.10);
     font-size: 12.5px; cursor: pointer;
   }
   .errline { color: var(--err); font-size: 13.5px; margin: 8px 0; }
   .sysline { color: var(--faint); font-size: 12.5px; text-align: center; margin: 8px 0; }
+  /* 回合结束分隔线：转圈消失太不显眼，手机上需要明确的"干完了"视觉终点 */
+  .turnend {
+    display: flex; align-items: center; gap: 10px;
+    color: var(--faint); font-size: 12px; margin: 12px 0 2px;
+    user-select: none;
+  }
+  .turnend::before, .turnend::after { content: ''; flex: 1; border-top: 1px dashed var(--line); }
 
   /* ── 运行状态条：视觉隐藏（官方无此条），但 DOM 保留——旧版 App 桥的
      哨兵词 span 仍随任务运行在此增删，运行态判定不受影响 ── */
@@ -268,9 +322,9 @@
     display: inline-flex; align-items: center; justify-content: center;
     transition: background .15s ease;
   }
-  #btnSend:disabled { background: #2c2c36; color: var(--faint); }
-  #btnSend.stop { background: #2e2e38; color: var(--fg); }
-  #btnSend.stop:active { background: #3a3a46; }
+  #btnSend:disabled { background: var(--btn-muted); color: var(--faint); }
+  #btnSend.stop { background: var(--btn-muted); color: var(--fg); }
+  #btnSend.stop:active { background: var(--btn-muted-2); }
 
   button {
     background: var(--card); color: var(--fg); border: 1px solid var(--line);
@@ -360,8 +414,8 @@
   .pop {
     position: fixed; z-index: 40; display: none; min-width: 216px; max-width: min(88vw, 340px);
     max-height: 62vh; overflow-y: auto;
-    background: #1c1c22; border: 1px solid var(--line); border-radius: 16px;
-    padding: 6px; box-shadow: 0 10px 34px rgba(0,0,0,.55);
+    background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+    padding: 6px; box-shadow: var(--shadow);
   }
   .pop.open { display: block; }
   .pop .phead { padding: 8px 10px 4px; font-size: 12px; color: var(--faint); font-weight: 600; letter-spacing: .03em; }
@@ -399,7 +453,7 @@
   .ask button { margin: 3px 7px 3px 0; padding: 6px 14px; border-radius: 999px; font-size: 12.5px; }
   .toast {
     position: fixed; left: 50%; transform: translateX(-50%); bottom: 96px;
-    background: #23232c; border: 1px solid var(--line); color: var(--fg);
+    background: var(--card); border: 1px solid var(--line); color: var(--fg);
     padding: 8px 16px; border-radius: 999px; z-index: 50; font-size: 13px; display: none;
     max-width: 86vw; text-align: center;
   }
@@ -418,6 +472,7 @@
 <div id="modeMenu" class="pop"></div>
 <div id="modelMenu" class="pop"></div>
 <div id="thinkMenu" class="pop"></div>
+<div id="themeMenu" class="pop"></div>
 <input type="file" id="fileInput" style="display:none">
 
 <!-- 运行状态条：任务运行期间可见；哨兵词 span 仅在运行时存在（旧版 App 桥据此判定运行态） -->
@@ -442,6 +497,9 @@
     </button>
     <button id="miPlan" class="railbtn" title="计划 / 上下文" aria-label="计划 / 上下文">
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1.1" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.1" fill="currentColor" stroke="none"/></svg>
+    </button>
+    <button id="miTheme" class="railbtn" title="外观（跟随系统/浅色/深色）" aria-label="外观设置">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.1"/><path d="M12 3v2.2M12 18.8V21M3 12h2.2M18.8 12H21M5.6 5.6l1.6 1.6M16.8 16.8l1.6 1.6M18.4 5.6l-1.6 1.6M7.2 16.8l-1.6 1.6"/></svg>
     </button>
     <!-- 后续新功能按钮加在 railFuture 之上（跟随上方按钮顺排）；也可锚定到底部 -->
     <div id="railFuture"></div>
@@ -522,7 +580,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.21';
+const PAGE_BUILD = '2026-10-04.22';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -604,7 +662,14 @@ async function api(p, opts = {}) {
   return data;
 }
 
-function scrollBottom() { requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; }); }
+// 自动滚底：用户上滚阅读历史（离底部 >140px）时不再强行拽回——
+// 之前任何事件都无条件拽底，任务结束后往上拉就被弹回来（无法回看）。
+// force=true 用于用户主动发送、打开会话这类"应当回到底部"的场景。
+function nearBottom() { return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 140; }
+function scrollBottom(force = false) {
+  if (!force && !nearBottom()) return;
+  requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
+}
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -728,6 +793,8 @@ const SVG = {
   plug: '<svg class="ic sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M9 4.5A1.5 1.5 0 0 1 10.5 3h3A1.5 1.5 0 0 1 15 4.5V6h3.5A1.5 1.5 0 0 1 20 7.5V11h-1.5a1.5 1.5 0 0 0 0 3H20v3.5a1.5 1.5 0 0 1-1.5 1.5H15v-1.5a1.5 1.5 0 0 0-3 0V20H8.5A1.5 1.5 0 0 1 7 18.5V15H5.5a1.5 1.5 0 0 1 0-3H7V7.5A1.5 1.5 0 0 1 8.5 6H9V4.5z"/></svg>',
   model: '<svg class="ic sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M12 3l2.2 5.4L20 10l-5.8 1.6L12 17l-2.2-5.4L4 10l5.8-1.6L12 3z"/></svg>',
   compress: '<svg class="ic sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V5.5A1.5 1.5 0 0 1 5.5 4H9M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9M20 15v3.5a1.5 1.5 0 0 1-1.5 1.5H15M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15"/><path d="M9.5 12h5"/></svg>',
+  copy: '<svg class="ic sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5.5 15V5.5A2 2 0 0 1 7.5 3.5H17"/></svg>',
+  share: '<svg class="ic sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="6" cy="12" r="2.1"/><circle cx="17.5" cy="5.5" r="2.1"/><circle cx="17.5" cy="18.5" r="2.1"/><path d="M7.9 11l7.7-4.4M7.9 13l7.7 4.4"/></svg>',
 };
 function toolIcon(name) {
   const k = String(name ?? '').toLowerCase();
@@ -751,7 +818,10 @@ function toolLabel(name) {
 }
 function inputSummary(input) {
   if (!input || typeof input !== 'object') return '';
-  const v = input.command ?? input.file_path ?? input.filePath ?? input.path ?? input.url ?? input.query ?? input.pattern ?? input.prompt ?? '';
+  // AskUserQuestion 的 questions[].question 也算摘要来源：否则提问行只剩
+  // 红色工具名，用户连"问了什么"都看不到
+  const q = Array.isArray(input.questions) ? input.questions[0]?.question : input.question;
+  const v = input.command ?? q ?? input.file_path ?? input.filePath ?? input.path ?? input.url ?? input.query ?? input.pattern ?? input.prompt ?? '';
   return String(v).replace(/\s+/g, ' ').slice(0, 120);
 }
 
@@ -1126,6 +1196,7 @@ function updateSendButton() {
   btnSend.innerHTML = mode === 'stop' ? stopSvg : sendSvg;
 }
 
+let lastTurnFailed = false; // turn.failed 置位：失败回合不画"本轮结束"线（红字 errline 就是终点）
 function setBusy(on) {
   busy = on;
   const status = $('turnStatus');
@@ -1158,6 +1229,18 @@ function setBusy(on) {
     markThinkDurations();
     // 回合收尾（含轮询推断的收尾）：所有思考都已完成，折叠展开中的思考行
     collapseOpenThinks();
+    // 回合结束分隔线：转圈消失太不显眼，用户分不清智能体是干完了还是卡了。
+    // ≥5 秒的回合在对话流末尾补一条结束线（带用时）；失败回合自带红字
+    // errline 不重复画。SSE 收尾与轮询推断收尾（桌面驱动回合）都走这里。
+    if (busySince) {
+      const durS = Math.max(1, Math.round((Date.now() - busySince) / 1000));
+      if (durS >= 5 && !lastTurnFailed) {
+        const dur = durS < 60 ? `${durS} 秒` : `${Math.floor(durS / 60)} 分 ${durS % 60} 秒`;
+        chat.appendChild(el('div', 'turnend', `✓ 本轮结束 · 用时 ${dur}`));
+        scrollBottom();
+      }
+    }
+    lastTurnFailed = false;
     busySince = 0;
     if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
     $('turnElapsed').textContent = '';
@@ -1203,6 +1286,59 @@ function fileChip(container, p) {
   container.appendChild(b);
 }
 
+// ── 复制 / 分享（助手正文 + 成功的工具输出）──
+
+// WebView 剪贴板：clipboard API 优先，execCommand 兜底（部分 WebView 权限收紧）
+async function copyTextToClipboard(t) {
+  try { await navigator.clipboard.writeText(t); toast('已复制到剪贴板'); return; } catch { /* 走兜底 */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = t; ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+    toast('已复制到剪贴板');
+  } catch { toast('复制失败'); }
+}
+
+// Web Share API 优先（Android WebView 可用性不定），失败回落复制
+async function shareOrCopy(t) {
+  try {
+    if (navigator.share) { await navigator.share({ text: t }); return; }
+  } catch (e) { if (e?.name === 'AbortError') return; /* 用户取消分享面板 */ }
+  await copyTextToClipboard(t);
+  toast('当前环境不支持直接分享，已复制到剪贴板');
+}
+
+function collectMsgText(m) {
+  return [...m.partEls.values()]
+    .filter((v) => v.kind === 'text')
+    .map((v) => String(v.raw ?? v.full ?? v.el.innerText ?? '').trim())
+    .filter(Boolean).join('\n\n');
+}
+
+// 助手消息尾部的操作行（复制/分享）：仅在出现正文部件后创建，用户气泡不加
+function ensureMsgActions(m) {
+  if (m.el.classList.contains('user') || m.el.querySelector(':scope > .msgacts')) return;
+  const mkBtn = (label, icon, fn) => {
+    const b = el('button'); b.innerHTML = icon + `<span>${label}</span>`;
+    b.addEventListener('click', (ev) => { ev.stopPropagation(); fn(); });
+    return b;
+  };
+  const row = el('div', 'msgacts');
+  row.append(
+    mkBtn('复制', SVG.copy, () => {
+      const t = collectMsgText(m);
+      if (!t.trim()) return toast('没有可复制的正文');
+      copyTextToClipboard(t);
+    }),
+    mkBtn('分享', SVG.share, () => {
+      const t = collectMsgText(m);
+      if (!t.trim()) return toast('没有可分享的正文');
+      shareOrCopy(t);
+    }),
+  );
+  m.el.appendChild(row);
+}
+
 function renderTextPart(m, partId, text) {
   let pe = m.partEls.get(partId);
   if (!pe) {
@@ -1212,8 +1348,13 @@ function renderTextPart(m, partId, text) {
     pe = { kind: 'text', el: div };
     m.partEls.set(partId, pe);
   }
+  // 权威渲染：先冲掉挂起的流式合帧任务（其 pending 可能比本次参数旧/新
+  // 半个 delta），以落库参数为准整段重画，最终状态不会被节流吞掉
+  flushStreamRich(pe);
+  pe.raw = String(text ?? ''); // 原始文本留存：复制/分享取这里而非 DOM（避免混入 chip 文案）
   pe.el.textContent = '';
   richText(pe.el, text);
+  if (!m.el.classList.contains('user')) ensureMsgActions(m);
   // 正文里的文件路径 → 可点击 chip
   // 路径字符集排除 CJK 与全角标点：否则"E:\xxx\yyy）中文说明…"会把整段中文
   // 吞进匹配，误渲染成文件 chip（Windows 路径含中文目录名时放弃识别，可接受）
@@ -1223,6 +1364,8 @@ function renderTextPart(m, partId, text) {
 }
 
 // 思考行（官方：🧠 思考 · 持续了几秒，可展开看过程）
+// 折叠态显示时长 + 首行内容预览（tprev，展开时隐藏）——否则一屏"思考"占位
+// 既不知道想了多久、也不知道想了什么
 function ensureThink(m, partId) {
   let pe = m.partEls.get(partId);
   if (pe) return pe;
@@ -1234,10 +1377,12 @@ function ensureThink(m, partId) {
   summary.appendChild(ic);
   summary.appendChild(el('span', '', '思考'));
   summary.appendChild(el('span', 'tdur'));
+  const prev = el('span', 'tprev');
+  summary.appendChild(prev);
   const body = el('div', 'tbody');
   details.append(summary, body);
   m.bubble.appendChild(details);
-  pe = { kind: 'think', el: details, content: body };
+  pe = { kind: 'think', el: details, content: body, preview: prev };
   m.partEls.set(partId, pe);
   if (!thinkTimers.has(partId)) thinkTimers.set(partId, Date.now());
   // 最新思考自动展开跟看输出（用户要求：思考进行中要保持打开）；
@@ -1248,6 +1393,14 @@ function ensureThink(m, partId) {
   return pe;
 }
 let openThinkDetails = null;
+
+// 思考首行预览同步：取第一行非空文本截断。内容写入点（渲染/增量/直播）
+// 各自调用，折叠态 summary 上能看到这段思考大概在想什么
+function updateThinkPreview(pe) {
+  if (!pe?.preview || !pe.content) return;
+  const t = String(pe.content.textContent ?? '');
+  pe.preview.textContent = (t.split('\n').find((l) => l.trim()) ?? '').trim().slice(0, 90);
+}
 
 // 折叠所有展开中的思考行：思考完成的时机 = 工具/正文部件到达 或 回合结束
 function collapseOpenThinks() {
@@ -1295,13 +1448,20 @@ function setToolStatus(toolCallId, status, desc, detail) {
     status === 'error' || status === 'failed' ? SVG.cross : '';
   if (detail !== undefined && detail !== null && detail !== '') {
     t.body.textContent = '';
-    // 终态卡片的命令摘要不再显示在行内（CSS 隐藏 .completed .tdesc），
-    // 补进详情体首行，展开时仍能看到"这条输出来自哪条命令/哪个文件"。
-    if ((status === 'completed' || status === 'error' || status === 'failed') && t.desc.textContent) {
-      const cmd = el('pre'); cmd.textContent = t.desc.textContent;
-      t.body.appendChild(cmd);
-    }
-    const pre = el('pre'); pre.textContent = String(detail).slice(0, 4000);
+    // 成功/出错的工具输出可复制/分享（展开后出现在输出正文上方）
+    const detailText = String(detail).slice(0, 4000);
+    const acts = el('div', 'msgacts');
+    const mk = (label, icon, fn) => {
+      const b = el('button'); b.innerHTML = icon + `<span>${label}</span>`;
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); fn(); });
+      return b;
+    };
+    acts.append(
+      mk('复制', SVG.copy, () => copyTextToClipboard(detailText)),
+      mk('分享', SVG.share, () => shareOrCopy(detailText)),
+    );
+    t.body.appendChild(acts);
+    const pre = el('pre'); pre.textContent = detailText;
     t.body.appendChild(pre);
   }
   if (status === 'running') setActivity(`正在执行 ${t.name.textContent}`);
@@ -1469,8 +1629,12 @@ function renderHistory(messages, opts = {}) {
       switch (part.type) {
         case 'text': renderTextPart(m, String(part.partId ?? mid + '-t'), part.text ?? ''); break;
         case 'reasoning': {
-          const pe = ensureThink(m, String(part.partId ?? mid + '-r'));
+          const pidR = String(part.partId ?? mid + '-r');
+          const existedR = m.partEls.has(pidR);
+          const pe = ensureThink(m, pidR);
           pe.content.textContent = part.text ?? '';
+          updateThinkPreview(pe);
+          if (!existedR) thinkTimers.delete(pidR); // 存储整段落库的思考无真实起始时刻，不冒充"持续了 X 秒"
           break;
         }
         case 'tool': {
@@ -1495,7 +1659,7 @@ function renderHistory(messages, opts = {}) {
   // 全量重绘后：空闲会话的历史思考都已完成 → 全部折叠；
   // 忙碌中（打开运行中的会话/断线重同步）则保留"最新思考展开"跟着输出
   if (!busy && !opts.keepThinkOpen) collapseOpenThinks();
-  scrollBottom();
+  scrollBottom(true); // 打开/重同步会话：回到最新消息（不受用户滚动守卫限制）
 }
 
 // ── 计划 / 用量 / 插件（引擎能力，端点容错降级）──
@@ -1828,10 +1992,27 @@ function handleZcodeEvent(ev) {
       m.parts.set(part.partId, part);
       // 思考完成 = 同一回合的下一个非思考部件到达：折叠所有展开中的思考
       if (isNewPart && part.type !== 'reasoning') collapseOpenThinks();
-      if (part.type === 'text') renderTextPart(m, String(part.partId), part.text ?? '');
+      if (part.type === 'text') {
+        // 直播正文去重（与思考行同款，见 settleLiveText）：落库副本追平
+        // 直播块前只记数据不渲染，否则同一段正文两块同步增长直到回合结束
+        if (!settleLiveText(m)) break;
+        renderTextPart(m, String(part.partId), part.text ?? '');
+      }
       else if (part.type === 'reasoning') {
+        // 直播思考还在增长、落库副本未追平：只记录数据不渲染副本，
+        // 否则同一思考出现两块（直播一块 + 落库一块），轮询清理前一直重复
+        const live = m.partEls.get('__live-think');
+        const liveLen = live ? (live.content?.textContent ?? '').length : 0;
+        const t = String(part.text ?? '');
+        if (live && t.length < liveLen) break;
+        if (live) {
+          live.el.remove();
+          m.partEls.delete('__live-think');
+          thinkTimers.delete('__live-think');
+        }
         const pe = ensureThink(m, String(part.partId));
-        if (part.text) pe.content.textContent = part.text;
+        if (t) pe.content.textContent = t;
+        updateThinkPreview(pe);
       }
       else if (part.type === 'tool') {
         const st = part.state ?? {};
@@ -1856,14 +2037,23 @@ function handleZcodeEvent(ev) {
       m.parts.set(partId, p);
       const pe = m.partEls.get(String(partId));
       if (pe?.kind === 'text') {
-        pe.el.textContent = '';
-        richText(pe.el, p.text ?? '');
+        streamRich(pe, p.text ?? '');
       } else if (pe?.kind === 'think') {
         pe.content.textContent = p.text ?? '';
+        updateThinkPreview(pe);
       } else if (!pe && p.type === 'text') {
+        if (!settleLiveText(m)) break;
         renderTextPart(m, String(partId), p.text ?? '');
       } else if (!pe && p.type === 'reasoning') {
-        ensureThink(m, String(partId)).content.textContent = p.text ?? '';
+        // 与思考行 upserted 分支同款去重：落库思考追平直播块才接管渲染
+        const live = m.partEls.get('__live-think');
+        const liveLen = live ? (live.content?.textContent ?? '').length : 0;
+        const t = String(p.text ?? '');
+        if (live && t.length < liveLen) break;
+        if (live) { live.el.remove(); m.partEls.delete('__live-think'); thinkTimers.delete('__live-think'); }
+        const peR = ensureThink(m, String(partId));
+        peR.content.textContent = t;
+        updateThinkPreview(peR);
       }
       scrollBottom();
       break;
@@ -1915,6 +2105,7 @@ function handleZcodeEvent(ev) {
     case 'turn.failed': {
       purgeLiveStream();
       busySource = null;
+      lastTurnFailed = true;
       setBusy(false);
       stopLiveTimers();
       notifyTaskState(false);
@@ -1969,9 +2160,27 @@ function handleZcodeEvent(ev) {
       const kind = String(p.kind ?? 'text_delta');
       if (kind !== 'text_delta' && kind !== 'reasoning_delta') break;
       const m = ensureMsg(mid, 'assistant');
+      // 部件通道是唯一事实来源（对齐桌面官方）：引擎已推送同类真实部件
+      // （DOM 已渲染、或数据已落 m.parts 但渲染被 settle 押后）时，token
+      // 直播块一律不再创建/增长——冻结等 settle 追平交接。直播块只剩
+      // legacy 引擎（只发 token 流、部件回合末才落库）兜底这一条路。
+      const liveKey = kind === 'reasoning_delta' ? '__live-think' : '__live-text';
+      const domKind = kind === 'reasoning_delta' ? 'think' : 'text';
+      const dataKind = kind === 'reasoning_delta' ? 'reasoning' : 'text';
+      let hasReal = false;
+      for (const [k, v] of m.partEls) {
+        if (k !== liveKey && v.kind === domKind) { hasReal = true; break; }
+      }
+      if (!hasReal) {
+        for (const pt of m.parts.values()) {
+          if (pt?.type === dataKind) { hasReal = true; break; }
+        }
+      }
+      if (hasReal) break;
       if (kind === 'reasoning_delta') {
         const pe = ensureThink(m, '__live-think');
         pe.content.textContent += delta;
+        updateThinkPreview(pe);
       } else {
         let pe = m.partEls.get('__live-text');
         if (!pe) {
@@ -1982,8 +2191,8 @@ function handleZcodeEvent(ev) {
           m.partEls.set('__live-text', pe);
         }
         pe.full = (pe.full ?? '') + delta;
-        pe.el.textContent = '';
-        richText(pe.el, pe.full);
+        streamRich(pe, pe.full);
+        ensureMsgActions(m);
       }
       scrollBottom();
       break;
@@ -2011,6 +2220,48 @@ function purgeLiveStream() {
     }
   }
   thinkTimers.delete('__live-think');
+}
+
+// 直播正文去重：引擎对同一回合同时发 token 直播（model.streaming →
+// __live-text 累积块）与部件落库（part.upserted/delta → 真实 partId），
+// 两路都渲染就是同一段正文出现两块、同步增长直到回合结束（思考行早有
+// 同款去重，正文漏了——这就是"对话过程大量重复输出"的根因）。
+// 落库文本总长追平直播块前返回 false（调用方只记数据不渲染副本），
+// 追平后移除直播块、返回 true 由真实部件接管。
+function settleLiveText(m) {
+  const live = m.partEls.get('__live-text');
+  if (!live) return true;
+  const liveLen = String(live.full ?? '').length;
+  if (!liveLen) { live.el.remove(); m.partEls.delete('__live-text'); return true; }
+  let done = 0;
+  for (const p of m.parts.values()) {
+    if (p?.type === 'text') done += String(p.text ?? '').length;
+  }
+  if (done < liveLen) return false;
+  live.el.remove();
+  m.partEls.delete('__live-text');
+  return true;
+}
+
+// 流式正文合帧：每来一个 token 就对整段累积文本重跑 markdown 解析是 O(n²)
+// （长回复在手机 WebView 上肉眼可见卡顿）。60ms 合并多次增量渲染一次；
+// 权威渲染（renderTextPart）与直播块清理会取消挂起任务，最终状态以落库
+// 部件为准，节流不会吞尾字。
+const richTimers = new Map(); // pe → setTimeout 句柄
+function streamRich(pe, text) {
+  pe.__pending = text;
+  if (richTimers.has(pe)) return;
+  richTimers.set(pe, setTimeout(() => {
+    richTimers.delete(pe);
+    const t = pe.__pending;
+    pe.__pending = null;
+    if (t != null && pe.el.isConnected) { pe.el.textContent = ''; richText(pe.el, t); }
+  }, 60));
+}
+function flushStreamRich(pe) {
+  const t = richTimers.get(pe);
+  if (t) { clearTimeout(t); richTimers.delete(pe); }
+  pe.__pending = null;
 }
 
 function handleUiEvent(p) {
@@ -2133,15 +2384,23 @@ function renderTail(messages) {
         thinkTimers.delete('__live-think');
       }
     }
+    // 直播正文去重（与思考块同款）：存储文本总长追平直播块前不渲染落库正文，
+    // 否则直播块 + 落库副本两份同步增长（对话过程大量重复输出的根因之一）
+    const liveTextOk = settleLiveText(m);
     for (const part of msg.parts ?? []) {
       switch (part.type) {
         case 'text':
+          if (!liveTextOk) break;
           renderTextPart(m, String(part.partId ?? mid + '-t'), part.text ?? '');
           changed = true;
           break;
         case 'reasoning': {
-          const pe = ensureThink(m, String(part.partId ?? mid + '-r'));
+          const pidR = String(part.partId ?? mid + '-r');
+          const existedR = m.partEls.has(pidR);
+          const pe = ensureThink(m, pidR);
           pe.content.textContent = part.text ?? '';
+          updateThinkPreview(pe);
+          if (!existedR) thinkTimers.delete(pidR); // 存储整段落库的思考无真实起始时刻，不冒充"持续了 X 秒"
           changed = true;
           break;
         }
@@ -2440,6 +2699,7 @@ async function send() {
   }
   // 忙碌与否都直接走服务端：服务端运行中自动入队（引擎 -32010 也会转排队）
   const ok = await doSend(text);
+  if (ok) scrollBottom(true); // 用户主动发送：无论如何回到最新消息
   if (!ok) {
     composer.value = text;
     composer.dispatchEvent(new Event('input'));
@@ -2494,6 +2754,48 @@ $('info').addEventListener('click', (e) => { if (e.target.id === 'info') $('info
 $('miNew').addEventListener('click', () => openSession(null));
 $('miPlugins').addEventListener('click', () => openInfo('⧩ 插件', loadPlugins));
 $('miPlan').addEventListener('click', () => openInfo('☰ 计划 / 上下文', loadPlan));
+
+// ── 外观主题（左侧栏 ☀：跟随系统 / 浅色 / 深色，localStorage 持久）──
+// data-theme 只存 'light'/'dark'（已解析），'auto' 跟随 matchMedia 实时切换；
+// head 里的预应用脚本负责首帧不闪错主题，本模块负责交互与系统切换跟手。
+const THEME_KEY = 'dshTheme';
+const sysLightMQ = matchMedia('(prefers-color-scheme: light)');
+function currentThemePref() {
+  try {
+    const v = localStorage.getItem(THEME_KEY);
+    return v === 'light' || v === 'dark' ? v : 'auto';
+  } catch { return 'auto'; }
+}
+function applyTheme() {
+  const pref = currentThemePref();
+  const resolved = pref === 'auto' ? (sysLightMQ.matches ? 'light' : 'dark') : pref;
+  document.documentElement.dataset.theme = resolved;
+  const mt = document.getElementById('metaTheme');
+  if (mt) mt.content = resolved === 'light' ? '#f5f5f7' : '#0b0b0e';
+}
+sysLightMQ.addEventListener('change', () => {
+  if (currentThemePref() === 'auto') applyTheme();
+});
+function renderThemeMenu() {
+  const pop = $('themeMenu');
+  pop.textContent = '';
+  pop.appendChild(el('div', 'phead', '外观'));
+  const cur = currentThemePref();
+  for (const [v, t, d] of [
+    ['auto', '跟随系统', '深浅色随系统昼夜切换'],
+    ['light', '浅色', '始终使用浅色'],
+    ['dark', '深色', '始终使用深色'],
+  ]) {
+    pop.appendChild(popRow({ title: t, desc: d, checked: cur === v, onClick: () => {
+      try { localStorage.setItem(THEME_KEY, v); } catch { /* 隐私模式等：本次生效不持久 */ }
+      applyTheme();
+      closePops();
+      toast(`外观：${t}`);
+    } }));
+  }
+}
+$('miTheme').addEventListener('click', (e) => { e.stopPropagation(); togglePop($('themeMenu'), e.currentTarget, renderThemeMenu); });
+applyTheme();
 
 // ── 项目 / 会话（官方 PC 侧边栏同款：按项目分组的单列表）──
 
