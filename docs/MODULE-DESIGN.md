@@ -34,6 +34,7 @@
 | F1 | **会话存储共享**：桌面端与手机引擎共用 `~/.zcode/cli/db/db.sqlite`（session/message/part/… 表）；消息按**部件粒度**实时落盘 | 任意进程都能读到别人回合的进度（轮询跟随的可行性依据） |
 | F2 | **SSE 事件是进程内的**：引擎只推送自己执行的回合；桌面端驱动的回合对手机引擎不可见 | 旁观回合只能轮询存储跟随，无法拿到实时事件（含 token 流） |
 | F3 | **凭据文件共享**：`~/.zcode/v2/credentials.json`（aes-256-gcm，密钥为机器自包含串） | 手机桥可读取桌面端登录态（oauth token set、standalone key） |
+| F4 | **会话存活边界**：引擎把会话持有在内存，未完成首回合的会话在引擎/服务器重启后**彻底消失**（CLI 库无 session 行）；`session/list` 对本进程内新建会话返回的 `title` 恒为空串（标题只写落库层，内存快照不回填），重启后从库里读出的标题才正常 | 桌面任务索引同步必须以**共享库**为存在性与标题的权威源；引擎列表只取 status/mode/workspace |
 
 ---
 
@@ -94,6 +95,11 @@ sessionState(sid) = { subs:Set<res>, ring:[≤1000], busy, busySince, lastSend, 
   `turn.failed`→`scheduleRateLimitRetry`。
 - `pushSse`：常规事件进 ring（重连重放 `afterSeq` 过滤）+ 直播订阅者；
   **`model.streaming` 例外：只直播不进环**（单回合百余 chunk，进环挤占 ring 且重放语义不对）。
+- **delta 合帧（2026-10-04）**：`model.streaming`/`part.delta` 相邻同键 chunk 合并为一帧
+  （60ms 或非 delta 事件到达时冲刷；键 = 助手消息 id+kind / 消息+部件+field）。严格 FIFO：
+  只允许与队尾待发 delta 同键合并，其余事件先冲刷再入队，**顺序绝不重排**；合并帧携带
+  首个 chunk 的 seq，重连重放语义不变。长回复 SSE 帧量从数千降到数十——手机蜂窝网络
+  省流量，页面渲染不再碎片化。
 - 事件语义速查：
   - `turn.started|completed|failed`：payload 含 `input`/`inputId`/`error`；
     **`inputId` 可打标记**（重试回显跳过的依据）
@@ -130,7 +136,9 @@ sessionState(sid) = { subs:Set<res>, ring:[≤1000], busy, busySince, lastSend, 
 
 - **桌面驱动回合**：无 SSE 事件（F2）、`updatedAt` 不变、engine `status` 恒 idle。
   页面只能靠轮询存储跟随（部件粒度、秒级），且**无 token 流**。
-- **文本部件回合末才持久化**：流式观感完全依赖 `model.streaming` 直播，断流即丢、后续续流。
+- **文本部件持久化节奏依引擎通道而异**：legacy 通道回合末才落库（流式观感全靠
+  `model.streaming` 直播）；现引擎**部件粒度实时落盘**（即 F1），页面因此以部件通道
+  为事实来源、token 直播仅作 legacy 兜底（见 §3.2）。
 - **sqlite 直写**：清库操作绕过引擎直接删行（先备份、白名单、孤儿清理）；引擎不感知，
   会话列表以引擎重启后的实时查询为准。
 
@@ -152,18 +160,24 @@ sessionState(sid) = { subs:Set<res>, ring:[≤1000], busy, busySince, lastSend, 
 - `fingerprint`：最后一条 assistant 消息的 `id|role|parts.length|末部件type|status|text长度`。
 - `turnLooksFinished/Running`：最后 assistant 消息末部件是否 `step-finish`。
 - 工具行图标/名称按 toolName 映射（bash→终端、edit→编辑、grep→搜索…）；描述与名字相同则去重。
+  **完成态保留行内摘要**（压暗 + 省略号截断，对齐官方桌面；此前隐藏导致"一屏终端✓看不出执行了什么"，
+  2026-10-04 恢复，展开卡首行的补偿逻辑已删）。
 
 ### 3.2 事件处理（handleZcodeEvent / handleUiEvent）
 
 - **会话守卫**：`ev.sessionId !== curSession` 的事件直接丢弃（切换瞬间旧流在途事件防串台）。
 - `turn.started`：渲染用户回显（`inputId` 带 `__retry` 前缀则跳过——限流重试不重复出消息）。
 - `part.*` / `tool.updated`：部件与工具行增量更新；活动事件触发"运行态推断"（见 3.3）。
-- **`model.streaming`（逐字流式）**：
-  - `reasoning_delta` → `ensureThink(m,'__live-think')` 内容追加；
-  - `text_delta` → `m.partEls['__live-text']` 累积 + richText 全量重绘该 div；
-  - 回合结束 `purgeLiveStream()` 移除 `__live-*` 元素，由存储真实部件接管。
+- **`model.streaming`（逐字流式）**：现代引擎对同一回合**同时**发 token 直播与部件落库
+  事件，页面以**部件通道为唯一事实来源**（对齐桌面官方）——`m.parts` 已有同类真实部件
+  （或 DOM 已渲染）时 token 直播一律不创建/不再增长；直播块仅在 legacy 引擎（部件回合末
+  才落库）兜底，落库副本追平直播块才交接（`settleLiveText`，与思考行同款去重）。
+  流式 markdown 渲染 60ms 合帧（`streamRich`，权威渲染 `renderTextPart` 前 flush 防回闪）。
 - `turn.completed/failed`：复位 + 从存储补一次尾部重绘（修正断流期间卡 running 的工具行）
   + `flushQueue()`；failed 对 1113/429 给人话文案。
+- **回合结束分隔线**：`setBusy(false)` 统一收口——≥5 秒的回合在对话流末尾画
+  "✓ 本轮结束 · 用时 X"（`.turnend` 虚线分隔）；`turn.failed` 置 `lastTurnFailed` 跳过
+  （红字 errline 就是终点）。SSE 收尾与轮询推断收尾（桌面驱动回合）都生效。
 - `ui` 事件：权限批准卡片（批准/拒绝按钮文案匹配 App 审批检测）、`note`（重试提示行）。
 
 ### 3.3 运行态状态机（核心不变量：任何运行态都必须能退出）
@@ -227,6 +241,20 @@ openSession 同时：记录 lastSession、重置计时基准、按 server busy/�
 | `window.__dshComposerBridge{insertText,send}` / `__dshPhotoBridge.pickImage` / `__zcode` v2 | App 注入桥 | |
 | `data-composer-card` | artifactBridgeJs 放行 composer 点击 | |
 
+### 3.8 外观主题与折叠态信息密度
+
+- **主题**：偏好存 `localStorage['dshTheme']`（auto/light/dark）；根元素 `data-theme` 只落
+  已解析的 light/dark，auto 档监听 `prefers-color-scheme` 实时切换。`<head>` 预应用脚本
+  先于页面主体脚本落主题，首帧不闪错色。配色全部 CSS 变量化：深色为 `:root` 默认，
+  浅色 `:root[data-theme=light]` 覆盖；代码块/行内代码/成果 chip/链接/按钮静默态/弹层
+  阴影均走变量（新增硬编码颜色视为回归）；`color-scheme` 与 `<meta name="theme-color">` 随主题更新。
+- **折叠态信息密度**（手机上"一屏占位符看不出在干嘛"的教训）：
+  - 工具行完成态保留行内摘要（命令/目标文件/查询串，压暗 + 省略号）；
+  - 思考行折叠态显示"持续了 X 秒"（仅真实直播过的思考有计时）+ 首行内容预览
+    （`.tprev`，展开隐藏）；历史整段落库的思考无真实起始时刻，不冒充时长。
+  - 回合结束有带用时的分隔线（见 3.2）——折叠信息三件套合起来保证对话流
+    不看详情也能读出"想了什么 → 干了什么 → 结果如何 → 花了多久"。
+
 ---
 
 ## 4. 模块：DSH-Phone App（Flutter 侧，Zcode 模式相关）
@@ -279,6 +307,11 @@ approval 高优通知）。页面 v2 通知与 DOM 桥**双通道并存**，通�
 | 11 | 正文出现紫色碎片 chip | 路径正则贪婪吞中文 | 字符集排除 CJK/全角 | 中文后缀不再匹配 |
 | 12 | 服务重启后页面刷 `Session is not active` | 引擎丢会话、页面不重连 | ensureResumed（30s 冷却）+ reset 自动重连 | 重启后自愈 |
 | 13 | 无流式输出（等回合结束一次性出） | `model.streaming` token 直播未被消费；文本部件回合末才落盘 | 页面消费 token 直播；服务端流式不进环 | 正文 11→128→234→278 字逐段增长 |
+| 14 | 桌面任务列表里手机会话显示"新任务"、点开报 `Session is not active and not persisted` | 三个叠加：①引擎 `session/list` 对**本进程内**创建的会话 title 恒空（标题只写落库层 first_input，内存快照不回填），60s 对账把空标题同步进索引；②引擎会话存内存、**首回合完成才落库**——未落库就重启=会话彻底丢失（CLI 库/引擎列表双无），索引行成幽灵行，桌面点开必报错；③手机端直删会话后索引行残留（原"只增改不删"策略） | ①②③（server.mjs 桌面索引同步）：标题为空时从共享库 `session.title` 补齐；**未落库会话一律不 INSERT 索引行**（首回合完成→下一对账周期带真标题入索引）；新增 `cleanupGhostIndexRows`：手机侧工作区行既不在引擎列表也不在共享库、行龄>30min 即删除（宽限期保护桌面侧未落库活动草稿） | 重启后 task-sync 日志"清理幽灵行 10 条"；E2E：新会话回合完成→≤60s 索引带真标题（title==库 title 逐字节一致）；残留 2 条宽限期内幽灵行到期被清 |
+| 15 | 对话过程大量重复输出（同一段正文两块同步增长） | 引擎对同一回合**同时**发 token 直播（model.streaming）与部件落库（part.upserted/delta），页面两路都渲染；思考行早有去重、正文漏了 | 部件通道唯一事实来源 + `settleLiveText` 追平交接 + `model.streaming` hasReal 守卫（含 m.parts 数据层） | 长回合正文单份、流式不重复 |
+| 16 | 完成态工具行只剩"终端✓"，看不出执行了什么 | 此前为防命令刷屏用 CSS 隐藏 `.tool.completed .tdesc`（摘要数据一直在 inputSummary） | 恢复行内摘要（压暗+省略号），删配套"摘要补详情体"补偿逻辑 | 对齐官方桌面行样式 |
+| 17 | 回合结束在手机上看不出特征（转圈消失太弱） | 结束唯一信号是 spinner 移除 | `setBusy(false)` 统一收口画回合结束分隔线（带用时；失败回合除外，见 3.2） | ≥5s 回合结束即出现结束线 |
+| 18 | 思考行折叠后只剩"思考"两字，不知道想了多久/想了什么 | summary 只有图标+文字；时长计时对历史渲染的思考不准确 | summary 加时长 + 首行预览（`.tprev`）；存储整段落库的思考删计时器不冒充时长 | 折叠态可见"持续了 X 秒 + 首行" |
 
 ---
 

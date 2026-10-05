@@ -34,7 +34,7 @@
 | 仓库 | 内容 | 分支 |
 |---|---|---|
 | `liangjianzeng/zcode-phone-server` | 桥接服务（本仓库） | `main` |
-| `liangjianzeng/DSH-Phone` | 手机 APK（fork 自原项目） | `main`（DSH 原版）/ `zcode-mode`（双模式改造，稳定后合回） |
+| `liangjianzeng/DSH-Phone` | 手机 APK（fork 自原项目） | `main`（DSH/Zcode 双模式已合入主线直开，`zcode-mode` 分支已关闭） |
 
 **工作区约定**（参考本机布局，其他机器可自由选择）：
 
@@ -171,6 +171,11 @@ flutter build apk      # 或 flutter run 直接连真机
 
 ## 9. 开发约定
 
-- 服务端改动提交到 `zcode-phone-server` `main`；App 改动在 `DSH-Phone` `zcode-mode` 分支进行，**稳定后再合并回 main**。
+- 服务端改动提交到 `zcode-phone-server` `main`；App 改动同样在 `DSH-Phone` `main` 直开（`zcode-mode` 分支已合并关闭，见 §1 仓库分工）。
+- **改 `public/index.html` 不用重启服务**：server 对 `/` 每请求读盘，且页面按 `/api/state` 的
+  构建指纹（md5 前 8 位）自动 reload（手机端 ≤25s 生效）；改 `server.mjs` 才需要
+  `bash restart_server.sh`（自带等会话空闲守卫）。注意 WebView 后台时轮询暂停，
+  回前台才补——联调时改动没生效先手动刷新一次页面。
 - 协议相关问题优先查开源源码：`ref/ZCode/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/`（服务端语义）、`packages/shared/src/zcode-protocol/`（schema 真源）。
 - 调试神器：桥日志 `logs/server.jsonl`（记录每个请求/事件/交互）；引擎日志 `~/.zcode/cli/log/zcode-YYYY-MM-DD.jsonl`。
+- 页面回归红线：改动 `index.html` 后核对 MODULE-DESIGN §3.7 桥接契约表（哨兵词/审批文案/fileMention/composer），App 端功能靠这些 DOM 约定活着。
