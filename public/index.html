@@ -1252,7 +1252,11 @@ function setBusy(on) {
 
 function ensureMsg(messageId, role) {
   let m = msgEls.get(messageId);
-  if (m) return m;
+  if (m) {
+    // part 事件先建了 assistant 壳、存储确认是用户消息：就地纠正角色与样式
+    if (m.role !== role) { m.role = role; m.el.className = `msg ${role}`; }
+    return m;
+  }
   const hero = chat.querySelector('.hero');
   if (hero) hero.remove();
   const wrap = el('div', `msg ${role}`);
@@ -1261,7 +1265,7 @@ function ensureMsg(messageId, role) {
   // 保持流末尾转圈始终在最底部
   const spinRow = document.getElementById('streamSpin');
   if (spinRow) chat.insertBefore(wrap, spinRow); else chat.appendChild(wrap);
-  m = { el: wrap, bubble, parts: new Map(), partEls: new Map() };
+  m = { el: wrap, bubble, parts: new Map(), partEls: new Map(), role };
   msgEls.set(messageId, m);
   scrollBottom();
   return m;
@@ -1315,9 +1319,15 @@ function collectMsgText(m) {
     .filter(Boolean).join('\n\n');
 }
 
-// 助手消息尾部的操作行（复制/分享）：仅在出现正文部件后创建，用户气泡不加
+// 助手消息尾部的操作行（复制/分享）：只在"关键输出"上出现——任何时刻仅
+// 最新一条带正文的助手消息持有，新正文到达即迁移（回合结束时正好落在
+// 最终回复上）；用户气泡不加
 function ensureMsgActions(m) {
-  if (m.el.classList.contains('user') || m.el.querySelector(':scope > .msgacts')) return;
+  if (m.el.classList.contains('user')) return;
+  for (const r of chat.querySelectorAll('.msg > .msgacts')) {
+    if (r.parentElement !== m.el) r.remove();
+  }
+  if (m.el.querySelector(':scope > .msgacts')) return;
   const mkBtn = (label, icon, fn) => {
     const b = el('button'); b.innerHTML = icon + `<span>${label}</span>`;
     b.addEventListener('click', (ev) => { ev.stopPropagation(); fn(); });
@@ -1448,20 +1458,7 @@ function setToolStatus(toolCallId, status, desc, detail) {
     status === 'error' || status === 'failed' ? SVG.cross : '';
   if (detail !== undefined && detail !== null && detail !== '') {
     t.body.textContent = '';
-    // 成功/出错的工具输出可复制/分享（展开后出现在输出正文上方）
-    const detailText = String(detail).slice(0, 4000);
-    const acts = el('div', 'msgacts');
-    const mk = (label, icon, fn) => {
-      const b = el('button'); b.innerHTML = icon + `<span>${label}</span>`;
-      b.addEventListener('click', (ev) => { ev.stopPropagation(); fn(); });
-      return b;
-    };
-    acts.append(
-      mk('复制', SVG.copy, () => copyTextToClipboard(detailText)),
-      mk('分享', SVG.share, () => shareOrCopy(detailText)),
-    );
-    t.body.appendChild(acts);
-    const pre = el('pre'); pre.textContent = detailText;
+    const pre = el('pre'); pre.textContent = String(detail).slice(0, 4000);
     t.body.appendChild(pre);
   }
   if (status === 'running') setActivity(`正在执行 ${t.name.textContent}`);
@@ -1481,6 +1478,18 @@ let lastFingerprint = '';    // 最后渲染的消息尾部指纹（renderHistor
 // renderHistory 会用存储 messageId 重画同一条消息——不清理就是"发出一条回显两条"。
 // 存储渲染同文本用户消息时移除对应回显气泡（60 秒窗口，连发两条相同内容也各自对齐）。
 let sseUserEchoes = [];
+
+// 最近自己发出的输入（doSend 成功 / turn.started 回显）：part 事件里的用户
+// 输入文本部件据此识别并跳过——part 处理器把一切部件当 assistant 画，用户
+// 消息会被画成两份（回显 + part 副本），存储接管后还残留一份错的
+const recentOwnInputs = []; // {text, at}
+function isOwnInput(text) {
+  const now = Date.now();
+  while (recentOwnInputs.length && now - recentOwnInputs[0].at > 5 * 60000) recentOwnInputs.shift();
+  const t = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  return recentOwnInputs.some((e) => e.text.replace(/\s+/g, ' ').trim() === t);
+}
 
 let busySource = null;       // 'sse' = 本引擎事件驱动；'inferred' = 轮询推断
 let lastActivity = 0;        // 推断运行态最近一次见到存储变化的时刻
@@ -1974,6 +1983,7 @@ function handleZcodeEvent(ev) {
         const m = ensureMsg(mid, 'user');
         m.bubble.textContent = String(input);
         sseUserEchoes.push({ mid, text: String(input), at: Date.now() });
+        recentOwnInputs.push({ text: String(input), at: Date.now() });
         scrollBottom();
       }
       busySince = Date.now();
@@ -1987,7 +1997,17 @@ function handleZcodeEvent(ev) {
     case 'part.upserted': {
       const part = ev.payload?.part;
       if (!part?.messageId) break;
-      const m = ensureMsg(String(part.messageId), 'assistant');
+      let m = msgEls.get(String(part.messageId));
+      const isNewMsg = !m;
+      m = ensureMsg(String(part.messageId), 'assistant');
+      // 用户输入的文本部件：不渲染。part 处理器把一切部件当 assistant 画，
+      // 会把用户消息画成第二份（回显之外再多一个）；标记 ownPart 后由
+      // dropMatchingUserEcho 在存储渲染时按文本对齐清理
+      if (part.type === 'text' && (m.role === 'user' || (isNewMsg && isOwnInput(part.text)))) {
+        m.role = 'user'; m.el.className = 'msg user'; m.ownPart = true;
+        m.parts.set(part.partId, part);
+        break;
+      }
       const isNewPart = !m.parts.has(part.partId);
       m.parts.set(part.partId, part);
       // 思考完成 = 同一回合的下一个非思考部件到达：折叠所有展开中的思考
@@ -2030,7 +2050,7 @@ function handleZcodeEvent(ev) {
       const { messageId, partId, field, delta } = ev.payload ?? {};
       if (!delta) break;
       const m = msgEls.get(String(messageId));
-      if (!m) break;
+      if (!m || m.role === 'user') break; // 用户消息部件不走 delta 渲染
       const p = { ...(m.parts.get(partId) ?? {}) };
       if (field === 'text' || field === undefined) p.text = (p.text ?? '') + delta;
       p.partId = partId;
@@ -2342,16 +2362,24 @@ function messageText(msg) {
   return (msg.parts ?? []).filter((p) => p.type === 'text').map((p) => p.text ?? '').join('\n');
 }
 
-// 落库渲染用户消息前，移除同文本的 SSE 回显气泡（60 秒窗口内），
-// 消除"一条消息两个气泡"（SSE user-<seq> + 存储 msg_xxx）
+// 落库渲染用户消息前，移除同文本的 SSE 回显气泡（60 秒窗口内）与
+// part 事件误建的用户消息副本（ownPart），消除"一条消息多个气泡"
 function dropMatchingUserEcho(text) {
   const now = Date.now();
   sseUserEchoes = sseUserEchoes.filter((e) => now - e.at < 60000);
   const idx = sseUserEchoes.findIndex((e) => e.text === text);
-  if (idx < 0) return;
-  const e = sseUserEchoes.splice(idx, 1)[0];
-  const m = msgEls.get(e.mid);
-  if (m) { m.el.remove(); msgEls.delete(e.mid); }
+  if (idx >= 0) {
+    const e = sseUserEchoes.splice(idx, 1)[0];
+    const m = msgEls.get(e.mid);
+    if (m) { m.el.remove(); msgEls.delete(e.mid); }
+  }
+  const norm = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!norm) return;
+  for (const [id, mm] of [...msgEls]) {
+    if (!mm.ownPart) continue;
+    const t = [...mm.parts.values()].filter((p) => p.type === 'text').map((p) => p.text ?? '').join('\n');
+    if (t.replace(/\s+/g, ' ').trim() === norm) { mm.el.remove(); msgEls.delete(id); }
+  }
 }
 
 function renderTail(messages) {
@@ -2668,6 +2696,7 @@ async function doSend(text, sid) {
     }
     busySince = Date.now();
     setBusy(true);
+    recentOwnInputs.push({ text, at: Date.now() }); // part 事件里识别自己的输入部件用
     return true;
   } catch (e) {
     toast(`发送失败：${e.message}`);
