@@ -5,3 +5,5 @@ node_modules/
 tmp-*.cjs
 .zcode-uploads/
 server.log
+public/slides.html
+public/slides-tech.html
