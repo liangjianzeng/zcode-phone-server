@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0e">
+<title>Zcode-Phone 体系 · 九页简版</title>
+<style>
+:root{--bg:#f5f5f7;--fg:#1c1c22;--dim:#66666f;--line:#e2e2e9;--card:#ffffff;--accent:#6a4df0;--code-bg:#f0f0f4}
+@media(prefers-color-scheme:dark){:root{--bg:#0b0b0e;--fg:#e9e9ee;--dim:#85858f;--line:#26262e;--card:#191920;--accent:#7c5cff;--code-bg:#08080b}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:15.5px/1.7 -apple-system,"Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+#deck{height:100svh;overflow-y:auto;scroll-snap-type:y mandatory;-webkit-overflow-scrolling:touch}
+.pg{min-height:100svh;scroll-snap-align:start;scroll-snap-stop:always;padding:26px 20px 58px;display:flex;flex-direction:column;gap:11px;overflow:hidden}
+.pg:nth-child(even){background:linear-gradient(180deg,var(--bg),var(--card))}
+.top{display:flex;justify-content:space-between;align-items:baseline}
+.kicker{font-size:11.5px;letter-spacing:.14em;color:var(--accent);font-weight:700}
+.n{font-size:30px;font-weight:800;color:var(--line)}
+h2{font-size:22px;line-height:1.3;margin:0}
+.sub{font-size:13px;color:var(--dim);margin:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:11px 14px}
+.card h3{margin:0 0 3px;font-size:14.5px}
+.card p,.card li{font-size:13px;color:var(--dim);margin:2px 0}
+ul.clean{list-style:none;margin:0;padding:0}
+ul.clean li{padding-left:16px;position:relative}
+ul.clean li::before{content:'▸';position:absolute;left:0;color:var(--accent)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.chiprow{display:flex;flex-wrap:wrap;gap:6px}
+.chip{border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12px;color:var(--dim);background:var(--card)}
+.sep{text-align:center;color:var(--dim);font-size:15px;line-height:1;margin:-2px 0}
+.layer{border:1px solid var(--line);border-left:4px solid var(--accent);background:var(--card);border-radius:12px;padding:9px 13px}
+.layer b{font-size:14px}.layer span{display:block;font-size:12.5px;color:var(--dim)}
+svg.f{width:100%;max-width:400px;display:block;margin:0 auto;height:auto}
+.star{color:var(--accent)}
+.foot{margin-top:auto;font-size:11.5px;color:var(--faint)}
+a{color:var(--accent);text-decoration:none;word-break:break-all}
+.dots{position:fixed;bottom:13px;left:0;right:0;display:flex;justify-content:center;gap:7px;z-index:9;pointer-events:none}
+.dots b{width:7px;height:7px;border-radius:50%;background:var(--line);transition:.25s}
+.dots b.on{background:var(--accent);width:19px;border-radius:4px}
+@media(prefers-color-scheme:dark){.dots b{background:var(--dim)}}
+</style>
+</head>
+<body>
+<main id="deck">
+
+<!-- P1 -->
+<section class="pg">
+  <div class="top"><span class="kicker">DSH-PHONE · 功能架构</span><span class="n">01</span></div>
+  <h2>一台手机，两条隧道，全套 AI 工作台</h2>
+  <div class="layer"><b>能力层</b><span>离线流式语音（热词/增强）· 相机与文件直传 · 成果查看器 + 断点下载 · 主机监控趋势 · 锁屏任务通知 · 月相/天气动效</span></div>
+  <div class="sep">▼</div>
+  <div class="layer"><b>接入层 · 双服务模式</b><span>DSH（远端 3080）⇄ Zcode（远端 8787）——顶栏一键切换，连接不断</span></div>
+  <div class="sep">▼</div>
+  <div class="layer"><b>连接层</b><span>dartssh2 本地 fork（zlib + 批量解密）· 最多 3 路实例 · 前台服务保活 · 主机密钥 TOFU · SFTP 上传/下载</span></div>
+  <div class="foot">WebView 以 loopback 身份接入，特权接口全可用 · 敏感信息 Keystore 加密</div>
+</section>
+
+<!-- P2 -->
+<section class="pg">
+  <div class="top"><span class="kicker">DSH-PHONE · 最新版本</span><span class="n">02</span></div>
+  <h2>v0.2.1（build 17）更新内容</h2>
+  <div class="card"><h3>🔀 实例级 DSH ⇄ Zcode 双服务模式</h3><p>每路实例独立选择服务模式与远端端口；顶栏一键切换转发目标，连接不断、就地生效。</p></div>
+  <div class="card"><h3>🎙️ 语音体验重构</h3><p>语音并入相机按钮（角标随月相反色）；识别增强档位（beam search + 自定义热词）；聆听声浪动效替代"准备中"。</p></div>
+  <div class="card"><h3>⚡ 启动与性能</h3><p>ASR 模型首帧后后台预热（启动不黑屏）；天气动效量化 ~20fps + 独立图层，开启特效不拖慢界面。</p></div>
+  <div class="card"><h3>💾 WebView 缓存策略</h3><p>对齐服务端 HTTP 缓存头（no-store 可靠更新，修复长期加载旧页面）；主文档 no-cache 保住鉴权链。</p></div>
+  <div class="foot">完整版本史：README.html · GitHub Releases 提供历史 APK</div>
+</section>
+
+<!-- P3 -->
+<section class="pg">
+  <div class="top"><span class="kicker">DSH-PHONE · ZCODE 合入主线</span><span class="n">03</span></div>
+  <h2>Zcode 模式：合入单一主线</h2>
+  <p class="sub">zcode-mode 分支已合回 main——此后单主线开发，双模式随版发布。</p>
+  <svg class="f" viewBox="0 0 360 128">
+    <rect x="50" y="4" width="260" height="34" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="2"/><text x="180" y="26" text-anchor="middle" font-size="12" fill="currentColor">手机 DSH-Phone（DSH / Zcode 双模式）</text>
+    <line x1="180" y1="38" x2="180" y2="54" stroke="var(--dim)" stroke-width="1.4"/><path d="M176 52 L180 58 L184 52" fill="none" stroke="var(--dim)" stroke-width="1.4"/>
+    <rect x="50" y="58" width="120" height="30" rx="9" fill="var(--card)" stroke="var(--line)"/><text x="110" y="78" text-anchor="middle" font-size="11" fill="currentColor">DSH · 3080</text>
+    <rect x="190" y="58" width="120" height="30" rx="9" fill="var(--card)" stroke="var(--line)"/><text x="250" y="78" text-anchor="middle" font-size="11" fill="currentColor">Zcode · 8787</text>
+    <line x1="180" y1="92" x2="180" y2="104" stroke="var(--dim)" stroke-width="1.4"/>
+    <text x="180" y="120" text-anchor="middle" font-size="11" fill="var(--dim)">SSH 隧道就地把转发目标切到另一模式，无需重连</text>
+  </svg>
+  <ul class="clean">
+    <li>Zcode 模式对端 = <b>zcode-phone-server</b>（8787）：驱动 ZCode 桌面引擎的桥接服务</li>
+    <li>与桌面<b>共享凭据与会话库</b>：免登录、同批会话、任务互相旁观</li>
+    <li>JS 桥靠 DOM 契约复用，<b>App 侧零改动</b>支持两模式</li>
+  </ul>
+</section>
+
+<!-- P4 -->
+<section class="pg">
+  <div class="top"><span class="kicker">模块设计 · 总体架构</span><span class="n">04</span></div>
+  <h2>四层链路 + 四条基础事实</h2>
+  <svg class="f" viewBox="0 0 360 208">
+    <rect x="40" y="4" width="280" height="34" rx="10" fill="var(--card)" stroke="var(--line)" opacity=".8"/><text x="180" y="26" text-anchor="middle" font-size="11.5" fill="currentColor" opacity=".8">消费方：DSH-Phone App（WebView + JS 桥）</text>
+    <line x1="180" y1="38" x2="180" y2="50" stroke="var(--dim)" stroke-width="1.4"/><text x="196" y="49" font-size="10.5" fill="var(--dim)">SSH 隧道（仅回环）</text>
+    <rect x="40" y="50" width="280" height="36" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="2"/><text x="180" y="73" text-anchor="middle" font-size="12" fill="currentColor">zcode-phone-server（token HTTP/SSE · 移动聊天页）</text>
+    <line x1="180" y1="86" x2="180" y2="98" stroke="var(--dim)" stroke-width="1.4"/><text x="196" y="97" font-size="10.5" fill="var(--dim)">stdio ND-JSON</text>
+    <rect x="40" y="98" width="280" height="32" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="180" y="119" text-anchor="middle" font-size="11.5" fill="currentColor">zcode.cjs app-server（ZCode 引擎）</text>
+    <line x1="180" y1="130" x2="180" y2="142" stroke="var(--dim)" stroke-width="1.4"/><text x="196" y="141" font-size="10.5" fill="var(--dim)">HTTPS · 凭据直通</text>
+    <rect x="40" y="142" width="280" height="32" rx="10" fill="var(--card)" stroke="var(--line)" opacity=".8"/><text x="180" y="163" text-anchor="middle" font-size="11.5" fill="currentColor" opacity=".8">模型提供方（z.ai / bigmodel Coding Plan）</text>
+    <text x="40" y="200" font-size="10.5" fill="var(--dim)">凭据来自桌面端共享文件；会话与桌面共用同一 sqlite 库</text>
+  </svg>
+  <div class="grid2">
+    <div class="card"><h3>F1 会话库共享</h3><p>部件粒度实时落盘 → 手机轮询跟随可行</p></div>
+    <div class="card"><h3>F2 SSE 进程内</h3><p>桌面驱动的回合无事件 → 只能轮询旁观</p></div>
+    <div class="card"><h3>F3 凭据共享</h3><p>桥读取桌面登录态（start-plan JWT 直通）</p></div>
+    <div class="card"><h3>F4 存活边界</h3><p>未落库会话重启即失 → 索引以共享库为准</p></div>
+  </div>
+</section>
+
+<!-- P5 -->
+<section class="pg">
+  <div class="top"><span class="kicker">模块设计 · 服务端功能架构</span><span class="n">05</span></div>
+  <h2>接入层 → 六大功能模块 → 引擎与数据</h2>
+  <svg class="f" viewBox="0 0 360 274">
+    <rect x="14" y="4" width="160" height="34" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="94" y="26" text-anchor="middle" font-size="10.5" fill="currentColor">HTTP /api/*（token 鉴权）</text>
+    <rect x="186" y="4" width="160" height="34" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="266" y="26" text-anchor="middle" font-size="10.5" fill="currentColor">SSE 流（重放环 · 心跳）</text>
+    <rect x="14" y="52" width="160" height="42" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="94" y="69" text-anchor="middle" font-size="10.5" fill="currentColor">引擎桥 ZcodeAgent</text><text x="94" y="84" text-anchor="middle" font-size="10" fill="var(--dim)">stdio · 反向应答 · 崩溃拉起</text>
+    <rect x="186" y="52" width="160" height="42" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="266" y="69" text-anchor="middle" font-size="10.5" fill="currentColor">delta 合帧</text><text x="266" y="84" text-anchor="middle" font-size="10" fill="var(--dim)">60ms · 相邻同键 · FIFO</text>
+    <rect x="14" y="104" width="160" height="42" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="94" y="121" text-anchor="middle" font-size="10.5" fill="currentColor">发送队列（预备任务）</text><text x="94" y="136" text-anchor="middle" font-size="10" fill="var(--dim)">运行中入队 · 收尾补发</text>
+    <rect x="186" y="104" width="160" height="42" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="266" y="121" text-anchor="middle" font-size="10.5" fill="currentColor">限流自动重试</text><text x="266" y="136" text-anchor="middle" font-size="10" fill="var(--dim)">429×5 次 · 1113 不重试</text>
+    <rect x="14" y="156" width="160" height="42" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="94" y="173" text-anchor="middle" font-size="10.5" fill="currentColor">任务索引同步</text><text x="94" y="188" text-anchor="middle" font-size="10" fill="var(--dim)">共享 sqlite 对账 · 幽灵行清理</text>
+    <rect x="186" y="156" width="160" height="42" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="266" y="173" text-anchor="middle" font-size="10.5" fill="currentColor">交互应答</text><text x="266" y="188" text-anchor="middle" font-size="10" fill="var(--dim)">权限/提问 · 凭据解析直通</text>
+    <line x1="180" y1="198" x2="180" y2="222" stroke="var(--dim)" stroke-width="1.4"/><text x="192" y="214" font-size="10" fill="var(--dim)">stdio 驱动 · 共享库对账 · 凭据解密</text>
+    <rect x="14" y="226" width="106" height="40" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="2"/><text x="67" y="243" text-anchor="middle" font-size="10.5" fill="currentColor">ZCode 引擎</text><text x="67" y="257" text-anchor="middle" font-size="10" fill="var(--dim)">app-server</text>
+    <rect x="127" y="226" width="106" height="40" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="180" y="243" text-anchor="middle" font-size="10.5" fill="currentColor">共享会话库</text><text x="180" y="257" text-anchor="middle" font-size="10" fill="var(--dim)">db.sqlite</text>
+    <rect x="240" y="226" width="106" height="40" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="293" y="243" text-anchor="middle" font-size="10.5" fill="currentColor">桌面凭据</text><text x="293" y="257" text-anchor="middle" font-size="10" fill="var(--dim)">credentials.json</text>
+  </svg>
+  <p class="sub">零 npm 依赖，Node ≥22.5（node:sqlite）；只监听 127.0.0.1，手机经 SSH 隧道接入。</p>
+</section>
+
+<!-- P6 -->
+<section class="pg">
+  <div class="top"><span class="kicker">模块设计 · 流式与跟随</span><span class="n">06</span></div>
+  <h2>双通道跟随 · 唯一事实来源</h2>
+  <svg class="f" viewBox="0 0 360 232">
+    <rect x="8" y="4" width="210" height="36" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="1.8"/><text x="113" y="20" text-anchor="middle" font-size="10.5" fill="currentColor">① 部件落库事件</text><text x="113" y="34" text-anchor="middle" font-size="10" fill="var(--dim)">part.upserted / part.delta（SSE）</text>
+    <rect x="8" y="54" width="210" height="36" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="113" y="70" text-anchor="middle" font-size="10.5" fill="currentColor">② token 直播 model.streaming</text><text x="113" y="84" text-anchor="middle" font-size="10" fill="var(--dim)">直播块 __live-*（legacy 兜底）</text>
+    <rect x="8" y="104" width="210" height="36" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="113" y="120" text-anchor="middle" font-size="10.5" fill="currentColor">③ 存储轮询 renderTail</text><text x="113" y="134" text-anchor="middle" font-size="10" fill="var(--dim)">1.2s 指纹比对 · 未变化跳过</text>
+    <line x1="218" y1="22" x2="238" y2="60" stroke="var(--dim)" stroke-width="1.4"/><line x1="218" y1="72" x2="238" y2="76" stroke="var(--dim)" stroke-width="1.4"/><line x1="218" y1="122" x2="238" y2="92" stroke="var(--dim)" stroke-width="1.4"/>
+    <rect x="244" y="40" width="108" height="96" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="2"/><text x="298" y="62" text-anchor="middle" font-size="10.5" fill="currentColor">渲染层</text><text x="298" y="78" text-anchor="middle" font-size="10" fill="var(--dim)">msgEls / toolEls</text><text x="298" y="94" text-anchor="middle" font-size="10" fill="var(--dim)">部件 =</text><text x="298" y="108" text-anchor="middle" font-size="10" fill="var(--dim)">唯一事实来源</text>
+    <line x1="298" y1="136" x2="298" y2="164" stroke="var(--dim)" stroke-width="1.4"/><text x="310" y="154" font-size="10" fill="var(--dim)">未变化跳过</text>
+    <rect x="244" y="164" width="108" height="44" rx="10" fill="var(--card)" stroke="var(--line)"/><text x="298" y="181" text-anchor="middle" font-size="10" fill="currentColor">增长走 60ms 合帧</text><text x="298" y="196" text-anchor="middle" font-size="10" fill="var(--dim)">滚动对齐 nearBottom</text>
+    <text x="8" y="176" font-size="10" fill="var(--dim)">② → ①：settleLiveText 追平交接，</text>
+    <text x="8" y="190" font-size="10" fill="var(--dim)">直播块只是 legacy 兜底——</text>
+    <text x="8" y="204" font-size="10" fill="var(--dim)">根治"正文/输入双份重复"</text>
+  </svg>
+  <div class="card"><h3>服务端 delta 合帧</h3><p>相邻同键 token chunk 60ms 合并成一帧，严格 FIFO 不重排：长回复 SSE 帧量从数千降到数十，蜂窝网络省流量、渲染不碎片。</p></div>
+</section>
+
+<!-- P7 -->
+<section class="pg">
+  <div class="top"><span class="kicker">模块设计 · 运行态状态机</span><span class="n">07</span></div>
+  <h2>任何运行态都必须能退出</h2>
+  <svg class="f" viewBox="0 0 360 272">
+    <rect x="8" y="4" width="82" height="28" rx="8" fill="var(--card)" stroke="var(--line)"/><text x="49" y="22" text-anchor="middle" font-size="10" fill="currentColor">turn.started</text>
+    <rect x="98" y="4" width="82" height="28" rx="8" fill="var(--card)" stroke="var(--line)"/><text x="139" y="22" text-anchor="middle" font-size="10" fill="currentColor">活动事件推断</text>
+    <rect x="188" y="4" width="82" height="28" rx="8" fill="var(--card)" stroke="var(--line)"/><text x="229" y="22" text-anchor="middle" font-size="10" fill="currentColor">openSession 恢复</text>
+    <rect x="278" y="4" width="74" height="28" rx="8" fill="var(--card)" stroke="var(--line)"/><text x="315" y="22" text-anchor="middle" font-size="10" fill="currentColor">doSend</text>
+    <line x1="49" y1="32" x2="49" y2="52" stroke="var(--dim)" stroke-width="1.2"/><line x1="139" y1="32" x2="139" y2="52" stroke="var(--dim)" stroke-width="1.2"/><line x1="229" y1="32" x2="229" y2="52" stroke="var(--dim)" stroke-width="1.2"/><line x1="315" y1="32" x2="315" y2="52" stroke="var(--dim)" stroke-width="1.2"/>
+    <rect x="40" y="58" width="280" height="40" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="2"/><text x="180" y="76" text-anchor="middle" font-size="12" fill="currentColor">busy 运行中</text><text x="180" y="91" text-anchor="middle" font-size="10" fill="var(--dim)">busySource = sse | inferred</text>
+    <line x1="180" y1="98" x2="180" y2="118" stroke="var(--dim)" stroke-width="1.4"/><text x="192" y="113" font-size="10" fill="var(--dim)">收敛路径（全部以存储为事实源）</text>
+    <rect x="14" y="124" width="160" height="32" rx="9" fill="var(--card)" stroke="var(--line)"/><text x="94" y="145" text-anchor="middle" font-size="10.5" fill="currentColor">SSE turn.completed / failed</text>
+    <rect x="186" y="124" width="160" height="32" rx="9" fill="var(--card)" stroke="var(--line)"/><text x="266" y="145" text-anchor="middle" font-size="10.5" fill="currentColor">step-finish 稳定 6 秒</text>
+    <rect x="14" y="166" width="160" height="32" rx="9" fill="var(--card)" stroke="var(--line)"/><text x="94" y="187" text-anchor="middle" font-size="10.5" fill="currentColor">finished + 静默 30 秒</text>
+    <rect x="186" y="166" width="160" height="32" rx="9" fill="var(--card)" stroke="var(--line)"/><text x="266" y="187" text-anchor="middle" font-size="10.5" fill="currentColor">无变化静默 45 秒（兜底）</text>
+    <line x1="180" y1="198" x2="180" y2="218" stroke="var(--dim)" stroke-width="1.4"/>
+    <rect x="40" y="222" width="280" height="34" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="2"/><text x="180" y="244" text-anchor="middle" font-size="11.5" fill="currentColor">空闲——不永久转圈</text>
+  </svg>
+  <p class="sub">配套：turn.failed 给人话提示（1113/429 分流）、自动重试、回合结束分隔线与当轮产出卡。</p>
+</section>
+
+<!-- P8 -->
+<section class="pg">
+  <div class="top"><span class="kicker">模块设计 · 改动红线</span><span class="n">08</span></div>
+  <h2>桥接契约——App 功能靠它们活着</h2>
+  <div class="card"><h3>运行哨兵词</h3><p><code>[role=status][aria-live=polite]</code> 含 <b>Deep diving</b>，仅运行时存在于 DOM——常驻 = App 永远"任务进行中"。</p></div>
+  <div class="card"><h3>成果 chip</h3><p><code>.fileMention</code> + <code>title=完整路径</code>；页面侧<b>不得 stopPropagation</b>（桥在 document 冒泡阶段接管，按后缀分流查看器/下载）。</p></div>
+  <div class="card"><h3>审批与输入</h3><p>权限卡片按钮短文案 <b>批准 / 拒绝</b>（≤12 字正则识别）；原生 <code>textarea#composer</code> + <code>data-composer-card</code> 放行注入区。</p></div>
+  <div class="card"><h3>两代 App 桥并存</h3><p>v2 通知（<code>onTaskState</code>）与 DOM 哨兵双通道，通知 id 相同自然去重；APK 全量升级后可撤哨兵兼容。</p></div>
+  <div class="foot">回归红线：改页面先核对 MODULE-DESIGN §3.7；改 boot 核对 busy &gt; lastSession &gt; 最近 的优先级顺序。</div>
+</section>
+
+<!-- P9 -->
+<section class="pg">
+  <div class="top"><span class="kicker">收尾 · 仓库与更多</span><span class="n">09</span></div>
+  <h2>踩坑精华 & 仓库地址</h2>
+  <div class="card"><h3>踩坑档案精选（完整 21 条见 MODULE-DESIGN.html）</h3><ul class="clean">
+    <li>会话历史串台 → 代际守卫 + 排队绑定会话 + 事件会话守卫</li>
+    <li>永久转圈 → 存储事实源自愈（finished + 静默强制复位）</li>
+    <li>正文/输入重复 → 部件通道唯一事实来源 + ownPart 识别</li>
+    <li>页面抖动 → 内容未变不重建、非最新消息不迁移</li>
+    <li>chip 点击无效 → 勿拦死 document 冒泡阶段的 App 桥</li>
+  </ul></div>
+  <div class="card"><h3>📦 两个仓库</h3><ul class="clean">
+    <li><a href="https://github.com/liangjianzeng/DSH-Phone">github.com/liangjianzeng/DSH-Phone</a>——手机 App（本体系端侧）</li>
+    <li><a href="https://github.com/liangjianzeng/zcode-phone-server">github.com/liangjianzeng/zcode-phone-server</a>——桥接服务（v0.0.1）</li>
+  </ul></div>
+  <div class="card"><h3><span class="star">★</span> 推荐：TongYi-Lite</h3><p>同作者的端侧轻量模型统一适配应用项目——<a href="https://github.com/liangjianzeng/TongYi-Lite">github.com/liangjianzeng/TongYi-Lite</a></p></div>
+  <div class="foot">v0.0.1 · 2026-10-05 · 完整文档：/README.html · /MODULE-DESIGN.html · /GETTING-STARTED 待转</div>
+</section>
+
+</main>
+<nav class="dots" id="dots"></nav>
+<script>
+const deck = document.getElementById('deck');
+const pages = document.querySelectorAll('.pg');
+const dots = document.getElementById('dots');
+pages.forEach((_, i) => { const b = document.createElement('b'); b.onclick = () => pages[i].scrollIntoView({behavior:'smooth'}); b.style.pointerEvents='auto'; b.style.cursor='pointer'; dots.appendChild(b); });
+function sync() {
+  const i = Math.round(deck.scrollTop / deck.clientHeight);
+  dots.querySelectorAll('b').forEach((b, j) => b.classList.toggle('on', j === i));
+}
+deck.addEventListener('scroll', sync, {passive:true}); sync();
+</script>
+</body>
+</html>
