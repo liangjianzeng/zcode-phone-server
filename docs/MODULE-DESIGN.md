@@ -178,6 +178,10 @@ sessionState(sid) = { subs:Set<res>, ring:[≤1000], busy, busySince, lastSend, 
 - **回合结束分隔线**：`setBusy(false)` 统一收口——≥5 秒的回合在对话流末尾画
   "✓ 本轮结束 · 用时 X"（`.turnend` 虚线分隔）；`turn.failed` 置 `lastTurnFailed` 跳过
   （红字 errline 就是终点）。SSE 收尾与轮询推断收尾（桌面驱动回合）都生效。
+- **本轮产出卡**：回合内**成功写出**的文件（Write/Edit 等带 file_path 且 completed）
+  经 `addTurnArtifact` 去重收集（新回合清空），回合结束时在底部集中成卡片——
+  文档/成果类（md/html/pdf/office/图片等，`DOC_ARTIFACT_RE`）直接平铺 chip（点击
+  经 artifactBridge 打开查看器），代码/其他折叠为"另有 N 个"计数；随后才是结束分隔线。
 - `ui` 事件：权限批准卡片（批准/拒绝按钮文案匹配 App 审批检测）、`note`（重试提示行）。
 
 ### 3.3 运行态状态机（核心不变量：任何运行态都必须能退出）
@@ -313,6 +317,7 @@ approval 高优通知）。页面 v2 通知与 DOM 桥**双通道并存**，通�
 | 17 | 回合结束在手机上看不出特征（转圈消失太弱） | 结束唯一信号是 spinner 移除 | `setBusy(false)` 统一收口画回合结束分隔线（带用时；失败回合除外，见 3.2） | ≥5s 回合结束即出现结束线 |
 | 18 | 思考行折叠后只剩"思考"两字，不知道想了多久/想了什么 | summary 只有图标+文字；时长计时对历史渲染的思考不准确 | summary 加时长 + 首行预览（`.tprev`）；存储整段落库的思考删计时器不冒充时长 | 折叠态可见"持续了 X 秒 + 首行" |
 | 19 | 用户输入的消息也重复显示（不止输出） | part 处理器把一切部件事件当 assistant 画（`ensureMsg(mid,'assistant')` 写死）；现代引擎对用户输入文本部件也实时推 part 事件 → 回显之外再多一份副本 | 记录最近自己发出的输入（doSend/turn.started），part 事件命中即标记 `ownPart` 不渲染、就地纠正为 user 角色；`dropMatchingUserEcho` 扩展按文本对齐清理 ownPart 副本；ensureMsg 支持存储确认后的角色就地升级 | 输入单份、身份样式正确 |
+| 20 | 页面自己"一抖一抖"（高度反复变化+滚动跳动） | ①复制/分享操作行在每次部件事件/轮询都无条件迁移（增删 DOM 改变行高）；②streamRich 合帧定时器异步重绘改变高度后无人对齐滚动，下次事件又在错误位置判 nearBottom | 操作行以"持有者真正变化"为条件（actionsHolder）；合帧渲染后补一次 scrollBottom | 流式期间无抖动 |
 
 ---
 

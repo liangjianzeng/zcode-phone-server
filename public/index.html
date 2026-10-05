@@ -235,6 +235,12 @@
     user-select: none;
   }
   .turnend::before, .turnend::after { content: ''; flex: 1; border-top: 1px dashed var(--line); }
+  /* 本轮产出卡：文档/成果集中排在回合底部；代码/其他太多 → 折叠为计数。
+     chip 沿用 .fileMention（App 成果桥按 class+title 接管点击） */
+  .turnarts { border: 1px solid var(--line); background: var(--card); border-radius: 12px; padding: 10px 12px; margin: 10px 0 4px; }
+  .turnarts .tt { font-size: 12.5px; color: var(--dim); margin-bottom: 8px; }
+  .turnarts .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .turnarts summary { cursor: pointer; font-size: 12px; color: var(--faint); margin-bottom: 6px; }
 
   /* ── 运行状态条：视觉隐藏（官方无此条），但 DOM 保留——旧版 App 桥的
      哨兵词 span 仍随任务运行在此增删，运行态判定不受影响 ── */
@@ -1196,6 +1202,15 @@ function updateSendButton() {
   btnSend.innerHTML = mode === 'stop' ? stopSvg : sendSvg;
 }
 
+// ── 本轮产出：回合内成功写出的文件集中到回合底部展示 ──
+// 只突出文档/成果类（手机上点开即看），代码类条目可能太多 → 折叠为计数
+let turnArtifacts = new Map(); // path → path（去重）
+const DOC_ARTIFACT_RE = /\.(md|markdown|html?|txt|pdf|docx?|xlsx?|pptx?|csv|tsv|rtf|png|jpe?g|gif|webp|svg)$/i;
+function addTurnArtifact(p) {
+  const s = String(p ?? '');
+  if (s && /\.[A-Za-z0-9]{1,8}$/.test(s)) turnArtifacts.set(s, s);
+}
+
 let lastTurnFailed = false; // turn.failed 置位：失败回合不画"本轮结束"线（红字 errline 就是终点）
 function setBusy(on) {
   busy = on;
@@ -1222,13 +1237,37 @@ function setBusy(on) {
     spinRow.remove();
   }
   if (on) {
-    if (!busySince) busySince = Date.now();
+    if (!busySince) { busySince = Date.now(); turnArtifacts.clear(); } // 新回合：清空产出收集
     tickElapsed();
     if (!elapsedTimer) elapsedTimer = setInterval(tickElapsed, 1000);
   } else {
     markThinkDurations();
     // 回合收尾（含轮询推断的收尾）：所有思考都已完成，折叠展开中的思考行
     collapseOpenThinks();
+    // 本轮产出卡：回合内成功写出的文档/成果集中排在回合最底部（点开即看）；
+    // 代码/其他条目可能太多，折叠为计数。失败回合也照常展示（文件已存在）。
+    if (busySince && turnArtifacts.size) {
+      const docs = []; const code = [];
+      for (const p of turnArtifacts.keys()) (DOC_ARTIFACT_RE.test(p) ? docs : code).push(p);
+      if (docs.length || code.length) {
+        const card = el('div', 'turnarts');
+        card.appendChild(el('div', 'tt', `📦 本轮产出${docs.length ? ` · ${docs.length} 个文档/成果` : ''}`));
+        const chips = el('div', 'chips');
+        for (const p of docs) fileChip(chips, p);
+        card.appendChild(chips);
+        if (code.length) {
+          const d = document.createElement('details');
+          d.appendChild(el('summary', '', `另有 ${code.length} 个代码/其他文件，点击展开`));
+          const cc = el('div', 'chips');
+          for (const p of code) fileChip(cc, p);
+          d.appendChild(cc);
+          card.appendChild(d);
+        }
+        chat.appendChild(card);
+        scrollBottom();
+      }
+      turnArtifacts.clear();
+    }
     // 回合结束分隔线：转圈消失太不显眼，用户分不清智能体是干完了还是卡了。
     // ≥5 秒的回合在对话流末尾补一条结束线（带用时）；失败回合自带红字
     // errline 不重复画。SSE 收尾与轮询推断收尾（桌面驱动回合）都走这里。
@@ -1321,13 +1360,15 @@ function collectMsgText(m) {
 
 // 助手消息尾部的操作行（复制/分享）：只在"关键输出"上出现——任何时刻仅
 // 最新一条带正文的助手消息持有，新正文到达即迁移（回合结束时正好落在
-// 最终回复上）；用户气泡不加
+// 最终回复上）；用户气泡不加。
+// ⚠️ 迁移必须以"持有者真正变化"为条件：renderTextPart 在每个部件事件和每次
+// 轮询都会进来，若无条件增删 DOM，行高反复变化 + 滚动对齐 = 页面一抖一抖。
+let actionsHolder = null;
 function ensureMsgActions(m) {
   if (m.el.classList.contains('user')) return;
-  for (const r of chat.querySelectorAll('.msg > .msgacts')) {
-    if (r.parentElement !== m.el) r.remove();
-  }
-  if (m.el.querySelector(':scope > .msgacts')) return;
+  if (actionsHolder === m && m.el.querySelector(':scope > .msgacts')) return;
+  for (const r of chat.querySelectorAll('.msg > .msgacts')) r.remove();
+  actionsHolder = m;
   const mkBtn = (label, icon, fn) => {
     const b = el('button'); b.innerHTML = icon + `<span>${label}</span>`;
     b.addEventListener('click', (ev) => { ev.stopPropagation(); fn(); });
@@ -1659,6 +1700,7 @@ function renderHistory(messages, opts = {}) {
           // 工具的 Write/Edit 目标文件 → chip
           const fp = st?.input?.file_path ?? st?.input?.filePath ?? st?.input?.path;
           if (fp) fileChip(card.body, String(fp));
+          if (fp && status === 'completed') addTurnArtifact(String(fp));
           break;
         }
         default: break;
@@ -2097,6 +2139,7 @@ function handleZcodeEvent(ev) {
         const s = JSON.stringify(p.result ?? {});
         const fp = s.match(/"(?:file_path|filePath|path)":"([^"]+)"/);
         if (fp) fileChip(toolEls.get(id)?.body ?? chat, fp[1]);
+        if (fp) addTurnArtifact(fp[1]);
       }
       if (p.kind === 'error') setToolStatus(id, 'error', undefined, p.error ? JSON.stringify(p.error, null, 1) : undefined);
       break;
@@ -2275,7 +2318,7 @@ function streamRich(pe, text) {
     richTimers.delete(pe);
     const t = pe.__pending;
     pe.__pending = null;
-    if (t != null && pe.el.isConnected) { pe.el.textContent = ''; richText(pe.el, t); }
+    if (t != null && pe.el.isConnected) { pe.el.textContent = ''; richText(pe.el, t); scrollBottom(); }
   }, 60));
 }
 function flushStreamRich(pe) {
@@ -2444,6 +2487,7 @@ function renderTail(messages) {
           setToolStatus(part.callId, status, undefined, detail);
           const fp = st?.input?.file_path ?? st?.input?.filePath ?? st?.input?.path;
           if (fp) fileChip(card.body, String(fp));
+          if (fp && status === 'completed') addTurnArtifact(String(fp));
           changed = true;
           break;
         }
