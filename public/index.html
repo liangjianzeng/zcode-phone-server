@@ -770,8 +770,10 @@ function mdBlocks(container, seg) {
 function richText(container, text) {
   const parts = String(text).split(/```/);
   parts.forEach((seg, i) => {
-    if (i % 2 === 1) { // 代码块：首行语言名丢弃
+    if (i % 2 === 1) { // 代码块：首行语言名 → pre.language-xxx（App 代码查看器按此识别语言）
+      const lang = (seg.match(/^[a-zA-Z0-9_+-]*/) ?? [''])[0];
       const pre = el('pre');
+      if (lang) pre.className = 'language-' + lang;
       pre.textContent = seg.replace(/^[a-zA-Z0-9_+-]*\n/, '');
       container.appendChild(pre);
     } else {
@@ -1213,6 +1215,7 @@ function addTurnArtifact(p) {
 
 let lastTurnFailed = false; // turn.failed 置位：失败回合不画"本轮结束"线（红字 errline 就是终点）
 function setBusy(on) {
+  const wasBusy = busy; // 回合边界判定：false→true 才是新回合（多个置 busy 路径都先改 busySince，不能拿它当边界）
   busy = on;
   const status = $('turnStatus');
   status.classList.toggle('on', on);
@@ -1237,7 +1240,8 @@ function setBusy(on) {
     spinRow.remove();
   }
   if (on) {
-    if (!busySince) { busySince = Date.now(); turnArtifacts.clear(); } // 新回合：清空产出收集
+    if (!busySince) busySince = Date.now();
+    if (!wasBusy) turnArtifacts.clear(); // 新回合开始（false→true 才是边界）：产出只收集当轮，不跨回合积累
     tickElapsed();
     if (!elapsedTimer) elapsedTimer = setInterval(tickElapsed, 1000);
   } else {
@@ -1250,6 +1254,8 @@ function setBusy(on) {
       const docs = []; const code = [];
       for (const p of turnArtifacts.keys()) (DOC_ARTIFACT_RE.test(p) ? docs : code).push(p);
       if (docs.length || code.length) {
+        // 产出卡只保留当轮一份：新卡渲染前移除旧回合的卡（不跨回合积累）
+        for (const old of chat.querySelectorAll('.turnarts')) old.remove();
         const card = el('div', 'turnarts');
         card.appendChild(el('div', 'tt', `📦 本轮产出${docs.length ? ` · ${docs.length} 个文档/成果` : ''}`));
         const chips = el('div', 'chips');
@@ -1316,11 +1322,12 @@ function fileChip(container, p) {
   const b = el('button', 'fileMention', name);
   b.setAttribute('title', p);
   b.addEventListener('click', (ev) => {
-    ev.stopPropagation();
-    // App 内：原生成果桥（artifactBridgeJs）会在文档级接管本点击，打开
-    // 查看器/下载流程；本监听在 target 阶段先于桥触发，此前只会弹 toast，
-    // 看起来像"点了没反应"。浏览器环境降级为复制完整路径。
+    // App 内：原生成果桥（artifactBridgeJs）在 document 冒泡阶段接管本点击
+    // （按后缀分流查看器/下载页）。绝不能 stopPropagation——那会拦死桥，
+    // chip 点击就"没有任何反应"。
     if (window.__dshArtifactBridge) return;
+    ev.stopPropagation();
+    // 浏览器环境降级为复制完整路径
     const fallback = () => toast(`文件：${p}`);
     try {
       navigator.clipboard.writeText(p).then(() => toast(`路径已复制：${p}`), fallback);
@@ -1365,13 +1372,7 @@ function collectMsgText(m) {
 // ① 只有持有者真正变化才动 DOM；② 轮询会反复带着"旧消息"进来，非最新
 // 消息一律不迁移——否则操作行在 10 条消息间被反复搬动。
 let actionsHolder = null;
-function ensureMsgActions(m) {
-  if (m.el.classList.contains('user')) return;
-  if (actionsHolder === m && m.el.querySelector(':scope > .msgacts')) return;
-  const msgs = chat.querySelectorAll('.msg');
-  if (!msgs.length || msgs[msgs.length - 1] !== m.el) return;
-  for (const r of chat.querySelectorAll('.msg > .msgacts')) r.remove();
-  actionsHolder = m;
+function buildMsgActionsRow(m) {
   const mkBtn = (label, icon, fn) => {
     const b = el('button'); b.innerHTML = icon + `<span>${label}</span>`;
     b.addEventListener('click', (ev) => { ev.stopPropagation(); fn(); });
@@ -1390,7 +1391,28 @@ function ensureMsgActions(m) {
       shareOrCopy(t);
     }),
   );
-  m.el.appendChild(row);
+  return row;
+}
+function ensureMsgActions(m) {
+  if (m.el.classList.contains('user')) return;
+  // 按钮位置 = 紧跟"最后一段正文"之后（挨着复制对象的底部）：
+  // 思考/工具行即使 DOM 顺序在其后，也不把按钮顶得远离正文
+  const texts = [...m.partEls.values()].filter((v) => v.kind === 'text' && v.el?.isConnected);
+  const lastText = texts[texts.length - 1];
+  if (!lastText) return;
+  let row = (m.el.querySelector('.msgacts')) || null;
+  if (actionsHolder === m && row) {
+    // 已是持有者：仅当出现了更新的正文段才搬动（未变化不动 DOM，防抖）
+    if (row.previousElementSibling !== lastText.el) lastText.el.after(row);
+    return;
+  }
+  const msgs = chat.querySelectorAll('.msg');
+  if (!msgs.length || msgs[msgs.length - 1] !== m.el) return;
+  for (const r of chat.querySelectorAll('.msgacts')) {
+    if (r !== row) r.remove();
+  }
+  actionsHolder = m;
+  lastText.el.after(row || buildMsgActionsRow(m));
 }
 
 function renderTextPart(m, partId, text) {
