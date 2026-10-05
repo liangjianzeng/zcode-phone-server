@@ -1,5 +1,7 @@
 # zcode-phone-server
 
+> **当前版本：v0.0.1**（版本号见 `VERSION`，与 git tag 同步）
+
 ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Protocol stdio 协议），
 封装成 token 鉴权的 HTTP/SSE 服务，并自带一套移动优先的聊天 Web 页面，
 供 DSH-Phone 的 **Zcode 模式** 经 SSH 隧道访问。
