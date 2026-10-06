@@ -469,6 +469,21 @@
     padding: 8px 16px; border-radius: 999px; z-index: 50; font-size: 13px; display: none;
     max-width: 86vw; text-align: center;
   }
+  /* 会话切换过渡层：点击会话到历史渲染完成之间的即时反馈
+     （POST /api/sessions 挂载会话+拉全量历史可能数秒，没有这层就是"点了没反应"）。
+     z-index 30：盖住抽屉(20)，低于 toast(50) 与弹层(40+)。 */
+  #switching {
+    position: fixed; inset: 0; z-index: 30; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(0,0,0,.45); backdrop-filter: blur(2px);
+  }
+  #switching.on { display: flex; }
+  #switching .card {
+    background: var(--card); border: 1px solid var(--line); color: var(--fg);
+    border-radius: 14px; padding: 14px 22px; font-size: 14px;
+    display: flex; align-items: center; gap: 10px; max-width: 86vw;
+  }
+  #switching .card .ic { color: var(--dim); flex: none; }
 
   /* spinner 通用 */
   .spin { animation: rot 1s linear infinite; }
@@ -585,6 +600,11 @@
 <!-- 会话行操作单（打开 / 归档或恢复 / 删除），锚定在 ⋯ 按钮旁 -->
 <div id="sessPop" class="smore-pop"></div>
 <div id="toast" class="toast"></div>
+<!-- 会话切换过渡层：openSession 进行中的即时反馈（点击即出现，历史渲染完成消失） -->
+<div id="switching"><div class="card">
+  <svg class="ic sm spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 3a9 9 0 1 1-9 9"/></svg>
+  <span id="switchingText"></span>
+</div></div>
 
 <script>
 'use strict';
@@ -636,10 +656,22 @@ function showAttachChip() {
 function clearAttach() { pendingImage = null; showAttachChip(); }
 
 // ── App 注入函数：新版显式契约 window.__zcode + 旧版 DSH 命名兼容（当前已装 APK 即用）──
-window.__dshComposerBridge = {
+// ⚠️ 必须用 defineProperty(writable:false) 挂到 window：App 每次页面加载完成都会
+// 无条件注入 DSH 通用版同名桥（photoBridgeJs/composerBridgeJs，裸赋值覆盖）。
+// 通用版拍照走"document 合成 drop"——DSH 页面有 drop 监听而本页没有，覆盖后
+// 拍照/传图/上传注入全部无声失效（桥还返回 {ok:true}，App 侧不报错）。
+// 非可写属性让那次赋值静默失败，页面原生实现始终胜出（App 零改动，后台统一适配）。
+const composerBridgeImpl = {
+  // 语义对齐 DSH 版：在光标处插入（保留已输入草稿），不整体替换
   insertText(text) {
-    composer.value = String(text ?? '');
+    const t = String(text ?? '');
+    const start = composer.selectionStart ?? composer.value.length;
+    const end = composer.selectionEnd ?? composer.value.length;
+    composer.value = composer.value.slice(0, start) + t + composer.value.slice(end);
+    const pos = start + t.length;
+    try { composer.setSelectionRange(pos, pos); } catch { /* 忽略 */ }
     composer.dispatchEvent(new Event('input'));
+    composer.focus();
     return { ok: true };
   },
   async send() {
@@ -648,13 +680,20 @@ window.__dshComposerBridge = {
     return { ok: true, via: 'zcode' };
   },
 };
-window.__dshPhotoBridge = {
+const photoBridgeImpl = {
   pickImage(base64, name, mime) {
     pendingImage = { base64: String(base64 ?? ''), name: String(name ?? 'image.png'), mime: String(mime ?? 'image/png') };
     showAttachChip();
     return { ok: true };
   },
 };
+function pinBridge(name, impl) {
+  try {
+    Object.defineProperty(window, name, { value: impl, writable: false, configurable: false });
+  } catch { window[name] = impl; }
+}
+pinBridge('__dshComposerBridge', composerBridgeImpl);
+pinBridge('__dshPhotoBridge', photoBridgeImpl);
 window.__zcode = {
   version: 2,
   insert(text) { return window.__dshComposerBridge.insertText(text); },
@@ -2912,6 +2951,18 @@ $('fileInput').addEventListener('change', async (e) => {
   e.target.value = '';
   handleFilePicked(f);
 });
+// 拖拽文件统一入口：桌面浏览器拖文件进窗口、DSH 通用拍照桥的 document 合成
+// drop（App 侧注入 base64→File→drop），都路由到待发附件槽。纯文本拖拽不拦截，
+// 保留 textarea 原生的拖字插入行为。
+document.addEventListener('dragover', (e) => {
+  if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) e.preventDefault();
+});
+document.addEventListener('drop', (e) => {
+  const f = e.dataTransfer?.files?.[0];
+  if (!f) return;
+  e.preventDefault();
+  handleFilePicked(f);
+});
 $('btnInfoClose').addEventListener('click', () => $('info').classList.remove('open'));
 $('info').addEventListener('click', (e) => { if (e.target.id === 'info') $('info').classList.remove('open'); });
 // 侧栏功能按钮：新会话 / 插件 / 计划（原溢出菜单已并入左侧边栏，直接铺开少一次点击）
@@ -3145,8 +3196,27 @@ function setSessionTitle(t) {
 
 let openSeq = 0; // openSession 代际号：引擎 resume 可达分钟级，快速切换会话时
                  // 慢响应后到会把别的会话的消息渲染进来（串台），过期结果直接丢弃
+// ── 会话切换过渡：点击即给反馈 ──
+// openSession 的 POST /api/sessions 要挂载会话 + 拉全量历史，可能数秒；
+// 没有过渡层时抽屉停在原地，用户以为"点了没反应"。
+// openSeq 防串台纪律：只有最新一次 openSession 负责过渡层的展示与收起。
+const switchingEl = $('switching');
+const switchingText = $('switchingText');
+function showSwitching(text) {
+  switchingText.textContent = text;
+  switchingEl.classList.add('on');
+}
+function hideSwitching() {
+  switchingEl.classList.remove('on');
+}
+
 async function openSession(sessionId, wsPath) {
   const mySeq = ++openSeq;
+  // 即时反馈：收抽屉/弹层 + 显示过渡层（成功失败都会收起，见下）
+  const drawerWasOpen = $('drawer').classList.contains('open');
+  $('drawer').classList.remove('open');
+  closePops();
+  showSwitching(sessionId ? '切换会话…' : '创建新会话…');
   try {
     // 打开已有会话：不传 workspace（引擎沿用会话自身所属项目，避免改绑）；
     // 新会话：落点为指定项目/当前项目。
@@ -3205,12 +3275,14 @@ async function openSession(sessionId, wsPath) {
     refreshQueue(curSession); // 排队消息（预备任务）随会话对齐
     curTodos = []; todoOpen = false; renderTodoBar(); refreshTodos(); // 任务计划随会话对齐
     queueEditId = null; // 编辑取回的原条目属于旧会话：清空替换追踪
-    $('drawer').classList.remove('open');
+    hideSwitching(); // 历史已渲染：过渡层在此收起（同帧呈现新会话内容）
     if (sessionId) toast('已恢复会话');
     renderProjectList();
     loadAllSessions();
     loadPlan();
   } catch (e) {
+    if (mySeq !== openSeq) return; // 已被更新的打开请求接管：UI 由它负责
+    hideSwitching();
     const msg = String(e?.message ?? e);
     // 会话已不存在（被清理/数据库重置）：清掉失效记忆并自动切换到其他会话，
     // 否则轮询会在这个死会话上 1.2s 一次无限打转（2026-10-04 实测）
@@ -3224,6 +3296,8 @@ async function openSession(sessionId, wsPath) {
         return;
       }
     }
+    // 打开失败：恢复抽屉让用户另选（过渡层已收起）
+    if (drawerWasOpen) $('drawer').classList.add('open');
     toast(`打开会话失败：${msg}`);
   }
 }
