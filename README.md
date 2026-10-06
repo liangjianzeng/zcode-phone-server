@@ -97,7 +97,7 @@ http://127.0.0.1:8787/?token=<token>
 | `POST /api/autoAnswer` | 运行时切换 autoAnswer |
 | `GET/POST /api/plugins`、`/api/plugins/setEnabled` | 插件列表 / 启停 |
 | `GET /api/skills`、`/api/workflows` | 技能 / 工作流（项目 + 全局合并） |
-| `GET /api/plan`、`/api/usage-stats` | 订阅计划 / 模型用量统计 |
+| `GET /api/plan` | 订阅计划 + 当前套餐余额（z.ai billing/balance 的 remaining/total） |
 
 ## 事件流（SSE `zcode` 事件）
 

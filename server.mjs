@@ -778,8 +778,15 @@ function persistModelConfig(sel) {
   saveConfig(config);
 }
 
-function workspaceRef(overridePath) {
-  // 本地 workspace：workspaceKey = workspacePath（bootstrap/zcode-protocol/workspace.ts 约定）。
+/**
+ * 每会话缓存最近一次 create/resume 快照的投影设置。
+ * session/read 返回的 model.available 是残缺投影（实测只剩当前 1 个模型，
+ * 2026-10-06），而 create/resume 快照带完整模型目录（官方 + 本地 personal）。
+ * /settings 路由用此缓存把 available 补齐，否则页面模型菜单只剩当前模型。
+ */
+const resumeSettingsCache = new Map();
+
+function workspaceRef(overridePath) {  // 本地 workspace：workspaceKey = workspacePath（bootstrap/zcode-protocol/workspace.ts 约定）。
   // overridePath：切换项目时由请求显式指定。允许：主工作区、config.workspaces 白名单、
   // 以及会话存储里出现过 knownWorkspaces（官方 PC 可打开任意历史项目，语义一致）。
   const requested = String(overridePath ?? '').trim();
@@ -1068,6 +1075,19 @@ function zaiBillingRequest(pathAndQuery, { method = 'GET', body } = {}) {
       headers: {
         authorization: `Bearer ${key}`,
         accept: 'application/json',
+        // zcode-plan 端点（尤其 billing/balance）校验桌面端公共源标识头，
+        // 缺了报 3001 parameter error（2026-10-06 实测）；字段名对照桌面端
+        // buildZCodeSourceHeadersFromContext
+        'user-agent': 'ZCode/3.14.4',
+        'http-referer': 'https://zcode.z.ai',
+        'x-title': 'Z Code@electron',
+        'x-zcode-app-version': '3.14.4',
+        'x-platform': `win32-${os.arch()}`,
+        'x-client-language': 'zh-CN',
+        'x-client-timezone': Intl.DateTimeFormat().resolvedOptions().timeZone,
+        'x-os-category': 'windows',
+        'x-os-version': os.release(),
+        'x-device-mid': crypto.randomUUID(),
         ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}),
       },
     }, (res) => {
@@ -1092,6 +1112,32 @@ async function fetchPlanOverview() {
   if (j.code !== 0) throw new Error(`billing/current code=${j.code} ${j.msg ?? ''}`.slice(0, 160));
   planOverviewCache = { at: Date.now(), data: j.data ?? {} };
   return planOverviewCache.data;
+}
+
+/**
+ * 套餐余额（billing/balance：每个额度桶的 total/used/remaining_units，
+ * 即"当前套餐余额"的权威来源；与 billing/current 的 grant 总额分开缓存 60 秒——
+ * 余额随推理实时变化，缓存过久会误导）。
+ * 响应结构对照桌面端 readZaiStartPlanBalances：data.balances[]。
+ */
+let planBalanceCache = { at: 0, data: null };
+async function fetchPlanBalances() {
+  if (planBalanceCache.data && Date.now() - planBalanceCache.at < 60000) return planBalanceCache.data;
+  const r = await zaiBillingRequest('/api/v1/zcode-plan/billing/balance?app_version=3.14.4');
+  if (r.status !== 200) throw new Error(`billing/balance ${r.status}: ${r.body.slice(0, 120)}`);
+  const j = JSON.parse(r.body);
+  if (j.code !== 0) throw new Error(`billing/balance code=${j.code} ${j.msg ?? ''}`.slice(0, 160));
+  const balances = (j.data?.balances ?? [])
+    .map((b) => ({
+      showName: b.show_name ?? '',
+      totalUnits: Number(b.total_units ?? 0),
+      usedUnits: Number(b.used_units ?? 0),
+      remainingUnits: Number(b.remaining_units ?? 0),
+      unitType: b.unit_type ?? '',
+    }))
+    .filter((b) => b.totalUnits > 0 || b.usedUnits > 0);
+  planBalanceCache = { at: Date.now(), data: balances };
+  return balances;
 }
 
 /**
@@ -1318,6 +1364,9 @@ async function sessionLooksFinished(sid) {
     }
     if (!sid) throw new Error('session/create 未返回 sessionId');
     sessionState(sid);
+    // 缓存 create/resume 快照的投影：session/read 的 available 残缺（只剩当前
+    // 模型），/settings 路由要用这份完整目录补齐（本地 personal 模型全靠它）
+    resumeSettingsCache.set(sid, projectSettings(snap, sid));
     // 订阅事件流（legacy 通道：subscribe 后才有 session/event 推送）
     await agent.request('session/subscribe', { sessionId: sid, deliveryKind: 'desktop-continuous', includeSnapshot: false });
     // 显式落一次模型选择：create 的 model 参数不保证写入会话运行时（turn 期校验用的是会话选择）。
@@ -1544,6 +1593,13 @@ async function sessionLooksFinished(sid) {
       try {
         const r = await agent.request('session/read', { sessionId: sid, messageLimit: 1 });
         const ps = projectSettings(r ?? {}, sid);
+        // session/read 的 model.available 只投影当前模型（残缺）：
+        // 用最近一次 create/resume 快照的完整目录补齐，current 以 read 的为准（实时）
+        const cached = resumeSettingsCache.get(sid);
+        const readAvail = ps.model?.available ?? [];
+        if (cached?.model?.available && readAvail.length < cached.model.available.length) {
+          ps.model.available = cached.model.available;
+        }
         return sendJson(res, 200, ps);
       } catch (e) {
         // 会话不在本进程激活（引擎重启后未 resume）：模型/档位拿不到，但
@@ -1572,8 +1628,16 @@ async function sessionLooksFinished(sid) {
       const providerId = String(body.providerId ?? '').trim();
       const modelId = String(body.modelId ?? '').trim();
       if (!providerId || !modelId) return sendJson(res, 400, { error: 'providerId / modelId 必填' });
+      // 页面未带档位时，用目标模型自己的默认档位（resume 快照缓存里有）。
+      // 不能拿全局 config.model 的档位兜底——那是另一个模型的档位，
+      // 套到不支持的模型上引擎直接报 "Reasoning effort X is not supported"。
+      const cfgSel = parseModelSelection(config.model);
+      const targetMeta = (resumeSettingsCache.get(sid)?.model?.available ?? [])
+        .find((o) => o.providerId === providerId && o.modelId === modelId);
       const reasoningLevel = String(body.reasoningLevel ?? '').trim()
-        || parseModelSelection(config.model)?.options?.reasoningLevel
+        || targetMeta?.defaultReasoningLevel
+        || (cfgSel?.providerId === providerId && cfgSel?.modelId === modelId
+          ? cfgSel?.options?.reasoningLevel : '')
         || '';
       const model = reasoningLevel
         ? { providerId, modelId, options: { reasoningLevel } }
@@ -1685,10 +1749,13 @@ async function sessionLooksFinished(sid) {
     }
   }
 
-  // 套餐概览（z.ai billing/current：套餐名/状态/额度/有效期；5 分钟缓存）
+  // 套餐概览 + 当前余额（billing/current 套餐名/有效期 + billing/balance 剩余额度）
   if (req.method === 'GET' && p === '/api/plan') {
     try {
       const d = await fetchPlanOverview();
+      // 余额接口失败不阻断套餐概览（balancesError 一并返回，前端降级显示 grant 总额）
+      let balances = [], balancesError = '';
+      try { balances = await fetchPlanBalances(); } catch (e) { balancesError = String(e?.message ?? e).slice(0, 200); }
       const plans = (d.plans ?? []).map((pl) => ({
         name: pl.name ?? '',
         planId: pl.plan_id ?? '',
@@ -1702,27 +1769,7 @@ async function sessionLooksFinished(sid) {
           period: en.period ?? '',
         })),
       }));
-      return sendJson(res, 200, { plans });
-    } catch (e) {
-      return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
-    }
-  }
-
-  // 本机用量统计（agent-db，与桌面端共用同一 sqlite：含桌面端驱动的会话）
-  if (req.method === 'GET' && p === '/api/usage-stats') {
-    const range = ['all', '7d', '30d'].includes(url.searchParams.get('range')) ? url.searchParams.get('range') : '7d';
-    try {
-      const r = await agent.request('usage/stats', { range });
-      const s = r?.summary ?? {};
-      return sendJson(res, 200, {
-        range: r?.range ?? range,
-        totalTokens: s.totalTokens ?? 0,
-        inputTokens: s.inputTokens ?? 0,
-        outputTokens: s.outputTokens ?? 0,
-        cacheReadTokens: s.cacheReadTokens ?? 0,
-        totalSessions: s.totalSessions ?? 0,
-        totalTurns: s.totalTurns ?? 0,
-      });
+      return sendJson(res, 200, { plans, balances, ...(balancesError ? { balancesError } : {}) });
     } catch (e) {
       return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
     }

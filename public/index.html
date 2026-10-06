@@ -443,6 +443,8 @@
   .mrow .mt .d { color: var(--faint); font-size: 11.5px; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mrow .mck { color: var(--fg); flex: none; display: flex; }
   .mrow.disabled { opacity: .45; }
+  /* 模型菜单紧凑行：条目多（官方+本地），行距收小、单行更密 */
+  .mrow.compact { padding: 5px 10px; }
 
   /* ── 上下文容量卡（对照官方：总量 + 百分比 + 渐变进度条 + 分类占比）── */
   .ctxcard { margin: 10px 12px 4px; border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; background: var(--card); }
@@ -612,7 +614,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-04.22';
+const PAGE_BUILD = '2026-10-06.23';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -962,7 +964,7 @@ function closePops() {
 }
 
 function popRow(opt) {
-  const b = el('button', 'mrow' + (opt.disabled ? ' disabled' : ''));
+  const b = el('button', 'mrow' + (opt.cls ? ' ' + opt.cls : '') + (opt.disabled ? ' disabled' : ''));
   if (opt.icon) { const i = el('span', 'mi'); i.innerHTML = opt.icon; b.appendChild(i); }
   const mt = el('div', 'mt');
   mt.appendChild(el('div', 't', opt.title));
@@ -979,17 +981,21 @@ function popRow(opt) {
 }
 
 // 在锚点按钮上方弹出（超出屏高则贴底）；再点一次收起
+function placePop(pop, anchor) {
+  const r = anchor.getBoundingClientRect();
+  const pw = pop.offsetWidth, ph = pop.offsetHeight;
+  pop.style.left = Math.min(Math.max(8, r.left), window.innerWidth - pw - 8) + 'px';
+  pop.style.top = 'auto';
+  pop.style.bottom = Math.min(window.innerHeight - r.top + 8, Math.max(8, window.innerHeight - ph - 8)) + 'px';
+}
+
 function togglePop(pop, anchor, render) {
   const wasOpen = pop.classList.contains('open');
   closePops();
   if (wasOpen) return;
   render?.();
   pop.classList.add('open');
-  const r = anchor.getBoundingClientRect();
-  const pw = pop.offsetWidth, ph = pop.offsetHeight;
-  pop.style.left = Math.min(Math.max(8, r.left), window.innerWidth - pw - 8) + 'px';
-  pop.style.top = 'auto';
-  pop.style.bottom = Math.min(window.innerHeight - r.top + 8, Math.max(8, window.innerHeight - ph - 8)) + 'px';
+  placePop(pop, anchor);
 }
 
 document.addEventListener('click', (e) => {
@@ -1047,7 +1053,7 @@ function renderModelMenu() {
       icon: SVG.model,
       title: o.label || o.modelId,
       desc: o.disabledReason || o.providerLabel || o.description || '',
-      trailing: o.reasoningLevels?.length ? `${o.reasoningLevels.length} 档` : '',
+      cls: 'compact',
       checked: currentModelKey(o) === curKey,
       disabled: !!o.disabledReason,
       onClick: () => pickModel(o),
@@ -1897,21 +1903,20 @@ function openInfo(title, loader) {
 
 // 用量/上下文容量面板（对照官方：容量大卡 + 分类占比 + 统计 + 压缩入口）
 // 上下文/套餐弹卡（审批卡风格，锚在模型旁圆圈上方）：
-// 上下文容量（KV 占用）+ 账户套餐额度 + 本机统计。不开侧栏抽屉。
+// 上下文容量（KV 占用）+ 账户套餐当前余额。不开侧栏抽屉。
 // 打开/关闭由通用 togglePop（btnCtx）负责；这里只负责渲染内容。
 async function loadUsage(silent = false) {
   const pop = $('ctxPop');
   if (silent && !pop.classList.contains('open')) return;
   if (!silent) { pop.textContent = ''; pop.appendChild(el('div', 'sysline', '加载中…')); }
-  let settings = null, goal = null, plan = null, stats = null;
+  let settings = null, goal = null, plan = null;
   try { settings = curSession ? await api(`sessions/${encodeURIComponent(curSession)}/settings`) : null; } catch { /* 降级 */ }
   // projection 为 0（会话未在本进程激活过）时，goal 快照的 contextUsed 是更可靠来源
   if (!settings?.projection?.contextUsed) {
     try { goal = curSession ? await api(`sessions/${encodeURIComponent(curSession)}/goal`) : null; } catch { /* 降级 */ }
   }
-  // 套餐（z.ai billing：套餐名/额度/有效期）+ 本机统计（与桌面端共用）
+  // 套餐 + 当前余额（z.ai 计费接口，真实数据）
   try { plan = await api('plan'); } catch { /* 降级 */ }
-  try { stats = await api('usage-stats?range=7d'); } catch { /* 降级 */ }
   if (settings && !settings.unavailable) { sessionSettings = settings; syncComposerChrome(); }
   // 回来了弹卡已关（用户点了别处）：不重绘
   if (!pop.classList.contains('open')) return;
@@ -1946,10 +1951,34 @@ async function loadUsage(silent = false) {
   } else {
     pop.appendChild(el('div', 'sub', '暂无数据（回合开始后统计）'));
   }
-  // ── 账户套餐（额度来自 z.ai 计费接口，真实数据）──
+  // ── 账户套餐当前余额（billing/balance 的 remaining/total，随推理实时变化）──
   pop.appendChild(el('div', 's2', '账户套餐'));
+  const balances = plan?.balances ?? [];
   const plans = plan?.plans ?? [];
-  if (plans.length) {
+  if (balances.length) {
+    const sumRem = balances.reduce((a, b) => a + b.remainingUnits, 0);
+    const sumTot = balances.reduce((a, b) => a + b.totalUnits, 0);
+    const sumUsed = balances.reduce((a, b) => a + b.usedUnits, 0);
+    const unit = balances[0].unitType === 'token' ? 'tokens' : (balances[0].unitType || 'tokens');
+    const big = el('div', '', `${fmtWan(sumRem)} / ${fmtWan(sumTot)}`);
+    big.className = 'bignum';
+    pop.appendChild(big);
+    const pct = sumTot > 0 ? Math.min(100, Math.round((sumUsed / sumTot) * 100)) : 0;
+    pop.appendChild(el('div', 'sub', `剩余 ${unit} · 已用 ${pct}%`));
+    const bar = el('div', 'cbar');
+    const fill = el('div');
+    fill.style.width = pct + '%';
+    if (pct > 80) fill.style.background = 'linear-gradient(90deg, #f85149, #d29922)';
+    bar.appendChild(fill);
+    pop.appendChild(bar);
+    // 多个额度桶（如一次性礼包 + 周期额度）时逐桶列出
+    if (balances.length > 1) {
+      for (const b of balances) {
+        pop.appendChild(row(b.showName || '模型额度', `${fmtWan(b.remainingUnits)} / ${fmtWan(b.totalUnits)}`));
+      }
+    }
+  } else if (plans.length) {
+    // 余额接口无数据：降级显示 billing/current 的 grant 总额
     for (const pl of plans.filter((p) => p.status === 'active' || p.status)) {
       const nm = el('div', '', `${pl.name}${pl.status !== 'active' ? `（${pl.status}）` : ''}`);
       nm.className = 'bignum';
@@ -1959,23 +1988,15 @@ async function loadUsage(silent = false) {
           `${en.model || '模型额度'}${en.period === 'one_time' ? ' · 一次性' : ''}`,
           `${fmtWan(en.grantUnits)} ${en.unitType === 'token' ? 'tokens' : en.unitType}`));
       }
-      if (pl.endsAt > 0) {
-        const d = new Date(pl.endsAt * 1000);
-        pop.appendChild(row('有效期至', `${d.toLocaleDateString()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`));
-      }
     }
   } else {
-    pop.appendChild(el('div', 'sub', plan?.unavailable ? `套餐额度暂不可用：${plan.unavailable}` : '暂无套餐数据'));
+    pop.appendChild(el('div', 'sub', plan?.unavailable ? `套餐余额暂不可用：${plan.unavailable}` : '暂无套餐数据'));
   }
-  // ── 本机统计（引擎 sqlite 与桌面端共用：含桌面端驱动的用量）──
-  pop.appendChild(el('div', 's2', '近 7 天用量'));
-  if (stats && !stats.unavailable && (stats.totalTokens > 0 || stats.totalTurns > 0)) {
-    pop.appendChild(row('Token 总数（含缓存读取）', fmtWan(stats.totalTokens)));
-    pop.appendChild(row('输入 / 输出', `${fmtWan(stats.inputTokens)} / ${fmtWan(stats.outputTokens)}`));
-    pop.appendChild(row('缓存读取', fmtWan(stats.cacheReadTokens)));
-    pop.appendChild(row('会话 / 回合', `${stats.totalSessions} / ${stats.totalTurns}`));
-  } else {
-    pop.appendChild(el('div', 'sub', stats?.unavailable ? `暂不可用：${stats.unavailable}` : '近 7 天暂无用量'));
+  // 有效期（取 active 套餐最早的到期时间）
+  const activePlan = plans.find((p) => p.status === 'active') ?? plans[0];
+  if (activePlan?.endsAt > 0) {
+    const d = new Date(activePlan.endsAt * 1000);
+    pop.appendChild(row('有效期至', `${d.toLocaleDateString()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`));
   }
   // ── 压缩上下文入口 ──
   if (curSession) {
@@ -2943,7 +2964,26 @@ $('attachClear').addEventListener('click', clearAttach);
 // composer 底行：添加 / 权限模式 / 模型 / 思考档位（弹层锚定按钮上方）
 $('btnAdd').addEventListener('click', (e) => { e.stopPropagation(); togglePop($('addMenu'), e.currentTarget, renderAddMenu); });
 $('btnMode').addEventListener('click', (e) => { e.stopPropagation(); togglePop($('modeMenu'), e.currentTarget, renderModeMenu); });
-$('btnModel').addEventListener('click', (e) => { e.stopPropagation(); togglePop($('modelMenu'), e.currentTarget, renderModelMenu); });
+$('btnModel').addEventListener('click', (e) => {
+  e.stopPropagation();
+  togglePop($('modelMenu'), e.currentTarget, renderModelMenu);
+  refreshModelMenu(e.currentTarget);
+});
+
+// 模型目录随引擎/桌面端配置实时变化（桌面端新增/修改本地模型、引擎重启后
+// 旧快照不再可靠）：打开菜单时后台拉一次最新设置，回来后菜单仍开着就重绘。
+async function refreshModelMenu(anchor) {
+  if (!curSession) return;
+  try {
+    const s = await api(`sessions/${encodeURIComponent(curSession)}/settings`);
+    if (s && !s.unavailable) { sessionSettings = s; syncComposerChrome(); }
+  } catch { /* 拉取失败沿用缓存渲染 */ }
+  const pop = $('modelMenu');
+  if (pop.classList.contains('open')) {
+    renderModelMenu();
+    placePop(pop, anchor);
+  }
+}
 $('btnCtx').addEventListener('click', (e) => { e.stopPropagation(); togglePop($('ctxPop'), e.currentTarget, () => loadUsage(false)); });
 $('btnThink').addEventListener('click', (e) => { e.stopPropagation(); togglePop($('thinkMenu'), e.currentTarget, renderThinkMenu); });
 $('fileInput').addEventListener('change', async (e) => {
