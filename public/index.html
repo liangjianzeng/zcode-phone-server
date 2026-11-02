@@ -86,8 +86,10 @@
   #todoBar {
     position: sticky; top: 0; z-index: 4; display: none;
     margin: -4px -6px 8px; padding: 8px 10px;
-    background: color-mix(in srgb, var(--panel) 88%, transparent);
-    backdrop-filter: blur(8px);
+    /* 必须完全不透明：安卓 WebView 大多不支持 backdrop-filter，磨砂失效后
+       半透明底会让滚动经过的正文渗出来，视觉上就是"文字被夹断/错位"。
+       （曾用 88% 透明 + blur 的毛玻璃方案，实测渗字，2026-11-03 改实底） */
+    background: var(--panel);
     border: 1px solid var(--line); border-radius: 12px;
     cursor: pointer;
   }
@@ -112,7 +114,10 @@
   #todoBar .ti .mk.done { color: var(--ok); }
 
   /* ── 消息流 ── */
-  main { flex: 1; min-width: 0; overflow-y: auto; padding: calc(14px + env(safe-area-inset-top)) 16px 10px; scroll-behavior: smooth; }
+  /* 不用 scroll-behavior:smooth：流式输出时 scrollBottom 每帧都设新目标，
+     平滑动画被反复打断 = 滚动永远追不上内容增长，消息区抖动、内容错位观感。
+     移动端聊天页标准做法是即时滚动（官方桌面版同款）。 */
+  main { flex: 1; min-width: 0; overflow-y: auto; padding: calc(14px + env(safe-area-inset-top)) 16px 10px; }
   .hero { display: flex; flex-direction: column; align-items: center; gap: 10px; margin: 16vh auto 0; color: var(--dim); }
   .hero .bigz {
     width: 60px; height: 60px; border-radius: 18px;
@@ -373,6 +378,14 @@
   .wsrow.cur .dot { background: var(--ok); }
   .wsrow .p { color: var(--faint); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .wsrow .mi { color: var(--dim); display: flex; flex: none; }
+  /* 项目行内「＋」：一键把新会话建到该项目（新建会话不再落地不明项目） */
+  .wsrow .wsadd {
+    flex: none; width: 26px; height: 26px; margin-left: auto;
+    border-radius: 8px; border: none; background: transparent; color: var(--accent);
+    font: inherit; font-size: 15px; line-height: 1; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center; padding: 0;
+  }
+  .wsrow .wsadd:active { background: var(--card); }
   /* 会话行：官方单行布局 —— [✳运行中?] 标题 …… 相对时间，整体随项目缩进 */
   .sess { display: flex; align-items: center; gap: 8px; margin-left: 18px; }
   .sess .t { flex: 1; min-width: 0; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -502,6 +515,7 @@
 <div id="modelMenu" class="pop"></div>
 <div id="thinkMenu" class="pop"></div>
 <div id="themeMenu" class="pop"></div>
+<div id="newMenu" class="pop"></div>
 <input type="file" id="fileInput" style="display:none">
 
 <!-- 运行状态条：任务运行期间可见；哨兵词 span 仅在运行时存在（旧版 App 桥据此判定运行态） -->
@@ -614,7 +628,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-10-06.23';
+const PAGE_BUILD = '2026-11-03.5';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -1688,9 +1702,20 @@ function lastBusyMessage(messages) {
   return null;
 }
 
-// 尾部指纹：最后一条 assistant 消息的身份 + 末部件类型/状态/文本长度
+// 尾部指纹：最后一条"可见"消息（不限角色）的身份 + 末部件类型/状态/文本长度。
+// ⚠️ 必须包含 user 消息：桌面端发出的指令没有 SSE 事件（F2），只落共享库——
+// 指纹若只看 assistant，指令落库后 fp 不变、pollTick 早退，消息区永远不渲染它
+// （要等首个 assistant 部件落库才捎带出现；回合失败/无响应时干脆永不出现）。
+// 运行态判定（turnLooksFinished/turnLooksRunning）仍走 lastBusyMessage，不受影响。
+function lastVisibleMessage(messages) {
+  for (let i = (messages ?? []).length - 1; i >= 0; i--) {
+    if (isHiddenMessage(messages[i]?.info)) continue;
+    return messages[i];
+  }
+  return null;
+}
 function fingerprint(messages) {
-  const m = lastBusyMessage(messages ?? []);
+  const m = lastVisibleMessage(messages ?? []);
   const parts = m?.parts ?? [];
   const lp = parts.at(-1);
   return [
@@ -1752,9 +1777,12 @@ function renderTodoBar() {
   bar.querySelector('.thint').textContent = todoOpen ? '点击收起' : '点击展开';
   const cur = curTodos.find((t) => t.status === 'in_progress');
   const sum = cur ? `正在：${cur.content}` : (done === curTodos.length ? '全部完成' : '等待执行');
-  bar.querySelector('.tsum').textContent = sum;
-  bar.querySelector('.tsum').insertAdjacentHTML('beforeend',
-    ` <span class="tnum">${done}/${curTodos.length}</span>`);
+  // todo 内容是模型生成的文本：走 DOM 构造而非 innerHTML/insertAdjacentHTML
+  // （计数徽标同函数前几行用 textContent 的纪律保持一致，消除注入面）
+  const tsum = bar.querySelector('.tsum');
+  tsum.textContent = '';
+  tsum.appendChild(document.createTextNode(sum + ' '));
+  tsum.appendChild(el('span', 'tnum', `${done}/${curTodos.length}`));
   const box = bar.querySelector('.titems');
   box.textContent = '';
   for (const t of curTodos) {
@@ -1794,7 +1822,10 @@ function renderHistory(messages, opts = {}) {
   const vis = visibleMessages(messages);
   if (!vis.length) {
     const hero = el('div', 'hero');
-    hero.innerHTML = '<div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2">这个会话还没有消息</div>';
+    // 空会话标明所属项目空间：新会话首回合落库前抽屉里没有它的行，
+    // 这里是唯一能看出"这个会话属于哪个项目"的地方
+    hero.innerHTML = '<div class="bigz">Z</div><div class="t1">ZCode Phone</div>'
+      + '<div class="t2">这个会话还没有消息' + (curWs ? ' · 项目 ' + projName(curWs) : '') + '</div>';
     chat.appendChild(hero);
     return;
   }
@@ -2744,6 +2775,12 @@ async function pollTick() {
       startLiveTimers();
     }
     renderTail(msgs);
+    // 必须随 renderTail 推进指纹：此前只在 renderHistory 赋值，存储一旦变过，
+    // 后续每轮都落进"指纹变化"分支——「稳定 6 秒复位 / 静默 30s / 45s 兜底」
+    // 全在"无变化"分支里成了死代码。桌面驱动（inferred）回合收尾后
+    // 没有任何复位路径生效 → 永久转圈；lastActivity 还被每轮刷活，
+    // 静默判定永远不够阈值。回合结束落库即渲染完成，此后应视为"无变化"。
+    lastFingerprint = fp;
     // SSE 驱动的回合也可能断流：存储已收尾且流静默 30 秒 → 兜底复位
     if (busy && busySource === 'sse' && finished && Date.now() - lastSseEventAt > 30000) {
       busySource = null;
@@ -2959,7 +2996,8 @@ composer.addEventListener('input', () => {
 $('btnMenu').addEventListener('click', () => { loadAllSessions(); $('drawer').classList.add('open'); });
 $('btnClose').addEventListener('click', () => $('drawer').classList.remove('open'));
 $('drawer').addEventListener('click', (e) => { if (e.target.id === 'drawer') $('drawer').classList.remove('open'); });
-$('btnNew').addEventListener('click', () => openSession(null));
+// stopPropagation 必须加：document 的点击关闭弹层处理器会立刻关掉刚开的选择器
+$('btnNew').addEventListener('click', (e) => { e.stopPropagation(); newSessionFlow($('btnNew')); });
 $('attachClear').addEventListener('click', clearAttach);
 // composer 底行：添加 / 权限模式 / 模型 / 思考档位（弹层锚定按钮上方）
 $('btnAdd').addEventListener('click', (e) => { e.stopPropagation(); togglePop($('addMenu'), e.currentTarget, renderAddMenu); });
@@ -3006,7 +3044,7 @@ document.addEventListener('drop', (e) => {
 $('btnInfoClose').addEventListener('click', () => $('info').classList.remove('open'));
 $('info').addEventListener('click', (e) => { if (e.target.id === 'info') $('info').classList.remove('open'); });
 // 侧栏功能按钮：新会话 / 插件 / 计划（原溢出菜单已并入左侧边栏，直接铺开少一次点击）
-$('miNew').addEventListener('click', () => openSession(null));
+$('miNew').addEventListener('click', (e) => { e.stopPropagation(); newSessionFlow($('miNew')); });
 $('miPlugins').addEventListener('click', () => openInfo('⧩ 插件', loadPlugins));
 $('miPlan').addEventListener('click', () => openInfo('☰ 计划 / 上下文', loadPlan));
 
@@ -3090,6 +3128,17 @@ async function loadAllSessions() {
   renderProjectList();
 }
 
+// 侧栏自动刷新：loadAllSessions 只在开抽屉/打开会话/回合收尾这些事件点触发，
+// 桌面端驱动任务时无 SSE，手机侧栏的运行中标记与"刚刚/6分"时间会一直停在
+// 旧数据上。抽屉开着或有任务在跑时周期刷新（服务端列表有 5s 缓存、
+// 运行态判定有 3s 缓存，每 4s 一轮代价可控）；空闲且抽屉关着不打扰。
+setInterval(() => {
+  if (document.hidden) return; // WebView 后台定时器本就被挂起，显式跳过省请求
+  if ($('drawer').classList.contains('open') || busy || allSessions.some((s) => s.busy)) {
+    loadAllSessions();
+  }
+}, 4000);
+
 // 会话行操作单：锚定 ⋯ 按钮弹出（打开 / 归档或恢复 / 删除）
 function closeSessPop() { $('sessPop').classList.remove('open'); }
 function openSessPop(anchor, s) {
@@ -3135,7 +3184,10 @@ async function archiveSession(sid, archived) {
 }
 
 function sessRow(s, projectPath) {
-  const running = s.busy || s.status === 'running';
+  // 只信服务端核实过的 busy：它 = 桥内存标记 ∥ 共享库末部件判定。
+  // s.status 是引擎落库的静态值——桌面驱动回合结束不会回写（F2），
+  // 直接 OR 上去等于把服务端的僵尸 running 核实整个推翻，侧栏永久转圈
+  const running = !!s.busy;
   const item = el('div', 'sess' + (s.sessionId === curSession ? ' cur' : ''));
   if (running) {
     const sp = el('span', 'busy'); sp.innerHTML = SVG.spin; sp.title = '任务运行中'; item.appendChild(sp);
@@ -3176,7 +3228,13 @@ function renderProjectList() {
     const row = el('div', 'wsrow' + (isCur ? ' cur' : ''));
     const fi = el('span', 'mi'); fi.innerHTML = FOLDER_SVG; row.appendChild(fi);
     row.appendChild(el('div', '', projName(p)));
-    if (isCur) { const d = el('span', 'dot'); d.style.marginLeft = 'auto'; row.appendChild(d); }
+    // 项目行内「＋」：一键把新会话建到这个项目（此前"先点项目、再退出去点新会话"
+    // 全靠脑补，落错了项目无任何提示）
+    const add = el('button', 'wsadd', '＋');
+    add.title = '在此项目新建会话';
+    add.addEventListener('click', (ev) => { ev.stopPropagation(); openSession(null, p); });
+    row.appendChild(add);
+    if (isCur) { const d = el('span', 'dot'); row.appendChild(d); }
     row.addEventListener('click', () => switchWorkspace(p));
     box.appendChild(row);
     // 每个项目平铺最近 3 条会话，「显示更多」展开全量（官方交互）
@@ -3230,6 +3288,58 @@ async function loadWorkspaces() {
 
 // ── 会话管理 ──
 
+// ── 新建会话：先明确落点项目 ──
+// 此前「新会话」直接落到 curWs（localStorage 记忆值，错了服务端还静默回退到
+// 默认项目）——用户没机会选项目，建成后界面上也看不到属于哪个项目空间
+// （抽屉里要等首回合落库才出现这一条）。现在：多项目时先弹项目选择；
+// 建成后按服务端返回的真实落点提示并校正 curWs；空会话的 hero 也带项目名。
+function projectChoices() {
+  const seen = new Set(); const out = [];
+  // 同一项目可能以 E:\a 与 E:/a、带/不带尾分隔符等形态出现（config 与会话
+  // 记录来源不一）：分隔符方向归一 + 剥尾分隔符 + 忽略大小写去重
+  const clean = (p) => String(p ?? '').trim().replace(/\//g, '\\').replace(/\\{2,}/g, '\\').replace(/\\+$/, '');
+  const push = (p) => {
+    const path = clean(p);
+    if (!path) return;
+    const k = path.toLowerCase();
+    if (seen.has(k)) return;
+    seen.add(k); out.push(path);
+  };
+  push(curWs);
+  for (const s of allSessions) push(s.workspacePath);
+  for (const w of workspaces) push(w.path);
+  return out;
+}
+function renderNewSessionMenu(anchor) {
+  const pop = $('newMenu');
+  pop.textContent = '';
+  pop.appendChild(el('div', 'phead', '新会话建到哪个项目'));
+  const choices = projectChoices();
+  // 同名不同目录的项目（如 DTXY 与 .qwenpaw 下各有一个 TongYi-Lite）：
+  // 标题带父目录消歧，完整路径在副行——否则"选中了哪个"全靠猜
+  const baseCount = new Map();
+  for (const p of choices) {
+    const b = projName(p).toLowerCase();
+    baseCount.set(b, (baseCount.get(b) ?? 0) + 1);
+  }
+  for (const p of choices) {
+    const base = projName(p);
+    const dup = (baseCount.get(base.toLowerCase()) ?? 0) > 1;
+    const parent = p.replace(/[\\/]+$/, '').split(/[\\/]/).slice(-2)[0] ?? '';
+    const title = (dup && parent ? `${base} · ${parent}` : base) + (p === curWs ? '（当前）' : '');
+    pop.appendChild(popRow({
+      title,
+      desc: p,
+      onClick: () => { closePops(); openSession(null, p); },
+    }));
+  }
+}
+function newSessionFlow(anchor) {
+  const choices = projectChoices();
+  if (choices.length <= 1) { openSession(null, choices[0] ?? curWs); return; }
+  togglePop($('newMenu'), anchor, () => renderNewSessionMenu(anchor));
+}
+
 function setSessionTitle(t) {
   $('sessTitle').textContent = t || '未命名会话';
 }
@@ -3270,6 +3380,12 @@ async function openSession(sessionId, wsPath) {
     curSession = r.sessionId;
     // 记录本页面最后查看的会话：下次启动优先恢复它（连续性，见 boot）
     try { localStorage.setItem('zcode.lastSession', curSession); } catch { /* 忽略 */ }
+    // 项目归属以服务端返回的真实落点为准（新建时可能因白名单回退）：
+    // 校正 curWs，后续"新会话建到哪个项目"的选择器与提示都基于它
+    if (!sessionId && r.workspacePath) {
+      curWs = r.workspacePath;
+      try { localStorage.setItem('zcode.ws', curWs); } catch { /* 忽略 */ }
+    }
     // 计时基准全部按新会话重置，避免上一会话的静默/收尾状态串线
     lastSseEventAt = Date.now();
     lastActivity = Date.now();
@@ -3317,6 +3433,7 @@ async function openSession(sessionId, wsPath) {
     queueEditId = null; // 编辑取回的原条目属于旧会话：清空替换追踪
     hideSwitching(); // 历史已渲染：过渡层在此收起（同帧呈现新会话内容）
     if (sessionId) toast('已恢复会话');
+    else toast('新会话 · 项目：' + projName(curWs));
     renderProjectList();
     loadAllSessions();
     loadPlan();

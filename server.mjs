@@ -662,6 +662,36 @@ function dbArchiveSession(sid, archived) {
     .run(archived ? Date.now() : null, sid);
 }
 
+/**
+ * 归档会话列表：共享库直查。随包引擎（桌面版 3.14.4）的 session/list schema
+ * 没有 includeArchived（strict 校验报 Unrecognized key，2026-11-03 桥日志实测），
+ * 且不带参数时存储层就把归档过滤掉了——归档行在引擎通道上根本出不来，
+ * 手机侧栏"已归档"分组永远为空。侧栏归档行需要的字段（标题/时间/项目/归档态）
+ * session 表全有，直接按桌面版同源口径查库。
+ */
+function dbArchivedSessions() {
+  try {
+    if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
+    const rows = agentDbHandle.prepare(
+      'SELECT id, title, path, directory, time_updated, time_created FROM session ' +
+      "WHERE time_archived IS NOT NULL AND time_deleted IS NULL " +
+      "AND (task_type IS NULL OR task_type IN ('interactive','fork','workflow_parent')) " +
+      'ORDER BY time_updated DESC LIMIT 200'
+    ).all();
+    return rows.map((s) => ({
+      sessionId: String(s.id),
+      title: String(s.title ?? '').includes('\uFFFD') ? '' : s.title,
+      status: 'completed',
+      mode: '',
+      updatedAt: Number(s.time_updated ?? 0),
+      createdAt: Number(s.time_created ?? 0),
+      archived: true,
+      workspacePath: String(s.path ?? s.directory ?? ''),
+      busy: false,
+    }));
+  } catch { return []; }
+}
+
 // 删除会话：先关引擎内激活实例，再连带清所有 session 维度数据行（只删该会话）
 const SESSION_SCOPED_TABLES = [
   'part', 'message', 'todo', 'session_entry', 'session_input',
@@ -692,6 +722,56 @@ function dbSessionTodos(sid) {
       'SELECT content, status, priority, position FROM todo WHERE session_id = ? ORDER BY position'
     ).all(sid);
   } catch { return []; }
+}
+
+/**
+ * 会话运行态 + 真实活跃时间（共享库直查，不依赖引擎挂载）：
+ * 最后一条非隐藏消息是 assistant 且末部件非 step-finish → 回合在跑；
+ * time_updated 取最后消息行——桌面驱动的回合 session/list 的 updatedAt 是静止的
+ * （F2），侧栏"多久之前"必须用消息级时间才诚实。
+ * 30 分钟无任何写入的"运行中"按已结束处理：被取消/中断的回合不会写
+ * step-finish，不加这个上限侧栏会永久挂着假"运行中"（与幽灵行宽限同源）。
+ * 返回 null = 该会话没有消息（没跑过，空闲）。
+ */
+const DB_RUNNING_MAX_AGE_MS = 30 * 60 * 1000;
+function dbTurnState(sid) {
+  try {
+    if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
+    const rows = agentDbHandle.prepare(
+      'SELECT m.data AS mdata, m.time_updated AS mut, ' +
+      '(SELECT p.data FROM part p WHERE p.message_id = m.id ORDER BY p.sequence DESC LIMIT 1) AS pdata ' +
+      'FROM message m WHERE m.session_id = ? ORDER BY m.sequence DESC LIMIT 3'
+    ).all(sid);
+    for (const row of rows) {
+      let d = null;
+      try { d = JSON.parse(row.mdata ?? '{}'); } catch { /* 坏行跳过 */ }
+      if (!d) continue;
+      // 引擎注入的合成消息（TodoWrite 提醒/<task-notification> 等）不参与判定，
+      // 与页面 lastBusyMessage 同一口径，否则侧栏运行态跟着合成噪音抖
+      if (d.visibility === 'model-only' || d.metadata?.visibility === 'model-only' ||
+          d.semantics?.uiVisibility === 'hidden') continue;
+      const role = String(d.role ?? '');
+      let lastType = '';
+      if (row.pdata) { try { lastType = String(JSON.parse(row.pdata)?.type ?? ''); } catch { /* 坏部件 */ } }
+      const updatedAt = Number(row.mut ?? 0);
+      const running = role === 'assistant' && !!row.pdata && lastType !== 'step-finish'
+        && Date.now() - updatedAt < DB_RUNNING_MAX_AGE_MS;
+      return { running, updatedAt };
+    }
+    return null;
+  } catch { return null; }
+}
+
+// 运行态判定 3 秒缓存：侧栏 4s 轮询 + 队列补发核实共用，避免每条会话每轮都打库
+const finishedCache = new Map(); // sid → { t, finished }
+async function sessionLooksFinished(sid) {
+  const c = finishedCache.get(sid);
+  if (c && Date.now() - c.t < 3000) return c.finished;
+  const st = dbTurnState(sid);
+  const finished = st ? !st.running : true; // 读不到/无消息：不按 running 处理
+  finishedCache.set(sid, { t: Date.now(), finished });
+  if (finishedCache.size > 500) for (const k of finishedCache.keys()) { finishedCache.delete(k); if (finishedCache.size <= 400) break; }
+  return finished;
 }
 
 /**
@@ -929,7 +1009,7 @@ function cleanupGhostIndexRows(engineIds) {
 
 // 桌面标题自动生成有延迟、页面也未必开着：每 60s 全量对账一次
 setInterval(() => {
-  agent.request('session/list', { limit: 200, includeArchived: false })
+  agent.request('session/list', { limit: 200 })
     .then((r) => {
       const sessions = (r.sessions ?? []);
       syncTaskIndexRows(sessions.map((s) => ({
@@ -1186,10 +1266,24 @@ function pushAccountConfig() {
 // ────────────────────────── HTTP 服务 ──────────────────────────
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
-/** index.html 内容指纹（md5 前 8 位）：页面经 /api/state 比对，变了自动 reload。 */
-const PAGE_BUILD_FINGERPRINT = crypto.createHash('md5')
-  .update(fs.readFileSync(path.join(PUBLIC_DIR, 'index.html')))
-  .digest('hex').slice(0, 8);
+/** index.html 内容指纹（md5 前 8 位）：页面经 /api/state 比对，变了自动 reload。
+ *  ⚠️ 必须按请求现算（mtime+size 命中缓存则免重读）：此前是启动时算一次的常量，
+ *  改了 index.html 但没重启服务时指纹永远停在旧值，"页面自更新"整条链路静默失效
+ *  ——2026-10-04 立下的"改页面无需重启"约定实际只有重启后才生效。 */
+const PAGE_BUILD_PATH = path.join(PUBLIC_DIR, 'index.html');
+let pageBuildCache = { mtime: 0, size: -1, hash: '' };
+function pageBuildFingerprint() {
+  try {
+    const st = fs.statSync(PAGE_BUILD_PATH);
+    if (st.mtimeMs !== pageBuildCache.mtime || st.size !== pageBuildCache.size) {
+      pageBuildCache = {
+        mtime: st.mtimeMs, size: st.size,
+        hash: crypto.createHash('md5').update(fs.readFileSync(PAGE_BUILD_PATH)).digest('hex').slice(0, 8),
+      };
+    }
+  } catch { /* 文件暂不可读：沿用上次结果 */ }
+  return pageBuildCache.hash;
+}
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
 
 function timingSafeEqual(a, b) {
@@ -1230,26 +1324,6 @@ function readBody(req, limit = 5 * 1024 * 1024) {
 
 async function handleApi(req, res, url) {
   const p = url.pathname;
-/** 会话是否已收尾（最后 assistant 消息以 step-finish 结尾），10 秒缓存。
- * status=running 的会话若回合由外进程驱动，桥引擎收不到结束事件，
- * status 永远停在 running（僵尸 running）——必须用共享存储核实。 */
-const finishedCache = new Map();
-async function sessionLooksFinished(sid) {
-  const c = finishedCache.get(sid);
-  if (c && Date.now() - c.t < 10000) return c.finished;
-  let finished = false;
-  try {
-    const r = await agent.request('session/messages', { sessionId: sid, limit: 1 });
-    const last = (r.messages ?? []).at(-1);
-    finished = !!last
-      && String(last.info?.role ?? '') === 'assistant'
-      && (last.parts ?? []).length > 0
-      && String(last.parts.at(-1)?.type ?? '') === 'step-finish';
-  } catch { finished = true; } // 会话未挂载/读取失败：不按 running 处理
-  finishedCache.set(sid, { t: Date.now(), finished });
-  return finished;
-}
-
   const seg = p.split('/').filter(Boolean); // ['api', ...]
 
   if (req.method === 'GET' && p === '/api/state') {
@@ -1259,10 +1333,10 @@ async function sessionLooksFinished(sid) {
       model: config.model,
       autoAnswer: config.autoAnswer,
       agentRunning: !!agent.child,
-      // 页面构建指纹（index.html 内容 md5 前 8 位）：页面轮询对比，服务端
+      // 页面构建指纹（index.html 内容 md5 前 8 位，现算）：页面轮询对比，服务端
       // 更新页面后客户端自动 reload——否则手机一直跑内存里的旧 JS，
       // 所有页面级修复都到不了终端（2026-10-04 卡死/容量环教训）
-      pageBuild: PAGE_BUILD_FINGERPRINT,
+      pageBuild: pageBuildFingerprint(),
     });
   }
 
@@ -1296,44 +1370,62 @@ async function sessionLooksFinished(sid) {
       const now = Date.now();
       const wantArchived = url.searchParams.get('archived') === '1';
       if (!allListCache || allListCache.archived !== wantArchived || now - allListCache.t > 5000) {
-        const r = await agent.request('session/list', { limit: 200, includeArchived: true });
-        const mapped = await Promise.all((r.sessions ?? []).map(async (s) => ({
-          sessionId: s.sessionId,
-          title: String(s.title ?? '').includes('\uFFFD') ? '' : s.title,
-          status: s.status,
-          mode: s.mode,
-          updatedAt: s.updatedAt,
-          createdAt: s.createdAt,
-          archived: dbSessionArchived(s.sessionId) === true,
-          workspacePath:
-            s.workspace?.workspacePath ?? s.workspace?.workspaceKey ?? s.workspacePath ?? '',
-          // status=running 必须经存储核实：外进程驱动的回合结束后桥收不到
-          // 事件，status 永远 running（僵尸 running → 手机永久转圈点不动）
-          busy: sessionState(s.sessionId).busy
-            || (String(s.status ?? '').toLowerCase() === 'running'
-              && !(await sessionLooksFinished(s.sessionId))),
-        })));
-        const list = mapped.filter((s) => s.archived === wantArchived);
-        list.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+        let list;
+        if (wantArchived) {
+          // 归档视图共享库直查（见 dbArchivedSessions 头注：随包引擎的 list
+          // 把归档行挡在存储层，引擎通道拿不到）
+          list = dbArchivedSessions();
+        } else {
+          // 不传 includeArchived：随包引擎（桌面版 3.14.4）schema 无此键，
+          // strict 校验整帧被拒（Unrecognized key，2026-11-03 实测）；引擎默认
+          // 即"排除归档"。归档视图另走 dbArchivedSessions。
+          const r = await agent.request('session/list', { limit: 200 });
+          list = (r.sessions ?? []).map((s) => {
+            // 运行态以共享库为准：引擎 status 对桌面驱动的回合是静止的（F2），
+            // 且桥未挂载的会话也读不到实时状态——直接看最后消息末部件。
+            // 桥自己驱动的回合用内存 busy 标记（事件实时性最好）。
+            const turn = dbTurnState(s.sessionId);
+            return {
+              sessionId: s.sessionId,
+              title: String(s.title ?? '').includes('\uFFFD') ? '' : s.title,
+              status: s.status,
+              mode: s.mode,
+              // 时间新鲜度也走共享库：外进程回合 session.updatedAt 不更新，
+              // 侧栏"刚刚/6分"必须反映真实最后写入
+              updatedAt: Math.max(Number(s.updatedAt ?? 0), turn?.updatedAt ?? 0),
+              createdAt: s.createdAt,
+              // 防御性过滤：引擎存储层已按 time_archived 排除，DB 判定兜底
+              archived: dbSessionArchived(s.sessionId) === true,
+              workspacePath:
+                s.workspace?.workspacePath ?? s.workspace?.workspaceKey ?? s.workspacePath ?? '',
+              busy: sessionState(s.sessionId).busy || (turn?.running ?? false),
+            };
+          }).filter((s) => !s.archived);
+          list.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+          // 双向同步：手机侧会话同步进桌面任务索引（桌面→手机本就走共享存储）。
+          // 归档视图不同步——归档会话不进桌面列表（新行会以未归档形态冒出来）
+          syncTaskIndexRows(list).catch(() => {});
+        }
         allListCache = { t: now, list, archived: wantArchived };
-        // 双向同步：手机侧会话同步进桌面任务索引（桌面→手机本就走共享存储）
-        syncTaskIndexRows(list).catch(() => {});
         for (const it of list) {
           if (it.workspacePath) knownWorkspaces.add(path.resolve(it.workspacePath));
         }
       }
       return sendJson(res, 200, { sessions: allListCache.list });
     }
-    const r = await agent.request('session/list', { workspace: workspaceRef(ws), limit: 50, includeArchived: false });
-    const list = (r.sessions ?? []).map((s) => ({
-      sessionId: s.sessionId,
-      title: String(s.title ?? '').includes('�') ? '' : s.title,
-      status: s.status,
-      mode: s.mode,
-      updatedAt: s.updatedAt,
-      createdAt: s.createdAt,
-      busy: sessionState(s.sessionId).busy,
-    }));
+    const r = await agent.request('session/list', { workspace: workspaceRef(ws), limit: 50 });
+    const list = (r.sessions ?? []).map((s) => {
+      const turn = dbTurnState(s.sessionId);
+      return {
+        sessionId: s.sessionId,
+        title: String(s.title ?? '').includes('�') ? '' : s.title,
+        status: s.status,
+        mode: s.mode,
+        updatedAt: Math.max(Number(s.updatedAt ?? 0), turn?.updatedAt ?? 0),
+        createdAt: s.createdAt,
+        busy: sessionState(s.sessionId).busy || (turn?.running ?? false),
+      };
+    });
     list.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
     return sendJson(res, 200, { sessions: list });
   }
@@ -1384,12 +1476,16 @@ async function sessionLooksFinished(sid) {
       messages: snap?.messages ?? [],
       // lastSeq：页面首连从此序号只收新事件（历史已由 messages 渲染，重放会重复）
       lastSeq: sessionState(sid).lastSeq,
-      // 运行态恢复：页面刷新/重开后能立即回到"运行中"并接续计时
-      busy: sessionState(sid).busy,
+      // 运行态恢复：页面刷新/重开后能立即回到"运行中"并接续计时。
+      // 共享库兜底判定：桌面驱动的回合本进程 busy 标记是 false，靠存储末部件识别
+      busy: sessionState(sid).busy || (dbTurnState(sid)?.running ?? false),
       busySince: sessionState(sid).busySince || undefined,
       // 会话设置（模型列表/思考档位/权限模式/上下文投影）：
       // 供官方样式的模型选择、思考档位、权限模式菜单与上下文容量卡使用
       settings: projectSettings(snap, sid),
+      // 实际落点的项目空间（workspaceRef 可能因白名单回退到主工作区）：
+      // 页面据此提示"会话属于哪个项目"，不再靠猜
+      workspacePath: wsRef.workspacePath,
     });
     // 注意：这里不再插桌面索引占位行——新会话在首回合完成落库前，引擎重启即
     // 彻底丢失，占位行会变成桌面点开必报错的"新任务"幽灵行（问题档案 #14）。

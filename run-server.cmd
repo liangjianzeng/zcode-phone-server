@@ -1,7 +1,23 @@
 @echo off
-rem zcode-phone-server å®ˆæŠ¤è„šæœ¬ï¼šè¿›ç¨‹é€€å‡ºåŽ 3 ç§’è‡ªåŠ¨é‡å¯ï¼Œç‹¬ç«‹äºŽ ZCode ç”Ÿå‘½å‘¨æœŸ
+rem zcode-phone-server ÊØ»¤½Å±¾£º½ø³ÌÍË³öºó 3 Ãë×Ô¶¯ÖØÆô£¬¶ÀÁ¢ÓÚ ZCode ÉúÃüÖÜÆÚ
+rem ÃÝµÈÐÞ¸´(2026-11-03)£º´ËÇ°¶Ë¿Ú±»Õ¼Ê±ÈÔÃ¤Ä¿À­Æð -> EADDRINUSE Ã¿ 3 Ãë±ÀÀ£Ò»´ÎÎÞÏÞË¢ÈÕÖ¾
+rem £¨keepalive.log/server.log ±©ÕÇ£¬ÈÕÖ¾È«±» EADDRINUSE ¶ÑÕ»ÑÍÃ»£¬¹ÊÕÏÎÞ·¨¶¨Î»£©¡£
+rem ÏÖ¸ÄÎª£º¶Ë¿ÚÓÐ¼àÌýÕßÊ±Ö»µÈ´ý½Ó¹Ü£¨5 Ãë¸´²é£©£¬Ô­ÊµÀýÍË³öºó×Ô¶¯²¹Î»ÖØÆô£»
+rem ¶à¸öÊØ»¤ÊµÀý¹²´æ°²È«£¨Êä¼ÒµÈ´ý£¬Ó®¼Ò·þÎñ£©£¬ÊÖ¶¯À­Æð server.mjs Ò²²»ÔÙ´ò¼Ü¡£
 cd /d "%~dp0"
+rem ¶Ë¿ÚÒÔ config.json Îªµ¥Ò»À´Ô´£¨Óë server.mjs Ò»ÖÂ£©£¬¶ÁÈ¡Ê§°Ü»ØÂä 8787
+set PORT=8787
+node -e "try{const c=JSON.parse(require('fs').readFileSync('config.json','utf8'));process.stdout.write(String(c.port||8787))}catch(e){process.stdout.write('8787')}" > "%TEMP%\zps_port.txt" 2>nul
+set /p PORT=<"%TEMP%\zps_port.txt"
+set PORT=%PORT: =%
+
 :loop
+rem ¶Ë¿ÚÒÑÓÐ¼àÌýÕß = ÒÑÓÐÊµÀýÔÚ·þÎñ£º²»À­Æð£¬5 Ãëºó¸´²é£¬µÈËüÍË³öºó½Ó¹Ü
+netstat -ano -p TCP | findstr /c:":%PORT% " | findstr "LISTENING" >nul 2>&1
+if not errorlevel 1 (
+  timeout /t 5 /nobreak >nul
+  goto loop
+)
 echo [%date% %time%] server starting >> logs\keepalive.log
 node server.mjs >> logs\server.log 2>&1
 echo [%date% %time%] server exited (code %errorlevel%), restarting in 3s >> logs\keepalive.log

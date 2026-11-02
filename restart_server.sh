@@ -41,7 +41,10 @@ if [ -z "$PID" ]; then echo "$(date +%T) 未找到 8787 监听进程（可能已
 fi
 
 # 重新拉起（隐藏窗口、独立于本脚本存活）
-powershell -NoProfile -Command "Start-Process -FilePath 'node' -ArgumentList 'server.mjs' -WorkingDirectory '$DIR' -WindowStyle Hidden" 2>&1
+# WorkingDirectory 必须是 Windows 路径：$DIR 是 Git-Bash 形态（/e/...），
+# PowerShell 直接用会 DirectoryNotFoundException（2026-11-03 实测报错）
+DIR_WIN=$(cygpath -w "$DIR" 2>/dev/null || echo "$DIR")
+powershell -NoProfile -Command "Start-Process -FilePath 'node' -ArgumentList 'server.mjs' -WorkingDirectory '$DIR_WIN' -WindowStyle Hidden" 2>&1
 echo "$(date +%T) 已拉起，等待健康检查 ..."
 
 ok=""
