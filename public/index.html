@@ -66,7 +66,11 @@
     position: fixed; left: 0; top: 0; bottom: 0; z-index: 6;
     width: 46px;
     display: flex; flex-direction: column; align-items: center; gap: 4px;
-    padding: calc(8px + env(safe-area-inset-top)) 0 calc(8px + env(safe-area-inset-bottom));
+    /* 顶部不加 env(safe-area-inset-top)：App 端 WebView 位于原生顶栏之下，
+       而 Android WebView 上报的是窗口级（状态栏）inset，再加一次就是双重
+       避让——实测图标列被整体压下约 48px，悬在消息区半空（2026-11-03）。
+       本页顶边永远不进状态栏，桌面浏览器 env() 本就是 0，写死即可。 */
+    padding: 8px 0 calc(8px + env(safe-area-inset-bottom));
     background: var(--panel); border-right: 1px solid var(--line);
     overflow-y: auto; overflow-x: hidden;
   }
@@ -82,10 +86,18 @@
   .railsep { flex: none; width: 22px; height: 1px; background: var(--line); margin: 3px 0; }
   #railFuture { flex: 1; min-height: 8px; } /* 弹性占位：后续按钮可顺次排在上方或锚定底部 */
 
-  /* ── 任务计划折叠条（官方桌面版 todo 面板同款：消息区顶部 sticky）── */
+  /* 消息列：任务计划条 + 消息流（todoBar 不放进滚动容器） */
+  #chatCol { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+
+  /* ── 任务计划折叠条（官方桌面版 todo 面板同款：常驻消息区顶部）──
+     顶部为真实文档流位置（main 的前一个兄弟节点），不用 position:sticky：
+     滚动容器 padding 变化 / WebView 实现差异都会让 sticky 固定在 padding
+     缘而非可视顶部，上方的缝隙会漏出滚动经过的正文（实测顶部 padding 被
+     safe-area 双重避让撑到 62px 时整个计划条"悬空"错位）。挪出滚动容器
+     后无此依赖，WebView 与桌面渲染完全一致。 */
   #todoBar {
-    position: sticky; top: 0; z-index: 4; display: none;
-    margin: -4px -6px 8px; padding: 8px 10px;
+    position: relative; z-index: 4; flex: none; display: none;
+    margin: 6px 16px 0; padding: 8px 10px;
     /* 必须完全不透明：安卓 WebView 大多不支持 backdrop-filter，磨砂失效后
        半透明底会让滚动经过的正文渗出来，视觉上就是"文字被夹断/错位"。
        （曾用 88% 透明 + blur 的毛玻璃方案，实测渗字，2026-11-03 改实底） */
@@ -117,7 +129,7 @@
   /* 不用 scroll-behavior:smooth：流式输出时 scrollBottom 每帧都设新目标，
      平滑动画被反复打断 = 滚动永远追不上内容增长，消息区抖动、内容错位观感。
      移动端聊天页标准做法是即时滚动（官方桌面版同款）。 */
-  main { flex: 1; min-width: 0; overflow-y: auto; padding: calc(14px + env(safe-area-inset-top)) 16px 10px; }
+  main { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding: 10px 16px 10px; }
   .hero { display: flex; flex-direction: column; align-items: center; gap: 10px; margin: 16vh auto 0; color: var(--dim); }
   .hero .bigz {
     width: 60px; height: 60px; border-radius: 18px;
@@ -547,13 +559,16 @@
     <!-- 后续新功能按钮加在 railFuture 之上（跟随上方按钮顺排）；也可锚定到底部 -->
     <div id="railFuture"></div>
   </nav>
-  <main id="chat">
+  <section id="chatCol">
+    <!-- 任务计划条：消息区顶部常驻表头（滚动容器之外，见样式区说明） -->
     <div id="todoBar" role="button" aria-label="任务计划" title="点击展开/收起任务计划">
       <div class="thead"><span class="chev">▸</span><span class="tlabel">任务计划</span><span class="tsum"></span><span class="thint">点击展开</span></div>
       <div class="titems"></div>
     </div>
-    <div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2" id="heroTip">选择一个会话，下达你的第一个任务</div></div>
-  </main>
+    <main id="chat">
+      <div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2" id="heroTip">选择一个会话，下达你的第一个任务</div></div>
+    </main>
+  </section>
 </div>
 
 <footer>
@@ -1749,8 +1764,10 @@ function turnLooksRunning(messages) {
 // ── 任务计划（官方桌面版 todo 面板）：DB todos 实时状态 + TodoWrite 事件即时刷新 ──
 let curTodos = [];
 let todoOpen = false;
-// todoBar 的持久引用：renderHistory 的 textContent='' 会把节点从文档摘掉，
-// getElementById 对 detached 节点返回 null → appendChild(null) 崩溃（实测踩过）
+// todoBar 的持久引用（历史上的坑：曾放进 chat 内，renderHistory 的
+// textContent='' 会把节点从文档摘掉，getElementById 对 detached 节点
+// 返回 null → appendChild(null) 崩溃。现已移到 chatCol 常驻表头位，
+// 引用仍缓存于此，避免回归）
 const todoBarEl = document.getElementById('todoBar');
 
 async function refreshTodos(sid) {
@@ -1812,8 +1829,7 @@ function scheduleTodoRefresh() {
 
 function renderHistory(messages, opts = {}) {
   chat.textContent = '';
-  // 任务计划条是 chat 的常驻首子节点（sticky），全量重绘后补回
-  chat.appendChild(todoBarEl);
+  // 任务计划条已移出滚动容器（chatCol 的常驻表头），全量重绘不会动它
   msgEls.clear(); toolEls.clear(); thinkTimers.clear();
   sseUserEchoes = []; // 全量重绘，SSE 回显气泡已随 DOM 清掉
   // 更新尾部指纹：轮询跟随以这里为准（打开会话/重连重同步/轮询全量拉取共用）
