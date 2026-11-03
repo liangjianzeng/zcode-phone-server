@@ -884,6 +884,62 @@ function workspaceRef(overridePath) {  // 本地 workspace：workspaceKey = work
   return { workspacePath: wp, workspaceKey: wp };
 }
 
+// ── 工作区文件搜索（@ 引用菜单数据源）──
+// 按文件名/相对路径模糊匹配；空查询返回最近修改的文件（官方 @ 打开即最近文件）。
+// 纯 fs 遍历 + 双重限流（条目数/深度），大仓库也不会拖住事件循环。
+const SEARCH_SKIP_DIRS = new Set([
+  'node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out', '.next', '.nuxt',
+  '.output', 'target', '__pycache__', '.venv', 'venv', 'env', '.idea', '.vscode',
+  '.gradle', '.dart_tool', '.zcode-uploads', 'coverage', '.turbo', '.cache', 'vendor',
+]);
+function searchWorkspaceFiles(root, q, limit = 40) {
+  const items = [];
+  if (!root || !fs.existsSync(root)) return items;
+  const ql = q.toLowerCase();
+  const maxDepth = 9, maxVisited = 15000;
+  let visited = 0;
+  const recents = [];
+  const walk = (dir, depth) => {
+    if (items.length >= limit || depth > maxDepth || visited > maxVisited) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (items.length >= limit || visited > maxVisited) return;
+      if (e.name.startsWith('.')) continue; // 隐藏目录/文件一律跳过（.git/.env 等）
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (!SEARCH_SKIP_DIRS.has(e.name)) walk(full, depth + 1);
+        continue;
+      }
+      if (!e.isFile()) continue;
+      visited++;
+      const rel = path.relative(root, full).replaceAll('\\', '/');
+      let st = null;
+      try { st = fs.statSync(full); } catch { continue; }
+      if (!q) {
+        recents.push({ path: rel, name: e.name, mtime: st.mtimeMs });
+        continue;
+      }
+      const nameL = e.name.toLowerCase();
+      const relL = rel.toLowerCase();
+      // 打分：文件名全等 0 < 前缀 1 < 文件名包含 2 < 相对路径包含 3
+      const score = nameL === ql ? 0 : nameL.startsWith(ql) ? 1 : nameL.includes(ql) ? 2 : relL.includes(ql) ? 3 : -1;
+      if (score < 0) continue;
+      items.push({ path: rel, name: e.name, dir: path.dirname(rel) === '.' ? '' : path.dirname(rel), score });
+    }
+  };
+  walk(root, 0);
+  if (!q) {
+    recents.sort((a, b) => b.mtime - a.mtime);
+    for (const r of recents.slice(0, limit)) {
+      items.push({ path: r.path, name: r.name, dir: path.dirname(r.path) === '.' ? '' : path.dirname(r.path), score: 0 });
+    }
+  } else {
+    items.sort((a, b) => a.score - b.score || a.path.length - b.path.length || a.path.localeCompare(b.path));
+  }
+  return items.slice(0, limit);
+}
+
 // ────────────────────────── 桌面任务索引双向同步 ──────────────────────────
 // 桌面端 UI 的会话列表不读 session/list，而是读自己的任务索引
 // ~/.zcode/v2/tasks-index.sqlite（tasks 表，task_id = sessionId），只有桌面
@@ -918,14 +974,40 @@ async function syncTaskIndexRows(list) {
   try {
     const db = tasksDb();
     const existing = new Map();
-    for (const r of db.prepare('SELECT task_id, title, task_status, mode, updated_at, deleted, archived, title_overridden, meta_json FROM tasks').all()) {
+    for (const r of db.prepare('SELECT task_id, title, task_status, mode, updated_at, deleted, archived, title_overridden, meta_json, host_id, cli_created_at FROM tasks').all()) {
       existing.set(r.task_id, r);
     }
-    const ins = db.prepare(
-      'INSERT INTO tasks (workspace_key, workspace_path, workspace_identity, task_id, title, task_status, provider, mode, model, created_at, updated_at, pinned, archived, deleted, title_overridden, meta_json, searchable_text) ' +
-      'VALUES (?, ?, NULL, ?, ?, ?, \'glm\', ?, NULL, ?, ?, 0, 0, 0, 0, ?, ?)',
+    // 桌面任务列表的真实查询（app.asar 反解确认）：
+    //   SELECT * FROM tasks WHERE provider=? AND deleted=0 AND coalesce(cli_deleted,0)=0
+    //     AND cli_created_at IS NOT NULL ORDER BY cli_updated_at DESC
+    // cli_created_at 为 NULL 的行直接被过滤——此前手机行只写旧 schema 列，
+    // host_id/root_path/project_id/cli_* 全 NULL，桌面列表和项目树都看不到
+    // （桌面 initializeLegacyTaskIdentity 只在 app 启动时回填一次 host_id IS NULL
+    // 的行，手机后来插入的行永远等不到）。这里按桌面原生行同款形状写入/回填。
+    // project_id 反查同桌面 uniqueRootProject：路径恰好命中一个未删除项目才挂，否则 NULL。
+    const projectByRoot = db.prepare(
+      "SELECT p.project_id FROM projects p JOIN project_roots r USING(project_id) " +
+      "WHERE p.host_id='local' AND p.deleted=0 AND r.root_path=? LIMIT 2",
     );
-    const upd = db.prepare('UPDATE tasks SET title=?, task_status=?, mode=?, updated_at=?, meta_json=? WHERE task_id=?');
+    const projectIdFor = (ws) => {
+      try {
+        const hits = projectByRoot.all(ws);
+        return hits.length === 1 ? hits[0].project_id : null;
+      } catch { return null; }
+    };
+    // cli_last_outcome 桌面口径：error/interrupted/completed，其余（running 等）NULL
+    const lastOutcome = (st) => (st === 'error' || st === 'interrupted' || st === 'completed' ? st : null);
+    const ins = db.prepare(
+      'INSERT INTO tasks (workspace_key, workspace_path, workspace_identity, task_id, title, task_status, provider, mode, model, created_at, updated_at, pinned, archived, deleted, title_overridden, meta_json, searchable_text, host_id, root_path, project_id, cli_title, cli_title_source, cli_created_at, cli_updated_at, cli_last_outcome, cli_deleted, handoff_pending) ' +
+      "VALUES (?, ?, NULL, ?, ?, ?, 'glm', ?, NULL, ?, ?, 0, 0, 0, 0, ?, ?, 'local', ?, ?, ?, 'generated', ?, ?, ?, 0, 8)",
+    );
+    const upd = db.prepare(
+      'UPDATE tasks SET title=?, task_status=?, mode=?, updated_at=?, meta_json=?, ' +
+      "host_id='local', root_path=workspace_path, project_id=coalesce(project_id, ?), " +
+      'cli_title=?, cli_title_source=CASE WHEN title_overridden=1 THEN cli_title_source ELSE ? END, ' +
+      'cli_created_at=coalesce(cli_created_at, ?), cli_updated_at=?, cli_last_outcome=?, cli_deleted=0, ' +
+      'handoff_pending=handoff_pending|8 WHERE task_id=?',
+    );
     for (const s of rows) {
       const status = String(s.status ?? '').toLowerCase() === 'running' ? 'running' : 'completed';
       const ws = String(s.workspacePath ?? '').replace(/\//g, '\\');
@@ -944,7 +1026,8 @@ async function syncTaskIndexRows(list) {
           provider: 'glm', status, target: null, titleOverridden: false,
         };
         ins.run(ws, ws, s.sessionId, title, status, String(s.mode ?? ''),
-          createdAt, updatedAt, JSON.stringify(meta), title);
+          createdAt, updatedAt, JSON.stringify(meta), title,
+          ws, projectIdFor(ws), title, createdAt, updatedAt, lastOutcome(status));
         changed++;
         continue;
       }
@@ -954,7 +1037,9 @@ async function syncTaskIndexRows(list) {
       const engineTitle = String(s.title ?? '').trim();
       const dbTitle = meta0 ? meta0.title : '';
       const newTitle = titleOverridden ? old.title : (engineTitle || dbTitle || old.title || '');
-      if (old.title === newTitle && Number(old.updated_at) === updatedAt && old.task_status === status) continue;
+      // 旧口径残留行（cli_* 全 NULL）即使内容没变也要走一次 UPDATE 补齐桌面形状
+      const needsBackfill = !old.host_id || old.cli_created_at == null;
+      if (!needsBackfill && old.title === newTitle && Number(old.updated_at) === updatedAt && old.task_status === status) continue;
       let meta = {};
       try { meta = JSON.parse(old.meta_json ?? '{}'); } catch { /* 空对象兜底 */ }
       meta.taskId = s.sessionId;
@@ -967,7 +1052,8 @@ async function syncTaskIndexRows(list) {
       meta.provider = meta.provider ?? 'glm';
       meta.status = status;
       meta.titleOverridden = !!titleOverridden;
-      upd.run(newTitle, status, String(s.mode ?? old.mode ?? ''), updatedAt, JSON.stringify(meta), s.sessionId);
+      upd.run(newTitle, status, String(s.mode ?? old.mode ?? ''), updatedAt, JSON.stringify(meta),
+        projectIdFor(ws), newTitle, 'generated', createdAt, updatedAt, lastOutcome(status), s.sessionId);
       changed++;
     }
   } catch (e) {
@@ -1789,6 +1875,19 @@ async function handleApi(req, res, url) {
       const r = await agent.request('session/compact', { sessionId: sid });
       return sendJson(res, 200, r ?? { ok: true });
     }
+
+    // 分叉会话（对照官方消息"分叉"）：从指定消息（或最近 checkpoint）派生新会话，
+    // 原会话原样保留。引擎边界：运行中不可分叉（"Cannot fork while a prompt is
+    // running"），target 形如 {kind:"message",messageId} | {kind:"latestCheckpoint"}。
+    if (req.method === 'POST' && sub === 'fork') {
+      const body = await readBody(req);
+      const target = body.messageId
+        ? { kind: 'message', messageId: String(body.messageId) }
+        : { kind: 'latestCheckpoint' };
+      const r = await agent.request('session/fork', { sessionId: sid, target }, 60000);
+      allListCache = null; // 新会话立即可见于列表
+      return sendJson(res, 200, r ?? {});
+    }
   }
 
   if (req.method === 'GET' && p === '/api/plugins') {
@@ -1869,6 +1968,14 @@ async function handleApi(req, res, url) {
     } catch (e) {
       return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
     }
+  }
+
+  // 工作区文件搜索（对照官方 @ 引用的文件菜单）：按文件名/相对路径模糊匹配。
+  // 纯本地遍历，不依赖引擎方法；跳过大目录，限量返回。
+  if (req.method === 'GET' && p === '/api/search/files') {
+    const q = String(url.searchParams.get('q') ?? '').trim();
+    const ref = workspaceRef(url.searchParams.get('workspace') ?? undefined);
+    return sendJson(res, 200, { items: searchWorkspaceFiles(ref.workspacePath, q) });
   }
 
   if (req.method === 'POST' && seg[0] === 'api' && seg[1] === 'interactions' && seg[2]) {

@@ -142,6 +142,33 @@ sessionState(sid) = { subs:Set<res>, ring:[≤1000], busy, busySince, lastSend, 
 - **sqlite 直写**：清库操作绕过引擎直接删行（先备份、白名单、孤儿清理）；引擎不感知，
   会话列表以引擎重启后的实时查询为准。
 
+### 2.8 桌面任务索引同步（syncTaskIndexRows）
+
+桌面任务列表/项目树**不读 session/list**，只读自己的索引 `~/.zcode/v2/tasks-index.sqlite`
+（桌面主列表查询自 app.asar 反解确认）：
+
+```sql
+SELECT * FROM tasks WHERE provider=? AND deleted=0
+  AND coalesce(cli_deleted,0)=0 AND cli_created_at IS NOT NULL
+ORDER BY cli_updated_at DESC, task_id
+```
+
+手机建的会话要在桌面可见，索引行必须写成**桌面原生形状**——三道门缺任何一列=隐形：
+
+1. `cli_created_at IS NOT NULL`——主列表 WHERE 直接过滤（不是排序键，是准入条件）；
+2. 项目树查询 `WHERE project_id=? AND host_id=?`——`project_id` 按桌面 `uniqueRootProject`
+   口径反查（`projects ⋈ project_roots`，`host_id='local' AND deleted=0` 且 `root_path`
+   **恰好唯一**命中一个未删除项目才挂；0 个或多义则留 NULL，只进"全部任务"）；
+3. `host_id='local'` + `root_path`——桌面各查询的公共谓词。
+
+桌面自带的 `initializeLegacyTaskIdentity` 回填这些列，但**只在 app 启动时**对
+`host_id IS NULL` 的存量行跑一次——手机后来插入的行永远等不到。所以同步在
+INSERT/UPDATE 时直接按原生形状写全（`cli_title`/`cli_title_source='generated'`/
+`cli_created_at`/`cli_updated_at`/`cli_last_outcome`(error/interrupted/completed 外取 NULL)/
+`cli_deleted=0`/`handoff_pending` 置基线位 8）；UPDATE 的"内容未变即跳过"条件带
+`needsBackfill` 豁免（`!host_id || cli_created_at==null`），让旧口径残留行被对账周期回填。
+两条硬边界（标题以共享库为权威、未落库一律不 INSERT）见同步函数头注与问题档案 #14，不变。
+
 ---
 
 ## 3. 模块：Web 页面（public/index.html）
@@ -329,6 +356,8 @@ approval 高优通知）。页面 v2 通知与 DOM 桥**双通道并存**，通�
 | 29 | restart_server.sh 重启时 PowerShell 报 DirectoryNotFoundException（偶发靠运气起来） | `-WorkingDirectory` 收到的是 Git-Bash 路径（/e/...），PowerShell 不识别 | `cygpath -w` 转 Windows 路径后再传 | 重启全程无报错，健康检查 200 |
 | 30 | 桌面端发出的指令在手机会话里"根本没有体现"（要等回复部件落库才捎带出现，回合失败/无响应时永不出现） | `fingerprint()` 只看最后一条 **assistant** 消息——桌面指令是 user 消息、无 SSE 事件（F2），落库后 fp 不变、pollTick 早退，`renderTail` 永远不触发；user 消息只能靠后续 assistant 部件的指纹变化"捎带"渲染 | 指纹改看最后一条**可见**消息（`lastVisibleMessage`，含 user，跳过 model-only 合成消息）；运行态判定（turnLooksFinished/Running）仍走 assistant 口径不受影响 | 浏览器实测：fpUser/fpUser2 随 user 文本变化、fpHidden 正确跳过合成消息；活体桌面驱动回合 +505 字/新消息 10s 内自动渲染，lastFingerprint 同步推进 |
 | 31 | 手机端"没法在指定项目空间新建会话、建成了也不知道属于哪个项目"（乱） | ①「新会话」直接落 `curWs`（localStorage 记忆值），无项目选择环节，落错时服务端 workspaceRef 还**静默回退**到主工作区；②建成后界面无任何归属标识（空会话在抽屉里要等首回合落库才出现）；③config.json 的 workspaces 存在**过期路径**（项目搬迁后未更新），可把会话建到不存在的目录 | ①「新会话」先弹项目选择器（`projectChoices()`：当前项目 ∪ 会话记录 ∪ config 白名单，分隔符/尾斜杠/大小写归一去重，同名目录带父目录消歧）；②`POST /api/sessions` 响应带真实落点 `workspacePath`，页面校正 curWs + toast 明示"新会话 · 项目：X"，空会话 hero 带项目名；③修正 config 过期条目；④抽屉每个项目行加「＋」一键在该项目新建（注意 miNew/btnNew 处理器必须 stopPropagation，否则 document 关弹层处理器立即把选择器关掉） | 浏览器实测：选择器 13 个项目全部可见、同名消歧（TongYi-Lite · DTXY / · coding_projects）、点选后 curWs/hero/toast 三处归属一致 |
+| 32 | **手机端独立创建的会话桌面永远不可见**（tasks-index 里明明有行，桌面列表/项目树都找不到） | 桌面主列表查询自 app.asar 反解：`WHERE provider=? AND deleted=0 AND coalesce(cli_deleted,0)=0 AND cli_created_at IS NOT NULL`——`cli_created_at` 是**准入条件**不是排序键；项目树另按 `project_id + host_id` 挂载。手机同步行只写旧 schema 列（host_id/root_path/project_id/cli_* 全 NULL）→ 全部被过滤。桌面自带的 `initializeLegacyTaskIdentity` 能回填，但只在 app 启动时对存量 NULL 行跑一次，手机后来插入的行等不到 | `syncTaskIndexRows` 的 INSERT/UPDATE 按桌面原生形状写全（见 §2.8）：`host_id='local'`、`root_path=workspace_path`、`project_id` 走 uniqueRootProject 口径反查 project_roots（路径恰好唯一命中才挂）、`cli_title/cli_title_source/cli_created_at/cli_updated_at/cli_last_outcome/cli_deleted` 一次到位；UPDATE 跳过条件加 `needsBackfill` 豁免让存量 NULL 行被对账周期回填 | 同步后索引中手机工作区行 `host_id IS NULL OR cli_created_at IS NULL` 计数=0；此前隐形的 3 个手机会话 `project_id=fd46d984`（zcode-phone-server）挂上项目树，桌面端可见 |
+| 33 | keepalive.log/server.log 暴涨（80MB）：守护每 3 秒 EADDRINUSE 崩溃一次无限刷日志；且真正在服务的实例崩了没人拉起，"自动重启保护"名存实亡 | `run-server.cmd` 无条件 `node server.mjs`：端口被占（另一守护/手动实例在服务）时新进程必然 EADDRINUSE 秒退，守护 3 秒一次写两条日志无限循环，真实故障堆栈全被淹没；而由一次性脚本拉起的实例父进程已死=孤儿，崩了没有任何东西补位 | 守护幂等化：拉起前 netstat 查端口，有监听者→5 秒后复查等待接管，端口空了才拉起并阻塞在服务上。多守护共存、手动 `node server.mjs` 调试都不打架 | 清理僵尸守护后 keepalive.log 零新增；两次实测（含本次调试期）：服务被杀后守护 3 秒内自动补位，端口/健康检查恢复正常 |
 
 ---
 

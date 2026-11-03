@@ -30,7 +30,7 @@ ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Prot
 | **delta 合帧** | `model.streaming`/`part.delta` 相邻同键 chunk 合并成一帧（60ms 或非 delta 事件到达时冲刷），严格 FIFO 不重排——长回复从几千个 SSE 帧降到几十帧，手机蜂窝网络省流量、页面渲染不再碎片化 |
 | 发送队列 | 引擎 `session/send` 单飞（运行中 409）：运行中收到的消息入队（绑定会话、可取回删除），回合结束后自动补发为下一回合；桌面驱动的回合按共享存储核实收尾后补发 |
 | 限流自动重试 | `turn.failed` 匹配 429/限流时自动重发（5 次 × 20s，`__retry` inputId 防重复回显）；1113/余额类错误不重试，直接推人话提示 |
-| 桌面任务索引同步 | 会话标题/状态按共享 sqlite 库对账进桌面任务索引（标题为空不落库、幽灵行 30 分钟清理），桌面任务列表与手机会话一致 |
+| 桌面任务索引同步 | 会话标题/状态按共享 sqlite 库对账进桌面任务索引（标题为空不落库、幽灵行 30 分钟清理）；行必须写成**桌面原生形状**（`host_id/root_path/project_id/cli_title/cli_created_at`…）——桌面列表查询按 `cli_created_at IS NOT NULL` 过滤、项目树按 `project_id` 挂载，缺字段=手机建的会话桌面隐形（详见 MODULE-DESIGN §2.8） |
 | 页面自更新 | `index.html` 内容 md5 指纹经 `/api/state` 下发，页面轮询比对自动 reload——**改完页面无需重启服务、无需手机手动刷新** |
 | 静态服务 | `public/` 每请求读盘；token 鉴权（query `?token=` / header `x-zptoken` / cookie） |
 
@@ -40,7 +40,14 @@ ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Prot
 
 - **双通道跟随**：SSE 实时事件 + 1.2s 存储轮询，桌面端驱动的回合（无 SSE）也能近实时旁观。
 - **部件通道为唯一事实来源**：正文/思考按部件落库事件渲染；token 直播块仅在部件未落库时兜底显示，落库追平即交接（`settleLiveText`），**杜绝直播/落库双份重复**；流式 markdown 渲染 60ms 合帧，长回复不掉帧。
-- 工具行（图标 + 名称 + 命令/目标摘要 + 状态，点开看输出）、思考行（可展开）、任务计划条（todos 实时）、提问/权限卡片、排队药丸、附件上传。
+- 工具行（图标 + 名称 + 命令/目标摘要 + 状态，点开看输出）、思考行（可展开）、任务计划条（todos 实时）、提问/权限卡片（批准/始终允许/拒绝——"始终允许"经引擎 `permissionUpdates.addRules` 透传，同工具本会话/项目内不再询问）、排队药丸、附件上传。
+- **代码块升级（对照桌面 codeBlock）**：头部语言标签 + 复制按钮、横向滚动、零依赖轻量语法高亮（注释/字符串/数字/关键字/函数名/标签六类着色，常见语言族共用扫描器，>20KB 自动降级纯文本保流畅）。
+- **回合更改文件卡（对照桌面 changeSummary）**：回合收尾时汇总 Write/Edit 触达的文件（✏️ 标题 + 可点开 chip，多次编辑计 ×N）。
+- **会话搜索**：抽屉按标题/项目名即输即筛，归档会话同搜。
+- **@ 文件引用（对照桌面 @ 菜单）**：输入 `@token` 弹出工作区文件候选（`/api/search/files` 本地模糊匹配，空查询=最近修改），↑↓/Enter/点选插入 `@相对路径`。
+- **消息分叉（对照桌面 fork）**：助手消息操作行"分叉"→ `POST /api/sessions/:id/fork` → 引擎 `session/fork`，从该消息派生新会话（运行中引擎拒绝并透出文案）。
+- **Markdown 图片**：正文 `![alt](url)` 直接渲染（懒加载，点击放大）。
+- **键盘适配（visualViewport）**：adjustPan 型 WebView 键盘弹出时锁定可视高度并抵消平移，输入卡不再被软键盘遮挡（adjustResize 环境自动 no-op）。
 - **回合结束分隔线**：≥5 秒的回合结束在对话流末尾显示"✓ 本轮结束 · 用时 X"（失败回合显示红字 errline，不重复画线）。
 - **外观主题**：左侧栏 ☀ → 跟随系统（实时 matchMedia）/ 浅色 / 深色，localStorage 持久，首帧预应用不闪错主题。
 - 断线自愈：SSE 断流、服务重启（`event: reset`）、引擎丢会话均自动 resume；任何运行态都能收敛退出（不会永久转圈）。
@@ -59,6 +66,10 @@ http://127.0.0.1:8787/?token=<token>
 
 浏览器打开即可自测聊天链路；手机端在 App 里选 Zcode 模式、远端端口填 `8787`。
 安全重启（等待会话空闲后杀进程树再拉起）：`bash restart_server.sh`。
+
+守护脚本 `run-server.cmd`（登录时经计划任务 → `start-hidden.ps1` 拉起）是**幂等**的：
+拉起前先查端口，已有监听者就只等待接管（5 秒复查），服务被杀后 3 秒内自动补位——
+多个守护共存、或手动 `node server.mjs` 临时调试，都不会互相打架刷日志。
 
 ## 配置（config.json）
 
@@ -82,7 +93,7 @@ http://127.0.0.1:8787/?token=<token>
 |---|---|
 | `GET /api/state` | 服务状态 + 页面构建指纹（`pageBuild`，自动 reload 依据） |
 | `GET /api/workspaces` | 工作区列表 |
-| `GET /api/sessions`（`?workspace=|all=1`） | 会话列表（含 `busy/busySince/lastSeq`，页面恢复运行态用） |
+| `GET /api/sessions`（`?workspace=\|all=1`） | 会话列表（含 `busy/busySince/lastSeq`，页面恢复运行态用） |
 | `POST /api/sessions` `{sessionId?, workspace?}` | 创建新会话；带 `sessionId` 则恢复（+ 订阅 + setModel） |
 | `GET /api/sessions/:id/messages?limit=` | 历史消息（MessageWithParts，部件粒度） |
 | `GET /api/sessions/:id/stream?afterSeq=` | SSE 实时事件流（重放环 + 心跳 + `event: reset`） |
@@ -97,6 +108,8 @@ http://127.0.0.1:8787/?token=<token>
 | `POST /api/autoAnswer` | 运行时切换 autoAnswer |
 | `GET/POST /api/plugins`、`/api/plugins/setEnabled` | 插件列表 / 启停 |
 | `GET /api/skills`、`/api/workflows` | 技能 / 工作流（项目 + 全局合并） |
+| `GET /api/search/files?q=&workspace=` | 工作区文件搜索（@ 引用候选；空 q = 最近修改） |
+| `POST /api/sessions/:id/fork` `{messageId?}` | 分叉会话（引擎 `session/fork`；缺省从最近 checkpoint） |
 | `GET /api/plan` | 订阅计划 + 当前套餐余额（z.ai billing/balance 的 remaining/total） |
 
 ## 事件流（SSE `zcode` 事件）
