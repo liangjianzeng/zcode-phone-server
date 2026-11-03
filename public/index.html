@@ -30,6 +30,7 @@
     --code-bg: #08080b; --code-inline: #1c1c24;
     --chip-fg: #b7a5ff; --link: #7cb7ff;
     --btn-muted: #2c2c36; --btn-muted-2: #3a3a46;
+    --rowbg: #17171f; --tint: rgba(124,92,255,.14);
     --tok-key: #c792ea; --tok-str: #a5d6a5; --tok-num: #f2ae70; --tok-com: #6a6a76;
     --tok-fn: #82aaff; --tok-tag: #7cb7ff;
     --shadow: 0 10px 34px rgba(0,0,0,.55);
@@ -43,6 +44,8 @@
     --code-bg: #f0f0f4; --code-inline: #e8e8ee;
     --chip-fg: #5b3df0; --link: #0b62d6;
     --btn-muted: #e7e7ee; --btn-muted-2: #d9d9e2;
+    /* 浅色下 --card 与 --panel 同为白——侧栏选中/分组底色必须另有层级色，否则完全隐形 */
+    --rowbg: #eef0f6; --tint: rgba(106,77,240,.12);
     --tok-key: #7c3aed; --tok-str: #1a7f37; --tok-num: #b45309; --tok-com: #9a9aa3;
     --tok-fn: #1d4ed8; --tok-tag: #0b62d6;
     --shadow: 0 10px 34px rgba(0,0,0,.18);
@@ -424,8 +427,14 @@
   .wsrow {
     display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-radius: 10px;
     margin: 3px 0; cursor: pointer; border: 1px solid transparent; font-size: 13.5px;
+    background: var(--rowbg);
   }
-  .wsrow.cur { background: var(--card); border-color: rgba(124,92,255,.5); }
+  /* 分组头与会话行字体分层：项目加粗收紧、会话维持常规正文字号——同字号同字重时一锅粥 */
+  .wsrow .plabel {
+    flex: 1; min-width: 0; font-weight: 600; font-size: 13px; letter-spacing: .03em;
+    color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .wsrow.cur { background: var(--tint); border-color: rgba(124,92,255,.5); }
   .wsrow .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
   .wsrow.cur .dot { background: var(--ok); }
   .wsrow .p { color: var(--faint); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -439,7 +448,10 @@
   }
   .wsrow .wsadd:active { background: var(--card); }
   /* 会话行：官方单行布局 —— [✳运行中?] 标题 …… 相对时间，整体随项目缩进 */
-  .sess { display: flex; align-items: center; gap: 8px; margin-left: 18px; }
+  .sess {
+    display: flex; align-items: center; gap: 8px; margin: 1px 0 1px 18px;
+    padding: 6px 8px; border-radius: 10px; border: 1px solid transparent;
+  }
   .sess .t { flex: 1; min-width: 0; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sess .time { flex: none; color: var(--faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
   .sess .time.running { color: var(--ok); }
@@ -494,7 +506,9 @@
   .sesssearch button:active { background: var(--card); color: var(--fg); }
   .sect { padding: 12px 12px 4px; font-size: 12px; color: var(--faint); font-weight: 600; letter-spacing: .05em; }
   .sess { padding: 10px 12px; border-radius: 10px; margin: 4px 0; cursor: pointer; border: 1px solid transparent; }
-  .sess:active, .sess.cur { background: var(--card); border-color: var(--line); }
+  .sess:active { background: var(--card); }
+  /* 主界面正在查看/流式的会话：浅紫底 + 描边——侧栏一眼认出"现在聊的是哪条" */
+  .sess.cur { background: var(--tint); border-color: rgba(124,92,255,.55); }
   .sess .t { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sess .m { font-size: 12px; color: var(--faint); display: flex; gap: 8px; }
   .sess .busy { color: var(--ok); }
@@ -3708,13 +3722,15 @@ function renderProjectList() {
   // cli_updated_at DESC；已删除的项目/会话、归档在数据源里就被过滤）。
   // 页面禁止再分组、再排序——此前"按最近会话时间自排"就是排序乱掉的根源。
   const groups = allGroups ?? [];
+  // 远程组排前（用户决策 2026-11-03），其后本地项目按服务端官方顺序
+  renderRemoteSection(box);
   if (!groups.length) { box.appendChild(el('div', 'sysline', '还没有项目和会话')); }
   for (const g of groups) {
     const p = String(g.path ?? '');
     const isCur = p === curWs;
     const row = el('div', 'wsrow' + (isCur ? ' cur' : ''));
     const fi = el('span', 'mi'); fi.innerHTML = FOLDER_SVG; row.appendChild(fi);
-    row.appendChild(el('div', '', g.label || projName(p)));
+    row.appendChild(el('div', 'plabel', g.label || projName(p)));
     // 项目行内「＋」：一键把新会话建到这个项目
     const add = el('button', 'wsadd', '＋');
     add.title = '在此项目新建会话';
@@ -3738,55 +3754,57 @@ function renderProjectList() {
       box.appendChild(less);
     }
   }
-  // 远程项目（官方任务栏同款层级：主机 → 远程项目 → 工作会话，点开只读浏览）
-  if (remoteHosts.length) {
-    const total = remoteHosts.reduce(
-      (a, h) => a + (h.projects ?? []).reduce((x, pr) => x + ((pr.sessions ?? []).length), 0), 0);
-    const head = el('div', 'archsect');
-    const chev = el('span', '', remoteSectExpanded ? '▾' : '▸');
-    chev.style.color = 'var(--faint)';
-    head.appendChild(chev);
-    head.appendChild(el('b', '', `远程项目（${total}）`));
-    head.style.cursor = 'pointer';
-    head.addEventListener('click', () => {
-      remoteSectExpanded = !remoteSectExpanded;
-      try { localStorage.setItem('zcode.remoteOpen', remoteSectExpanded ? '1' : '0'); } catch { /* 忽略 */ }
-      renderProjectList();
-    });
-    box.appendChild(head);
-    if (remoteSectExpanded) {
-      for (const h of remoteHosts) {
-        const hrow = el('div', 'wsrow');
-        const hi = el('span', 'mi'); hi.innerHTML = GLOBE_SVG; hrow.appendChild(hi);
-        hrow.appendChild(el('div', '', `${h.username}@${h.host}`));
-        if (!h.online) {
-          const off = el('span', 'time', '离线');
-          off.style.color = '#e5484d';
-          hrow.appendChild(off);
-        }
-        box.appendChild(hrow);
-        if (!h.online) continue;
-        for (const pr of h.projects ?? []) {
-          const sessions = pr.sessions ?? [];
-          const prow = el('div', 'wsrow');
-          const fi = el('span', 'mi'); fi.innerHTML = FOLDER_SVG; prow.appendChild(fi);
-          prow.appendChild(el('div', '', pr.name));
-          prow.appendChild(el('span', 'time', '远程'));
-          box.appendChild(prow);
-          const key = `${h.hostId}|${pr.projectId}`;
-          const expanded = !!remoteProjExpanded.get(key);
-          const list = expanded ? sessions : sessions.slice(0, 3);
-          for (const s of list) box.appendChild(remoteRow(h, s));
-          if (sessions.length > list.length) {
-            const more = el('button', 'morebtn', `显示更多（还有 ${sessions.length - list.length} 条）`);
-            more.addEventListener('click', () => { remoteProjExpanded.set(key, true); renderProjectList(); });
-            box.appendChild(more);
-          } else if (expanded && sessions.length > 3) {
-            const less = el('button', 'morebtn', '收起');
-            less.addEventListener('click', () => { remoteProjExpanded.set(key, false); renderProjectList(); });
-            box.appendChild(less);
-          }
-        }
+}
+
+// 远程项目组（官方任务栏同款层级：主机 → 远程项目 → 工作会话，点开只读浏览）。
+// 排本地项目之前——用户决策 2026-11-03「远程项目默认优先排前」。
+function renderRemoteSection(box) {
+  if (!remoteHosts.length) return;
+  const total = remoteHosts.reduce(
+    (a, h) => a + (h.projects ?? []).reduce((x, pr) => x + ((pr.sessions ?? []).length), 0), 0);
+  const head = el('div', 'archsect');
+  const chev = el('span', '', remoteSectExpanded ? '▾' : '▸');
+  chev.style.color = 'var(--faint)';
+  head.appendChild(chev);
+  head.appendChild(el('b', '', `远程项目（${total}）`));
+  head.style.cursor = 'pointer';
+  head.addEventListener('click', () => {
+    remoteSectExpanded = !remoteSectExpanded;
+    try { localStorage.setItem('zcode.remoteOpen', remoteSectExpanded ? '1' : '0'); } catch { /* 忽略 */ }
+    renderProjectList();
+  });
+  box.appendChild(head);
+  if (!remoteSectExpanded) return;
+  for (const h of remoteHosts) {
+    const hrow = el('div', 'wsrow');
+    const hi = el('span', 'mi'); hi.innerHTML = GLOBE_SVG; hrow.appendChild(hi);
+    hrow.appendChild(el('div', 'plabel', `${h.username}@${h.host}`));
+    if (!h.online) {
+      const off = el('span', 'time', '离线');
+      off.style.color = '#e5484d';
+      hrow.appendChild(off);
+    }
+    box.appendChild(hrow);
+    if (!h.online) continue;
+    for (const pr of h.projects ?? []) {
+      const sessions = pr.sessions ?? [];
+      const prow = el('div', 'wsrow');
+      const fi = el('span', 'mi'); fi.innerHTML = FOLDER_SVG; prow.appendChild(fi);
+      prow.appendChild(el('div', 'plabel', pr.name));
+      prow.appendChild(el('span', 'time', '远程'));
+      box.appendChild(prow);
+      const key = `${h.hostId}|${pr.projectId}`;
+      const expanded = !!remoteProjExpanded.get(key);
+      const list = expanded ? sessions : sessions.slice(0, 3);
+      for (const s of list) box.appendChild(remoteRow(h, s));
+      if (sessions.length > list.length) {
+        const more = el('button', 'morebtn', `显示更多（还有 ${sessions.length - list.length} 条）`);
+        more.addEventListener('click', () => { remoteProjExpanded.set(key, true); renderProjectList(); });
+        box.appendChild(more);
+      } else if (expanded && sessions.length > 3) {
+        const less = el('button', 'morebtn', '收起');
+        less.addEventListener('click', () => { remoteProjExpanded.set(key, false); renderProjectList(); });
+        box.appendChild(less);
       }
     }
   }
