@@ -170,6 +170,22 @@ INSERT/UPDATE 时直接按原生形状写全（`cli_title`/`cli_title_source='ge
 `needsBackfill` 豁免（`!host_id || cli_created_at==null`），让旧口径残留行被对账周期回填。
 两条硬边界（标题以共享库为权威、未落库一律不 INSERT）见同步函数头注与问题档案 #14，不变。
 
+**project_id 每轮重算（#38）**：`project_id` 挂到**已删除**项目时两端同时隐形——桌面侧栏
+项目列表 `Wmt = projects.filter(!deleted)`（app.asar 反解），挂死项目的行无组可挂，而
+`projectId=null` 才进默认组；手机 §2.10 也丢弃悬空行。因此**手机自身工作区**的行
+（`config.workspacePath` + `workspaces`，同幽灵行清理的口径）UPDATE 时 `project_id=?`
+无条件重算（项目被删→改挂 NULL→桌面默认组/手机 ws 组），"内容未变即跳过"条件加
+`projDrifted` 豁免；**非手机工作区**的行维持 `coalesce(project_id,?)`——桌面自己删的项目，
+其桌面会话尊重删除语义，桥不复活。
+
+**桌面刷新语义（#38，app.asar 反解确认）**：桌面渲染层只在三种时机重读索引——
+窗口 **focus**、内部 `state:projects` 广播（仅项目服务自身变更/远程源状态事件触发，
+外部进程无法注入）、引擎 sessions-index V4 订阅推送（只覆盖桌面引擎自己持有的会话，
+手机引擎的会话不在其中；app-server 为 stdio 单客户端，无共享引擎通道）。因此桥的
+实时上限 = **行先落索引 + 桌面 focus 拉取**：`scheduleIndexSync()` 在 turn.started、
+回合收口（completed/failed 后 3s）、建/开会话（2s）时事件驱动对账（2~3s 内落行，
+60s 周期兜底），用户切回桌面点一下窗口即可见。
+
 ### 2.9 远程项目桥（/api/remote/*）
 
 官方任务栏把远程 SSH 主机当一等公民，注册表就在**本地**任务索引里：
@@ -272,19 +288,27 @@ sessionId 双端白名单校验、5s 列表缓存 + 3s 消息缓存 + 单飞合�
   经 `addTurnArtifact` 去重收集（新回合清空），回合结束时在底部集中成卡片——
   文档/成果类（md/html/pdf/office/图片等，`DOC_ARTIFACT_RE`）直接平铺 chip（点击
   经 artifactBridge 打开查看器），代码/其他折叠为"另有 N 个"计数；随后才是结束分隔线。
+- **回合归属与结算闸（幽灵卡防线，见问题档案 #37）**：改动/产出计数由
+  `countTurnTool` 统一入口收集（callId 去重，全量重绘/轮询补尾/SSE tool.updated
+  三路只计一次；只计"最后一条用户消息之后"的工具，历史与上一回合永不混入）。
+  回合所属会话记录在 `turnSession`，`setBusy(false)` 的结算（两卡+结束线）仅在
+  `turnSession === curSession` 且 `busySince>0` 时绘制；切会话/新建/进远程一律先
+  `abandonTurn()` 静默抛弃旧回合（清 busySince/归属/收集态，只剩 UI 复位）。
 - `ui` 事件：权限批准卡片（批准/拒绝按钮文案匹配 App 审批检测）、`note`（重试提示行）。
 
 ### 3.3 运行态状态机（核心不变量：任何运行态都必须能退出）
 
 ```
-状态: busy(bool) + busySource('sse'|'inferred'|null)
+状态: busy(bool) + busySource('sse'|'inferred'|null) + turnSession(回合归属会话)
 时间戳: busySince(计时) lastActivity(存储变化) lastSseEventAt(流事件) finishedSince(收尾稳定)
+收集: turnChanged/turnArtifacts(当轮计数) + turnCounted(callId 去重) —— 结算后统一释放
 ```
 
 置位路径：
 1. SSE `turn.started` → `busySource='sse'`
 2. 活动事件推断（`!busy && part/tool 事件`）→ `'inferred'`（错过 turn.started 的旁观回合）
 3. openSession 恢复：server `busy/busySince` → 'sse'；存储末部件非 step-finish → 'inferred'
+   （`setBusy(true, {keepCollections:true})`：保留 renderHistory 从存储重建的当轮计数）
 4. `doSend` 成功
 
 收敛路径（全部以**存储**为事实源）：
@@ -315,8 +339,11 @@ App 桥（两代并存）：
 3. **排队绑定会话**：`sendQueue.push({text, sid})`，补发仍归原会话（`doSend(text, sid)`）。
 4. **boot 恢复优先级**：`busy 会话 > zcode.lastSession > 最近`——
    任务进度可见性 > 连续性 > 兜底（**顺序不能换**，lastSession 优先曾导致任务不可见的回归）。
+5. **回合归属闸**：回合结算（改动卡/产出卡/结束线）认 `turnSession === curSession`，
+   切会话入口一律 `abandonTurn()`——结算不再追画进新会话（#37；await 窗口里旧会话
+   事件把 busy 拉回的野态由 openSession 尾部 `busyHere` 归属核对兜住）。
 
-openSession 同时：记录 lastSession、重置计时基准、按 server busy/存储恢复运行态、
+openSession 同时：abandonTurn、记录 lastSession、重置计时基准、按 server busy/存储恢复运行态、
 `connectStream(sid, r.lastSeq)`（**增量订阅**，历史已渲染，避免全量重放文本重复）。
 
 ### 3.6 输入与排队
@@ -434,6 +461,8 @@ approval 高优通知）。页面 v2 通知与 DOM 桥**双通道并存**，通�
 | 34 | 远程 reader 首版把脚本 base64 后塞进 ssh 命令行（约 10.5KB）：远端 stdout 吐出**未解码的 base64 原文**、后续所有命令凭空消失、exit 0 且 stderr 空，Git Bash 手跑同一条命令却正常 | SSH exec 通道对远程命令行在 **~8192 字节**处腰斩（node spawn 二分实测：8042 字节命令完好，9042 起被截），命令行被切成 `printf %s <B64>` 后半段（含重定向）丢失，printf 直接打到外层 stdout；手跑正常是 Git Bash ssh.exe 走了不同的参数组装路径。与远端 shell/基础工具无关 | 脚本改走 **stdin**：`cat > 文件 && python3 文件`（命令行只剩几十字节），python3 优先、127 退 node；node 目标机同样落盘执行 | 双主机（一台仅 python3、一台 node22+python3）`/api/remote/projects` 全在线；`/api/remote/messages` 实测拉回 102KB 完整 MessageWithParts |
 | 35 | 用户报"看不到远程项目的工作会话"；同时怀疑过 `session/list` 漏数（API 143 条 vs 共享库 236 条） | 漏的 93 条全部 `task_type=subagent_child`（子代理子会话）：引擎列表口径**故意**排除，桌面任务索引里也一行都没有（0/93）——官方任务栏同样不把它们当顶层任务，属正常语义不是缺口（若日后"补齐"反而制造官方没有的幽灵行）。真正的缺口：官方任务栏的"远程项目"组（`hosts`+`remote_project_entries`，两台 SSH 主机三个项目）桥此前零实现，远端库里的当日工作会话手机端整体不可见 | 新增 §2.9 远程项目桥：`/api/remote/projects` + `/api/remote/messages`（SSH stdin 落盘 reader，桌面主列表口径过滤）；页面侧栏"远程项目"分组 + 只读会话视图（不 resume/不 SSE/composer 禁用/运行中 5s 跟随） | 页面实测：liang-linux、TongYi-Lite、DSH-Phone 三远程项目组出现，运行中会话（busy）点开后思考/工具/正文全量渲染、输入框置灰提示桌面端继续；搜索命中远程会话 |
 | 36 | 侧栏"删掉的项目/会话还在、归档还在、排序乱糟糟全跑到最下面"——用户两度斥责"官方都开源了还瞎做" | 侧栏数据源用错：拿引擎 `session/list`（不知道桌面删除态）+ 客户端按 updatedAt 自排。官方任务栏读的是**桌面任务索引**：删除/归档都是索引标志位（`deleted/cli_deleted/archived`），"删掉的项目"是 `projects.deleted=1` 且**挂其下的任务整行不显示**（实测 5 个已删项目名下仍有 50 条存活任务行，桌面靠项目树挂载关系过滤）；排序是项目按 `position`、任务按 `cli_updated_at DESC, task_id`。手机此前两处自造：悬空 project_id 落进无归属组、`config.workspaces` 白名单把已删项目路径垫回来 | 新增 §2.10 `dbOfficialSessionGroups()` 为侧栏唯一事实源（官方逐字查询 + 悬空项目丢弃 + 白名单跳过已删路径 + provider 过滤），页面只按服务端数组顺序渲染、禁自排；归档分组/入口从页面删除（官方主列表 `archived=0`，归档归桌面管） | 索引对账：glm 存活 68 行 − 50 悬空 = 18 条，与页面逐条一致、0 幽灵；浏览器实测侧栏 6 项目按 position 排列、已删项目/归档全部消失、远程组照旧 |
+| 37 | **空的新会话凭空出现"本回合修改 35 个文件 / 本轮产出 / 本轮结束·用时43秒"**；切到空闲会话 6 秒后旧会话总结卡"追"到它的消息后面；chip ×N 越看越大、卡片混入别的回合的文件 | 回合结算状态（busy/busySince/turnChanged/turnArtifacts）不绑定会话、只在 `setBusy(false)` 收尾时释放：①`openSession` 新建分支在 `renderHistory([])` **之后**调 `setBusy(false)`，旧回合两卡+结束线被补画进刚清屏的新会话；②切到已有空闲会话时三分支全不命中，busy 滞留到 pollTick 6 秒收敛才复位，卡片带旧回合 busySince 追画进 B；③renderTail 每次指纹变化**重放**窗口内全部已完成工具（计数 +1 无去重）→ ×N 虚增，窗口又跨回合把上一回合文件混入；SSE result 与存储部件双路 ×2 | `turnSession` 归属登记 + `setBusy(false)` 结算闸（`turnSession===curSession && busySince` 才画）；`abandonTurn()` 收编所有切会话入口（openSession/openRemoteSession）静默抛弃旧回合；`countTurnTool` 按 callId 三路去重、renderHistory/renderTail 只计"最后一条用户消息之后"的工具；恢复分支 `busyHere` 归属核对 + `keepCollections` 保住存储重建的当轮计数 | node --check 通过；场景走查（S1-S12）：busy 中新建→空会话只有 hero；busy 中切空闲→无卡无残转圈；重开运行中会话→计时续接、当轮计数不清零 |
+| 38 | **手机建的会话桌面始终不可见**（重启桌面也不显示）；手机主工作区 DSH-Phone 下 35 条历史会话**两端同时消失**（#32 修复"形状"后仍隐形） | 双重根因（app.asar 反解 2026-11-04 实证）：①**孤儿挂载**——行 `project_id` 指向已删除项目时两头都不可见：桌面侧栏项目列表 `Wmt=projects.filter(!deleted)`（挂死项目的行无组可挂，`projectId=null` 才进默认组 `WCt`），手机 §2.10 也丢弃悬空行；DSH-Phone 桌面项目 11-02 被删后，`syncTaskIndexRows` 的 UPDATE 用 `project_id=coalesce(project_id,?)` 永远保留死项目 id，35 条手机会话整批隐形。②**无实时通道**——桌面只在窗口 focus、内部 `state:projects` 广播（仅项目服务自身变更/远程源事件触发）、引擎 sessions-index V4 订阅（只覆盖桌面引擎自己持有的会话，手机引擎的会话不在内；app-server 为 stdio 单客户端）时重读索引，外部进程无从触发 | `syncTaskIndexRows` 对**手机自身工作区**行 `project_id=?` 每轮重算（挂死项目→改挂 NULL→桌面默认组/手机 ws 组；"内容未变即跳过"加 `projDrifted` 豁免），非手机工作区行维持 coalesce 尊重桌面删除语义；新增事件驱动对账 `scheduleIndexSync()`（turn.started / 回合收口后 3s / 建开会话后 2s，60s 周期兜底）——行先落索引，桌面 focus 即拉到 | 重启服务触发对账：桌面默认组 **0→41 条**（手机会话全量可见），剩余 20 条孤儿全是桌面自建×桌面自删项目（ComfyUI-M/TongYiOCR/Temp 等，按官方删除语义保留隐藏）；手机侧栏出现「DSH-Phone」ws 组 41 会话；桌面 readTree 模拟（fd 查询 + Wmt/BP 分组逐条核对）一致 |
 
 ---
 

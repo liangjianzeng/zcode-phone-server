@@ -364,7 +364,7 @@ const agent = new ZcodeAgent();
 agent.onEvent = (event) => {
   const s = sessionState(event.sessionId);
   s.lastSeq = Math.max(s.lastSeq, event.seq ?? 0);
-  if (event.type === 'turn.started') { s.busy = true; s.busySince = Date.now(); }
+  if (event.type === 'turn.started') { s.busy = true; s.busySince = Date.now(); scheduleIndexSync(); }
   // 回合可能由外部（桌面端）驱动、桥进程错过 turn.started：见到回合内
   // 活动事件也标记 busy，会话列表的"运行中"才不撒谎；completed/failed 复位。
   if (event.type === 'tool.updated' && !s.busy) { s.busy = true; if (!s.busySince) s.busySince = Date.now(); }
@@ -372,6 +372,9 @@ agent.onEvent = (event) => {
     s.busy = false; s.busySince = 0;
     // 本回合结束：若有排队消息，稍候自动补发为下一回合（预备任务语义）
     scheduleQueueFlush(event.sessionId, 1500);
+    // 回合结束 3s 后对账桌面任务索引：标题落库、状态收口，行先进索引，
+    // 用户切到桌面即可见（#37）
+    scheduleIndexSync(3000);
   }
   // 429 限流自动重试：桌面端与手机共用同一账户，桌面跑任务期间手机新回合
   // 大概率撞并发限流；而桌面在工具执行间隙账户是空闲的，退避重试基本能过。
@@ -1008,7 +1011,7 @@ async function syncTaskIndexRows(list) {
   try {
     const db = tasksDb();
     const existing = new Map();
-    for (const r of db.prepare('SELECT task_id, title, task_status, mode, updated_at, deleted, archived, title_overridden, meta_json, host_id, cli_created_at FROM tasks').all()) {
+    for (const r of db.prepare('SELECT task_id, title, task_status, mode, updated_at, deleted, archived, title_overridden, meta_json, host_id, cli_created_at, project_id FROM tasks').all()) {
       existing.set(r.task_id, r);
     }
     // 桌面任务列表的真实查询（app.asar 反解确认）：
@@ -1029,6 +1032,18 @@ async function syncTaskIndexRows(list) {
         return hits.length === 1 ? hits[0].project_id : null;
       } catch { return null; }
     };
+    // 手机自身工作区的行 project_id 每轮重算（问题档案 #37，2026-11-04）：
+    // 桌面侧栏只渲染未删除项目（app.asar Wmt = projects.filter(!deleted)），任务行按
+    // project_id 挂进对应项目组、project_id 为 NULL 才进默认组——行挂已删项目时
+    // 两头都不可见（桌面无组可挂、手机 dbOfficialSessionGroups 也丢弃悬空行）。
+    // 手机主工作区 E:\DTXY\DSH-Phone 的桌面项目 2026-11-02 被删后，35 条手机会话
+    // 就是这样整批隐形的。已删项目下的行必须改挂 NULL（桌面默认组 / 手机 ws 组）。
+    // 非手机工作区的行维持 coalesce 尊重桌面删除语义（桌面自己删的项目，其桌面
+    // 会话不该被桥复活）。
+    const ownWs = new Set(
+      [config.workspacePath, ...(config.workspaces ?? []).map((w) => w?.path)]
+        .map((p) => path.resolve(String(p)).toLowerCase()),
+    );
     // cli_last_outcome 桌面口径：error/interrupted/completed，其余（running 等）NULL
     const lastOutcome = (st) => (st === 'error' || st === 'interrupted' || st === 'completed' ? st : null);
     const ins = db.prepare(
@@ -1038,6 +1053,13 @@ async function syncTaskIndexRows(list) {
     const upd = db.prepare(
       'UPDATE tasks SET title=?, task_status=?, mode=?, updated_at=?, meta_json=?, ' +
       "host_id='local', root_path=workspace_path, project_id=coalesce(project_id, ?), " +
+      'cli_title=?, cli_title_source=CASE WHEN title_overridden=1 THEN cli_title_source ELSE ? END, ' +
+      'cli_created_at=coalesce(cli_created_at, ?), cli_updated_at=?, cli_last_outcome=?, cli_deleted=0, ' +
+      'handoff_pending=handoff_pending|8 WHERE task_id=?',
+    );
+    const updOwn = db.prepare(
+      'UPDATE tasks SET title=?, task_status=?, mode=?, updated_at=?, meta_json=?, ' +
+      "host_id='local', root_path=workspace_path, project_id=?, " +
       'cli_title=?, cli_title_source=CASE WHEN title_overridden=1 THEN cli_title_source ELSE ? END, ' +
       'cli_created_at=coalesce(cli_created_at, ?), cli_updated_at=?, cli_last_outcome=?, cli_deleted=0, ' +
       'handoff_pending=handoff_pending|8 WHERE task_id=?',
@@ -1071,9 +1093,16 @@ async function syncTaskIndexRows(list) {
       const engineTitle = String(s.title ?? '').trim();
       const dbTitle = meta0 ? meta0.title : '';
       const newTitle = titleOverridden ? old.title : (engineTitle || dbTitle || old.title || '');
+      const projId = projectIdFor(ws);
+      const isOwn = ownWs.has(path.resolve(ws).toLowerCase());
+      // 手机工作区行 project_id 漂移（挂上了已删/换主的项目）也是变化，不能被
+      // "内容没变就跳过"吞掉——否则孤儿行永远得不到改挂 NULL 的机会
+      const projDrifted = isOwn &&
+        (old.project_id ?? '') !== (projId ?? '') &&
+        !(old.project_id == null && projId == null);
       // 旧口径残留行（cli_* 全 NULL）即使内容没变也要走一次 UPDATE 补齐桌面形状
       const needsBackfill = !old.host_id || old.cli_created_at == null;
-      if (!needsBackfill && old.title === newTitle && Number(old.updated_at) === updatedAt && old.task_status === status) continue;
+      if (!needsBackfill && !projDrifted && old.title === newTitle && Number(old.updated_at) === updatedAt && old.task_status === status) continue;
       let meta = {};
       try { meta = JSON.parse(old.meta_json ?? '{}'); } catch { /* 空对象兜底 */ }
       meta.taskId = s.sessionId;
@@ -1086,8 +1115,9 @@ async function syncTaskIndexRows(list) {
       meta.provider = meta.provider ?? 'glm';
       meta.status = status;
       meta.titleOverridden = !!titleOverridden;
-      upd.run(newTitle, status, String(s.mode ?? old.mode ?? ''), updatedAt, JSON.stringify(meta),
-        projectIdFor(ws), newTitle, 'generated', createdAt, updatedAt, lastOutcome(status), s.sessionId);
+      const args = [newTitle, status, String(s.mode ?? old.mode ?? ''), updatedAt, JSON.stringify(meta),
+        projId, newTitle, 'generated', createdAt, updatedAt, lastOutcome(status), s.sessionId];
+      (isOwn ? updOwn : upd).run(...args);
       changed++;
     }
   } catch (e) {
@@ -1283,11 +1313,11 @@ function projName(p) {
 }
 
 // 桌面标题自动生成有延迟、页面也未必开着：每 60s 全量对账一次
-setInterval(() => {
-  agent.request('session/list', { limit: 200 })
-    .then((r) => {
+function reconcileTaskIndex() {
+  return agent.request('session/list', { limit: 200 })
+    .then(async (r) => {
       const sessions = (r.sessions ?? []);
-      syncTaskIndexRows(sessions.map((s) => ({
+      const n = await syncTaskIndexRows(sessions.map((s) => ({
         sessionId: s.sessionId,
         title: String(s.title ?? '').includes('\uFFFD') ? '' : s.title,
         status: s.status,
@@ -1297,9 +1327,26 @@ setInterval(() => {
         workspacePath: s.workspace?.workspacePath ?? s.workspace?.workspaceKey ?? s.workspacePath ?? '',
       })));
       cleanupGhostIndexRows(new Set(sessions.map((s) => s.sessionId)));
-    })
-    .catch(() => { /* 引擎未就绪：下个周期再试 */ });
-}, 60000).unref();
+      return n;
+    });
+}
+setInterval(() => { reconcileTaskIndex().catch(() => { /* 引擎未就绪：下个周期再试 */ }); }, 60000).unref();
+
+// 事件驱动对账（#37）：回合开始/结束、建/开会话后 2s 内就把行对账进桌面索引，
+// 用户切到桌面点一下窗口（窗口 focus 即重读索引）就能看到——不等 60s 周期。
+// 桌面没有外部可触发刷新的通道（app.asar 反解 2026-11-04：state:projects 只由
+// 项目服务变更/远程源事件触发），"行先到、桌面 focus 拉取"就是桥能给的实时上限。
+let idxSyncTimer = null;
+function scheduleIndexSync(delayMs = 2000) {
+  if (idxSyncTimer) return;
+  idxSyncTimer = setTimeout(() => {
+    idxSyncTimer = null;
+    reconcileTaskIndex()
+      .then((n) => { if (n) logLine('task-sync', `事件对账更新 ${n} 行`); })
+      .catch(() => { /* 引擎未就绪：60s 周期兜底 */ });
+  }, delayMs);
+  idxSyncTimer.unref?.();
+}
 
 // ────────────────────────── 远程项目（官方任务栏「远程项目」同款通道）──────────────────────────
 // 官方任务栏的远程项目以本地任务索引两张表为注册表：hosts(kind='ssh'，target_json 含
@@ -2093,6 +2140,8 @@ async function handleApi(req, res, url) {
     }
     if (!sid) throw new Error('session/create 未返回 sessionId');
     sessionState(sid);
+    // 建/开会话后事件驱动对账：resume 的存量会话状态/时间戳有变也一并刷新（#37）
+    scheduleIndexSync();
     // 缓存 create/resume 快照的投影：session/read 的 available 残缺（只剩当前
     // 模型），/settings 路由要用这份完整目录补齐（本地 personal 模型全靠它）
     resumeSettingsCache.set(sid, projectSettings(snap, sid));
