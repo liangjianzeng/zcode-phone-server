@@ -435,6 +435,8 @@
     color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .wsrow.cur { background: var(--tint); border-color: rgba(124,92,255,.5); }
+  /* 主机行下的项目行缩半格（远程 主机→项目→会话 三级层级） */
+  .wsrow.sub { margin-left: 16px; }
   .wsrow .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
   .wsrow.cur .dot { background: var(--ok); }
   .wsrow .p { color: var(--faint); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -447,11 +449,30 @@
     display: inline-flex; align-items: center; justify-content: center; padding: 0;
   }
   .wsrow .wsadd:active { background: var(--card); }
-  /* 会话行：官方单行布局 —— [✳运行中?] 标题 …… 相对时间，整体随项目缩进 */
+  /* 会话行：官方单行布局 —— [✳运行中?] 标题 …… 相对时间。
+     层级缩进由 .gkids 容器负责（会话行自己不再各排各的左距——此前后段
+     重复规则覆盖了缩进，项目与会话齐宽平铺，看得眼花） */
   .sess {
-    display: flex; align-items: center; gap: 8px; margin: 1px 0 1px 18px;
+    display: flex; align-items: center; gap: 8px; margin: 1px 0;
     padding: 6px 8px; border-radius: 10px; border: 1px solid transparent;
   }
+  /* 分组子树容器：整块右缩 + 竖向导轨线，一眼看出"这几条属于上面那个项目" */
+  .gkids {
+    margin: 1px 10px 9px 20px; padding-left: 11px;
+    border-left: 2px solid var(--line);
+  }
+  .gkids .sess { margin-left: 0; }
+  .gkids .morebtn { margin-left: 0; width: 100%; }
+  /* 项目头行右侧会话条数（层级观感的锚点） */
+  .wsrow .cnt { flex: none; color: var(--faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  /* 分组折叠手柄（▾/▸）：组级折叠与组内「显示更多」是两层语义，各有状态 */
+  .wsrow .twist {
+    flex: none; width: 24px; height: 24px; margin-left: -4px; padding: 0;
+    border: none; background: transparent; color: var(--faint);
+    font: inherit; font-size: 12px; line-height: 1; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center; border-radius: 7px;
+  }
+  .wsrow .twist:active { background: var(--card); color: var(--fg); }
   .sess .t { flex: 1; min-width: 0; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sess .time { flex: none; color: var(--faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
   .sess .time.running { color: var(--ok); }
@@ -505,7 +526,7 @@
   }
   .sesssearch button:active { background: var(--card); color: var(--fg); }
   .sect { padding: 12px 12px 4px; font-size: 12px; color: var(--faint); font-weight: 600; letter-spacing: .05em; }
-  .sess { padding: 10px 12px; border-radius: 10px; margin: 4px 0; cursor: pointer; border: 1px solid transparent; }
+  .sess { padding: 9px 10px; border-radius: 10px; margin: 2px 0; cursor: pointer; border: 1px solid transparent; }
   .sess:active { background: var(--card); }
   /* 主界面正在查看/流式的会话：浅紫底 + 描边——侧栏一眼认出"现在聊的是哪条" */
   .sess.cur { background: var(--tint); border-color: rgba(124,92,255,.55); }
@@ -3532,7 +3553,21 @@ let workspaces = [];      // config.workspaces（补齐还没有会话的项目�
 let curWs = localStorage.getItem('zcode.ws') ?? '';
 let allSessions = [];     // 摊平视图（busy/搜索/兜底用）；渲染以 allGroups 为准
 let allGroups = null;     // GET /api/sessions?all=1 → 任务索引官方口径分组（服务端排好序）
-const projExpanded = new Map(); // 项目路径 → 是否展开全部会话
+const projExpanded = new Map(); // 项目路径 → 是否展开全部会话（组内"显示更多"）
+// 组级折叠（用户要求支持折叠展开）：与组内展开是两层语义，全部持久化，
+// 手机重开抽屉/重进页面不丢整理成果
+const loadCollapsedSet = (k) => { try { return new Set(JSON.parse(localStorage.getItem(k) ?? '[]')); } catch { return new Set(); } };
+const saveCollapsedSet = (k, s) => { try { localStorage.setItem(k, JSON.stringify([...s])); } catch { /* 忽略 */ } };
+const projCollapsed = loadCollapsedSet('zcode.collapsed');
+const remoteHostCollapsed = loadCollapsedSet('zcode.remoteHostCollapsed');
+const remoteProjCollapsed = loadCollapsedSet('zcode.remoteProjCollapsed');
+function collapseTwist(collapsed, hasKids, onToggle) {
+  const t = el('button', 'twist', collapsed ? '▸' : '▾');
+  t.title = collapsed ? '展开' : '折叠';
+  if (!hasKids) t.style.visibility = 'hidden';
+  t.addEventListener('click', (ev) => { ev.stopPropagation(); if (hasKids) onToggle(); });
+  return t;
+}
 
 const FOLDER_SVG = '<svg class="ic sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2.5h8A1.5 1.5 0 0 1 20.5 9v8.5a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5v-11z"/></svg>';
 
@@ -3727,10 +3762,21 @@ function renderProjectList() {
   if (!groups.length) { box.appendChild(el('div', 'sysline', '还没有项目和会话')); }
   for (const g of groups) {
     const p = String(g.path ?? '');
+    const gkey = String(g.key ?? p);
     const isCur = p === curWs;
+    const sessions = g.sessions ?? [];
+    const collapsed = projCollapsed.has(gkey);
     const row = el('div', 'wsrow' + (isCur ? ' cur' : ''));
+    // ▾/▸ 折叠整组（持久化）；行身点击仍是"切到该项目"，＋ 是"建到该项目"
+    row.appendChild(collapseTwist(collapsed, sessions.length > 0, () => {
+      if (projCollapsed.has(gkey)) projCollapsed.delete(gkey); else projCollapsed.add(gkey);
+      saveCollapsedSet('zcode.collapsed', projCollapsed);
+      renderProjectList();
+    }));
     const fi = el('span', 'mi'); fi.innerHTML = FOLDER_SVG; row.appendChild(fi);
     row.appendChild(el('div', 'plabel', g.label || projName(p)));
+    // 条数锚点：头行右侧显示总数，配合下方导轨线子树，层级一眼可辨
+    if (sessions.length) row.appendChild(el('span', 'cnt', String(sessions.length)));
     // 项目行内「＋」：一键把新会话建到这个项目
     const add = el('button', 'wsadd', '＋');
     add.title = '在此项目新建会话';
@@ -3739,20 +3785,23 @@ function renderProjectList() {
     if (isCur) { const d = el('span', 'dot'); row.appendChild(d); }
     row.addEventListener('click', () => switchWorkspace(p));
     box.appendChild(row);
-    // 每个项目平铺最近 3 条会话，「显示更多」展开全量（官方交互）
-    const sessions = g.sessions ?? [];
-    const expanded = !!projExpanded.get(g.key ?? p);
+    // 折叠态：整棵子树不渲染。展开态：平铺最近 3 条，「显示更多」展开全量（官方交互）；
+    // 会话整体收进 .gkids（右缩 + 竖向导轨），不再与项目头齐宽平铺
+    if (collapsed || !sessions.length) continue;
+    const kids = el('div', 'gkids');
+    const expanded = !!projExpanded.get(gkey);
     const list = expanded ? sessions : sessions.slice(0, 3);
-    for (const s of list) box.appendChild(sessRow(s, p || s.workspacePath));
+    for (const s of list) kids.appendChild(sessRow(s, p || s.workspacePath));
     if (sessions.length > list.length) {
       const more = el('button', 'morebtn', `显示更多（还有 ${sessions.length - list.length} 条）`);
-      more.addEventListener('click', () => { projExpanded.set(g.key ?? p, true); renderProjectList(); });
-      box.appendChild(more);
+      more.addEventListener('click', () => { projExpanded.set(gkey, true); renderProjectList(); });
+      kids.appendChild(more);
     } else if (expanded && sessions.length > 3) {
       const less = el('button', 'morebtn', '收起');
-      less.addEventListener('click', () => { projExpanded.set(g.key ?? p, false); renderProjectList(); });
-      box.appendChild(less);
+      less.addEventListener('click', () => { projExpanded.set(gkey, false); renderProjectList(); });
+      kids.appendChild(less);
     }
+    box.appendChild(kids);
   }
 }
 
@@ -3776,7 +3825,14 @@ function renderRemoteSection(box) {
   box.appendChild(head);
   if (!remoteSectExpanded) return;
   for (const h of remoteHosts) {
+    const hkey = String(h.hostId ?? h.host);
+    const hostCollapsed = remoteHostCollapsed.has(hkey);
     const hrow = el('div', 'wsrow');
+    hrow.appendChild(collapseTwist(hostCollapsed, (h.projects ?? []).length > 0, () => {
+      if (remoteHostCollapsed.has(hkey)) remoteHostCollapsed.delete(hkey); else remoteHostCollapsed.add(hkey);
+      saveCollapsedSet('zcode.remoteHostCollapsed', remoteHostCollapsed);
+      renderProjectList();
+    }));
     const hi = el('span', 'mi'); hi.innerHTML = GLOBE_SVG; hrow.appendChild(hi);
     hrow.appendChild(el('div', 'plabel', `${h.username}@${h.host}`));
     if (!h.online) {
@@ -3785,27 +3841,38 @@ function renderRemoteSection(box) {
       hrow.appendChild(off);
     }
     box.appendChild(hrow);
-    if (!h.online) continue;
+    if (!h.online || hostCollapsed) continue;
     for (const pr of h.projects ?? []) {
       const sessions = pr.sessions ?? [];
-      const prow = el('div', 'wsrow');
+      const key = `${h.hostId}|${pr.projectId}`;
+      const collapsed = remoteProjCollapsed.has(key);
+      const prow = el('div', 'wsrow sub');
+      prow.appendChild(collapseTwist(collapsed, sessions.length > 0, () => {
+        if (remoteProjCollapsed.has(key)) remoteProjCollapsed.delete(key); else remoteProjCollapsed.add(key);
+        saveCollapsedSet('zcode.remoteProjCollapsed', remoteProjCollapsed);
+        renderProjectList();
+      }));
       const fi = el('span', 'mi'); fi.innerHTML = FOLDER_SVG; prow.appendChild(fi);
       prow.appendChild(el('div', 'plabel', pr.name));
+      if (sessions.length) prow.appendChild(el('span', 'cnt', String(sessions.length)));
       prow.appendChild(el('span', 'time', '远程'));
       box.appendChild(prow);
-      const key = `${h.hostId}|${pr.projectId}`;
+      // 会话收进 .gkids：与本地项目同款导轨缩进（主机→项目→会话层级清晰）；折叠则整树不渲染
+      if (collapsed || !sessions.length) continue;
+      const kids = el('div', 'gkids');
       const expanded = !!remoteProjExpanded.get(key);
       const list = expanded ? sessions : sessions.slice(0, 3);
-      for (const s of list) box.appendChild(remoteRow(h, s));
+      for (const s of list) kids.appendChild(remoteRow(h, s));
       if (sessions.length > list.length) {
         const more = el('button', 'morebtn', `显示更多（还有 ${sessions.length - list.length} 条）`);
         more.addEventListener('click', () => { remoteProjExpanded.set(key, true); renderProjectList(); });
-        box.appendChild(more);
+        kids.appendChild(more);
       } else if (expanded && sessions.length > 3) {
         const less = el('button', 'morebtn', '收起');
         less.addEventListener('click', () => { remoteProjExpanded.set(key, false); renderProjectList(); });
-        box.appendChild(less);
+        kids.appendChild(less);
       }
+      box.appendChild(kids);
     }
   }
 }
