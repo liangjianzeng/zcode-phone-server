@@ -746,7 +746,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-11-03.6';
+const PAGE_BUILD = '2026-11-03.7';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -1558,9 +1558,29 @@ function addTurnChanged(p) {
 function toolFilePath(input) {
   return String(input?.file_path ?? input?.filePath ?? input?.path ?? input?.notebook_path ?? '');
 }
+// 回合簿记归属与去重（2026-11-03 幽灵卡修复）：
+// turnSession —— 当前回合所属的会话。setBusy(false) 的结算（改动卡/产出卡/
+//   结束线）只在它等于 curSession 时才画：切会话瞬间（含 await 窗口里旧会话
+//   事件把 busy 拉回来的情况）回合结算绝不追画进新会话视图。
+// turnCounted —— 已计入两卡的工具 callId。全量重绘 / 轮询补尾 / SSE tool.updated
+//   三路都会反复喂同一工具，不去重时 chip 的 ×N 大半是轮询重放计数，且轮询
+//   窗口尾巴会捎上上一回合的文件。
+let turnSession = null;
+let turnCounted = new Set(); // key: callId|path
+function countTurnTool(callId, toolName, p, status) {
+  const s = String(p ?? '');
+  if (!s || status !== 'completed') return;
+  const key = `${String(callId ?? '')}|${s}`;
+  if (turnCounted.has(key)) return;
+  turnCounted.add(key);
+  addTurnArtifact(s);
+  if (EDIT_TOOL_RE.test(String(toolName ?? ''))) addTurnChanged(s);
+}
 
 let lastTurnFailed = false; // turn.failed 置位：失败回合不画"本轮结束"线（红字 errline 就是终点）
-function setBusy(on) {
+// opts.keepCollections：恢复"仍在进行的回合"时用——renderHistory 刚从存储
+// 重建了当轮的改动/产出计数，新回合清场会把它们连锅端掉（重开会话卡片清零）。
+function setBusy(on, opts = {}) {
   const wasBusy = busy; // 回合边界判定：false→true 才是新回合（多个置 busy 路径都先改 busySince，不能拿它当边界）
   busy = on;
   const status = $('turnStatus');
@@ -1586,17 +1606,22 @@ function setBusy(on) {
     spinRow.remove();
   }
   if (on) {
+    turnSession = curSession; // 回合归属登记（切换期重新接管也一样盖写，旧归属不带入）
     if (!busySince) busySince = Date.now();
-    if (!wasBusy) { turnArtifacts.clear(); turnChanged.clear(); } // 新回合开始（false→true 才是边界）：产出只收集当轮，不跨回合积累
+    if (!wasBusy && !opts.keepCollections) { turnArtifacts.clear(); turnChanged.clear(); turnCounted.clear(); } // 新回合开始（false→true 才是边界）：产出只收集当轮，不跨回合积累
     tickElapsed();
     if (!elapsedTimer) elapsedTimer = setInterval(tickElapsed, 1000);
   } else {
     markThinkDurations();
     // 回合收尾（含轮询推断的收尾）：所有思考都已完成，折叠展开中的思考行
     collapseOpenThinks();
+    // 回合结算归属闸：改动卡/产出卡/结束线只回放到回合所属会话。
+    // 切会话时 abandonTurn 已把 busySince 清零 + 归属置空，这里再拿
+    // turnSession 对一道，双保险（SSE reset/session.closed 等路径同样被兜住）。
+    const settle = busySince && turnSession === curSession;
     // 本回合更改文件卡（对照官方 changeSummary：改了哪些文件一目了然）：
     // chip 沿用 .fileMention（App 成果桥按 class+title 接管点击直接打开文件）
-    if (busySince && turnChanged.size) {
+    if (settle && turnChanged.size) {
       for (const old of chat.querySelectorAll('.turnchanges')) old.remove();
       const card = el('div', 'turnchanges');
       const tt = el('div', 'tt');
@@ -1614,11 +1639,10 @@ function setBusy(on) {
       card.appendChild(chips);
       chat.appendChild(card);
       scrollBottom();
-      turnChanged.clear();
     }
     // 本轮产出卡：回合内成功写出的文档/成果集中排在回合最底部（点开即看）；
     // 代码/其他条目可能太多，折叠为计数。失败回合也照常展示（文件已存在）。
-    if (busySince && turnArtifacts.size) {
+    if (settle && turnArtifacts.size) {
       const docs = []; const code = [];
       for (const p of turnArtifacts.keys()) (DOC_ARTIFACT_RE.test(p) ? docs : code).push(p);
       if (docs.length || code.length) {
@@ -1640,12 +1664,11 @@ function setBusy(on) {
         chat.appendChild(card);
         scrollBottom();
       }
-      turnArtifacts.clear();
     }
     // 回合结束分隔线：转圈消失太不显眼，用户分不清智能体是干完了还是卡了。
     // ≥5 秒的回合在对话流末尾补一条结束线（带用时）；失败回合自带红字
     // errline 不重复画。SSE 收尾与轮询推断收尾（桌面驱动回合）都走这里。
-    if (busySince) {
+    if (settle) {
       const durS = Math.max(1, Math.round((Date.now() - busySince) / 1000));
       if (durS >= 5 && !lastTurnFailed) {
         const dur = durS < 60 ? `${durS} 秒` : `${Math.floor(durS / 60)} 分 ${durS % 60} 秒`;
@@ -1653,12 +1676,35 @@ function setBusy(on) {
         scrollBottom();
       }
     }
+    // 无论结算是否渲染：收集状态在此统一释放，绝不带进下一个回合/会话
+    turnChanged.clear();
+    turnArtifacts.clear();
+    turnCounted.clear();
+    turnSession = null;
     lastTurnFailed = false;
     busySince = 0;
     if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
     $('turnElapsed').textContent = '';
     setActivity('');
   }
+}
+
+// ── 切会话：静默抛弃当前回合 ──
+// setBusy(false) 的结算负责把改动卡/产出卡/结束线画回聊天流，若切会话时"顺手
+// 复位"，旧回合的总结就会追画进新会话视图（空的新会话凭空出现别的会话的
+// 35 个文件卡，2026-11-03 实锤）。开新会话/切会话/进远程只读一律走这里：
+// busySince 与归属先清零让卡片闸失配，setBusy(false) 只剩收转圈/计时/按钮的
+// UI 复位职责。运行中的回合不丢——会话重新打开时由 renderHistory 从存储
+// 重建当轮计数、由 r.busySince 续时。
+function abandonTurn() {
+  busySource = null;
+  busySince = 0;
+  lastTurnFailed = false;
+  finishedSince = 0;
+  turnChanged.clear();
+  turnArtifacts.clear();
+  turnCounted.clear();
+  setBusy(false); // 幂等：非 busy 时仅做 UI 复位
 }
 
 // ── 消息渲染 ──
@@ -2140,7 +2186,14 @@ function renderHistory(messages, opts = {}) {
     chat.appendChild(hero);
     return;
   }
-  for (const msg of vis) {
+  // "本回合"簿记窗口：最后一条用户消息（回合边界）之后的工具才允许计入
+  // 改动/产出卡——此前开窗把窗口内所有历史工具灌进 map，卡片内容张冠李戴
+  let turnStart = 0;
+  for (let i = vis.length - 1; i >= 0; i--) {
+    if ((vis[i].info?.role ?? '') === 'user') { turnStart = i + 1; break; }
+  }
+  for (let vi = 0; vi < vis.length; vi++) {
+    const msg = vis[vi];
     const role = msg.info?.role ?? 'assistant';
     const mid = String(msg.info?.messageId ?? msg.info?.id ?? Math.random());
     const m = ensureMsg(mid, role === 'user' ? 'user' : 'assistant');
@@ -2166,13 +2219,10 @@ function renderHistory(messages, opts = {}) {
           const status = st.status ?? 'pending';
           const detail = status === 'error' ? st.error : st.output;
           setToolStatus(part.callId, status, undefined, detail);
-          // 工具的 Write/Edit 目标文件 → chip
+          // 工具的 Write/Edit 目标文件 → chip（历史消息也挂，chip 与计数无关）
           const fp = st?.input?.file_path ?? st?.input?.filePath ?? st?.input?.path;
           if (fp) fileChip(card.body, String(fp));
-          if (fp && status === 'completed') {
-            addTurnArtifact(String(fp));
-            if (EDIT_TOOL_RE.test(String(part.tool ?? ''))) addTurnChanged(String(fp));
-          }
+          if (fp && vi >= turnStart) countTurnTool(part.callId, part.tool, String(fp), status);
           break;
         }
         default: break;
@@ -2671,10 +2721,10 @@ function handleZcodeEvent(ev) {
         const s = JSON.stringify(p.result ?? {});
         const fp = s.match(/"(?:file_path|filePath|path)":"([^"]+)"/);
         if (fp) fileChip(toolEls.get(id)?.body ?? chat, fp[1]);
-        if (fp) addTurnArtifact(fp[1]);
-        // 改动类工具：输入里的目标文件计入"本回合修改"卡
-        const inp = toolFilePath(p.input);
-        if (inp && EDIT_TOOL_RE.test(String(p.toolName ?? ''))) addTurnChanged(inp);
+        // 计数统一走 countTurnTool：优先输入目标路径、缺省回落结果携带路径；
+        // 与存储部件（renderHistory/renderTail）按 callId 去重，消除双路 ×2
+        const tp = toolFilePath(p.input) || (fp ? fp[1] : '');
+        if (tp) countTurnTool(id, p.toolName, tp, 'completed');
       }
       if (p.kind === 'error') setToolStatus(id, 'error', undefined, p.error ? JSON.stringify(p.error, null, 1) : undefined);
       break;
@@ -2984,7 +3034,15 @@ function dropMatchingUserEcho(text) {
 
 function renderTail(messages) {
   let changed = false;
-  for (const msg of messages) {
+  // "本回合"簿记窗口（与 renderHistory 同口径）：只计最后一条可见用户
+  // 消息之后的工具，轮询窗口跨回合时不把上一回合的文件混进当轮卡
+  let turnStart = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (isHiddenMessage(messages[i]?.info)) continue;
+    if ((messages[i].info?.role ?? '') === 'user') { turnStart = i + 1; break; }
+  }
+  for (let mi = 0; mi < messages.length; mi++) {
+    const msg = messages[mi];
     // 合成消息（TodoWrite 提醒/<task-notification>/<subagent-message>）：
     // 跳过渲染，并移除可能已被 SSE 实时路径画出来的气泡（自愈）
     if (isHiddenMessage(msg?.info)) {
@@ -3049,10 +3107,7 @@ function renderTail(messages) {
           setToolStatus(part.callId, status, undefined, detail);
           const fp = st?.input?.file_path ?? st?.input?.filePath ?? st?.input?.path;
           if (fp) fileChip(card.body, String(fp));
-          if (fp && status === 'completed') {
-            addTurnArtifact(String(fp));
-            if (EDIT_TOOL_RE.test(String(part.tool ?? ''))) addTurnChanged(String(fp));
-          }
+          if (fp && mi >= turnStart) countTurnTool(part.callId, part.tool, String(fp), status);
           changed = true;
           break;
         }
@@ -4041,12 +4096,11 @@ async function openRemoteSession(h, s) {
     if (mySeq !== openSeq) return; // 已有更新的打开/切换请求接管
     if (r.error) throw new Error(String(r.error));
     stopRemoteFollow();
+    abandonTurn(); // 旧会话回合静默抛弃：结算卡不追画进远程只读视图（见 abandonTurn）
     remoteView = { hostId: h.hostId, sessionId: s.sessionId, title: s.title || '未命名会话', host: h.host, username: h.username };
     // 本地会话状态整体退出：curSession=null 后轮询/队列/任务计划自动静默，SSE 手动关
     curSession = null;
     if (es) { es.close(); es = null; }
-    busySource = null;
-    setBusy(false);
     lastSseEventAt = Date.now();
     lastActivity = Date.now();
     finishedSince = 0;
@@ -4093,6 +4147,9 @@ function setComposerEnabled(on) {
 
 async function openSession(sessionId, wsPath) {
   const mySeq = ++openSeq;
+  // 切会话/新建：静默抛弃当前回合（幽灵卡根因修复，见 abandonTurn）——
+  // 旧会话回合的改动卡/产出卡/结束线不会再跟画进新会话视图
+  abandonTurn();
   // 从远程只读视图切回本地会话：恢复输入、停远程跟随
   stopRemoteFollow();
   remoteView = null;
@@ -4147,21 +4204,26 @@ async function openSession(sessionId, wsPath) {
     histLimit = r.messages?.length ? Math.max(r.messages.length, 40) : 40;
     histTotal = Number(r.total ?? (r.messages ?? []).length);
     renderHistory(r.messages ?? [], { keepThinkOpen: running || foreignRunning });
-    // 恢复会话时对齐运行态：服务端 ring 为空（重启过）也能正确显示"运行中"
-    if (running && !busy) {
+    // 恢复会话时对齐运行态：服务端 ring 为空（重启过）也能正确显示"运行中"。
+    // 归属核对：切会话的 await 窗口里，旧会话在途事件可能把 busy 又拉起来
+    // （turnSession 还指着旧会话）——那种 busy 不算数，必须按新会话实况重判
+    const busyHere = busy && turnSession === curSession;
+    if (running && !busyHere) {
       busySource = 'sse';
       busySince = r.busySince ?? Date.now();
-      setBusy(true);
+      setBusy(true, { keepCollections: true }); // 保留 renderHistory 从存储重建的当轮计数
       notifyTaskState(true);
       startLiveTimers();
-    } else if (foreignRunning && !busy) {
+    } else if (foreignRunning && !busyHere) {
       busySource = 'inferred';
       busySince = Date.now();
       lastActivity = Date.now();
-      setBusy(true);
+      setBusy(true, { keepCollections: true });
       notifyTaskState(true);
       startLiveTimers();
-    } else if (!running && !foreignRunning && busy && !sessionId) {
+    } else if (busy && !running && !foreignRunning) {
+      // 目标空闲而 busy 还挂着（切换期串进来的野态）：静默复位，结算闸拦住补画；
+      // 目标在跑且 busyHere 已成立时不进这里——运行态原样保留
       busySource = null;
       setBusy(false);
     }
