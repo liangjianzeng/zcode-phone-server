@@ -31,6 +31,7 @@ ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Prot
 | 发送队列 | 引擎 `session/send` 单飞（运行中 409）：运行中收到的消息入队（绑定会话、可取回删除），回合结束后自动补发为下一回合；桌面驱动的回合按共享存储核实收尾后补发 |
 | 限流自动重试 | `turn.failed` 匹配 429/限流时自动重发（5 次 × 20s，`__retry` inputId 防重复回显）；1113/余额类错误不重试，直接推人话提示 |
 | 桌面任务索引同步 | 会话标题/状态按共享 sqlite 库对账进桌面任务索引（标题为空不落库、幽灵行 30 分钟清理）；行必须写成**桌面原生形状**（`host_id/root_path/project_id/cli_title/cli_created_at`…）——桌面列表查询按 `cli_created_at IS NOT NULL` 过滤、项目树按 `project_id` 挂载，缺字段=手机建的会话桌面隐形（详见 MODULE-DESIGN §2.8） |
+| 远程项目桥 | 官方任务栏同款「远程项目」组：注册表读本地任务索引 `hosts`/`remote_project_entries`，工作会话经零依赖 SSH（stdin 落盘 reader，python3/node 双运行时）直查远端 `~/.zcode` 库，按桌面主列表口径过滤；只连注册表主机、只读（详见 MODULE-DESIGN §2.9） |
 | 页面自更新 | `index.html` 内容 md5 指纹经 `/api/state` 下发，页面轮询比对自动 reload——**改完页面无需重启服务、无需手机手动刷新** |
 | 静态服务 | `public/` 每请求读盘；token 鉴权（query `?token=` / header `x-zptoken` / cookie） |
 
@@ -48,6 +49,7 @@ ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Prot
 - **消息分叉（对照桌面 fork）**：助手消息操作行"分叉"→ `POST /api/sessions/:id/fork` → 引擎 `session/fork`，从该消息派生新会话（运行中引擎拒绝并透出文案）。
 - **Markdown 图片**：正文 `![alt](url)` 直接渲染（懒加载，点击放大）。
 - **键盘适配（visualViewport）**：adjustPan 型 WebView 键盘弹出时锁定可视高度并抵消平移，输入卡不再被软键盘遮挡（adjustResize 环境自动 no-op）。
+- **远程项目工作会话（对照官方任务栏）**：侧栏「远程项目」分组（主机→项目→会话，运行中转圈），点开**只读浏览**——远端回合的思考/工具/正文全量渲染，运行中 5s 自动跟随，输入框禁用并提示"请在桌面端继续"。
 - **回合结束分隔线**：≥5 秒的回合结束在对话流末尾显示"✓ 本轮结束 · 用时 X"（失败回合显示红字 errline，不重复画线）。
 - **外观主题**：左侧栏 ☀ → 跟随系统（实时 matchMedia）/ 浅色 / 深色，localStorage 持久，首帧预应用不闪错主题。
 - 断线自愈：SSE 断流、服务重启（`event: reset`）、引擎丢会话均自动 resume；任何运行态都能收敛退出（不会永久转圈）。
@@ -109,6 +111,8 @@ http://127.0.0.1:8787/?token=<token>
 | `GET/POST /api/plugins`、`/api/plugins/setEnabled` | 插件列表 / 启停 |
 | `GET /api/skills`、`/api/workflows` | 技能 / 工作流（项目 + 全局合并） |
 | `GET /api/search/files?q=&workspace=` | 工作区文件搜索（@ 引用候选；空 q = 最近修改） |
+| `GET /api/remote/projects` | 远程项目组（官方任务栏同源：hosts/remote_project_entries 注册表 + SSH 查远端任务索引） |
+| `GET /api/remote/messages?host=&sessionId=` | 远程会话消息（SSH 查远端共享库，`{info,parts}` 与本地同构，只读） |
 | `POST /api/sessions/:id/fork` `{messageId?}` | 分叉会话（引擎 `session/fork`；缺省从最近 checkpoint） |
 | `GET /api/plan` | 订阅计划 + 当前套餐余额（z.ai billing/balance 的 remaining/total） |
 

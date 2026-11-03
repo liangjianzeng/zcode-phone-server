@@ -1112,6 +1112,280 @@ setInterval(() => {
     .catch(() => { /* 引擎未就绪：下个周期再试 */ });
 }, 60000).unref();
 
+// ────────────────────────── 远程项目（官方任务栏「远程项目」同款通道）──────────────────────────
+// 官方任务栏的远程项目以本地任务索引两张表为注册表：hosts(kind='ssh'，target_json 含
+// host/port/username) + remote_project_entries(cached_name/cached_roots_json/
+// initial_position/cached_deleted)。注意这两张表全是**本地缓存元数据**——远程项目的
+// 工作会话（tasks + 共享库消息）在远程机自己的 ~/.zcode/v2/tasks-index.sqlite +
+// cli/db/db.sqlite 里，桌面经 SSH agent 查远端。桥用零依赖 SSH 复刻同一语义：
+// reader 脚本经 stdin 送到远端落盘执行（`cat > file && python3 file`，缺 python3
+// 退 node）——命令行超 ~8192 字节会被 exec 通道腰斩，脚本不能走命令行（#34）。
+// 查询按桌面主列表口径过滤（deleted=0、cli_deleted=0、cli_created_at IS NOT NULL、
+// archived=0），消息按共享库 message/part 组装成 {info,parts}，与本地
+// session/messages 同构、页面可直接渲染。远端不可达只标该 host 离线，不影响本地列表；
+// 5s 短缓存 + 单飞合并防页面轮询打爆 SSH。只连注册表里的 host，不接受任意地址。
+const REMOTE_READER_JS = `
+const { DatabaseSync } = require('node:sqlite');
+const os = require('os');
+const p = require('path');
+const A = __ARGS__;
+const out = {};
+try {
+  if (A.mode === 'tasks') {
+    const db = new DatabaseSync(p.join(os.homedir(), '.zcode', 'v2', 'tasks-index.sqlite'), { readOnly: true });
+    const rows = db.prepare(
+      'SELECT t.task_id,t.title,t.cli_title,t.task_status,t.mode,t.cli_updated_at,t.updated_at,' +
+      't.cli_created_at,t.created_at,t.workspace_path,t.project_id,p.name AS project_name ' +
+      'FROM tasks t LEFT JOIN projects p ON p.project_id=t.project_id ' +
+      'WHERE t.deleted=0 AND coalesce(t.cli_deleted,0)=0 AND t.cli_created_at IS NOT NULL AND t.archived=0 ' +
+      'ORDER BY coalesce(t.cli_updated_at,t.updated_at) DESC LIMIT ?'
+    ).all(A.limit ?? 200);
+    let sdb = null;
+    try { sdb = new DatabaseSync(p.join(os.homedir(), '.zcode', 'cli', 'db', 'db.sqlite'), { readOnly: true }); } catch (e) { sdb = null; }
+    const lastMsgs = sdb && sdb.prepare(
+      'SELECT m.data AS mdata,m.time_updated AS mut,' +
+      '(SELECT q.data FROM part q WHERE q.message_id=m.id ORDER BY q.sequence DESC LIMIT 1) AS pdata ' +
+      'FROM message m WHERE m.session_id=? ORDER BY m.sequence DESC LIMIT 3'
+    );
+    out.tasks = rows.map((t) => {
+      let title = String(t.cli_title ?? '');
+      if (!title || title.indexOf('\\uFFFD') >= 0) title = String(t.title ?? '');
+      if (title.indexOf('\\uFFFD') >= 0) title = '';
+      let updatedAt = Math.max(Number(t.cli_updated_at ?? 0), Number(t.updated_at ?? 0));
+      let running = false;
+      if (lastMsgs) {
+        try {
+          for (const row of lastMsgs.all(t.task_id)) {
+            let d = null;
+            try { d = JSON.parse(row.mdata ?? '{}'); } catch (e) { continue; }
+            if (!d) continue;
+            if (d.visibility === 'model-only' || (d.metadata && d.metadata.visibility === 'model-only') ||
+                (d.semantics && d.semantics.uiVisibility === 'hidden')) continue;
+            let lt = '';
+            if (row.pdata) { try { lt = String(JSON.parse(row.pdata).type ?? ''); } catch (e) { lt = ''; } }
+            updatedAt = Math.max(updatedAt, Number(row.mut ?? 0));
+            running = String(d.role ?? '') === 'assistant' && !!row.pdata && lt !== 'step-finish' &&
+              Date.now() - Number(row.mut ?? 0) < 1800000;
+            break;
+          }
+        } catch (e) { /* best effort */ }
+      }
+      return {
+        sessionId: String(t.task_id), title,
+        status: t.task_status ?? 'completed', mode: t.mode ?? '',
+        updatedAt, createdAt: Number(t.cli_created_at ?? t.created_at ?? 0),
+        workspacePath: t.workspace_path ?? '', projectId: String(t.project_id ?? ''),
+        projectName: t.project_name ?? '', busy: running,
+      };
+    });
+  } else if (A.mode === 'messages') {
+    if (!/^(sess|session)_[A-Za-z0-9._-]+$/.test(String(A.sessionId ?? ''))) throw new Error('bad sessionId');
+    const db = new DatabaseSync(p.join(os.homedir(), '.zcode', 'cli', 'db', 'db.sqlite'), { readOnly: true });
+    const ms = db.prepare('SELECT id,data FROM message WHERE session_id=? ORDER BY sequence ASC LIMIT ?')
+      .all(String(A.sessionId), A.limit ?? 200);
+    const ps = db.prepare('SELECT data FROM part WHERE message_id=? ORDER BY sequence ASC');
+    out.messages = ms.map((m) => {
+      let info = {};
+      try { info = JSON.parse(m.data ?? '{}'); } catch (e) { info = {}; }
+      let parts = [];
+      try { parts = ps.all(m.id).map((x) => { try { return JSON.parse(x.data ?? '{}'); } catch (e) { return null; } }).filter(Boolean); } catch (e) { parts = []; }
+      return { info, parts };
+    });
+  } else {
+    throw new Error('bad mode');
+  }
+  out.ok = 1;
+} catch (e) {
+  out.ok = 0;
+  out.error = String((e && e.message) || e);
+}
+process.stdout.write(JSON.stringify(out));
+`;
+
+// 无 node 的远端回退脚本（python3 标准库 sqlite3，与 JS 版同查询同形状）
+const REMOTE_READER_PY = `
+import sqlite3,os,json,sys,time,re
+A = __ARGS__
+out = {}
+try:
+  H = lambda x: os.path.expanduser(x)
+  if A['mode'] == 'tasks':
+    db = sqlite3.connect('file:' + H('~/.zcode/v2/tasks-index.sqlite') + '?mode=ro', uri=True)
+    db.row_factory = sqlite3.Row
+    rows = db.execute(
+      'SELECT t.task_id,t.title,t.cli_title,t.task_status,t.mode,t.cli_updated_at,t.updated_at,'
+      't.cli_created_at,t.created_at,t.workspace_path,t.project_id,p.name AS project_name '
+      'FROM tasks t LEFT JOIN projects p ON p.project_id=t.project_id '
+      'WHERE t.deleted=0 AND coalesce(t.cli_deleted,0)=0 AND t.cli_created_at IS NOT NULL AND t.archived=0 '
+      'ORDER BY coalesce(t.cli_updated_at,t.updated_at) DESC LIMIT ?', (int(A.get('limit', 200)),)).fetchall()
+    sdb = None
+    try:
+      sdb = sqlite3.connect('file:' + H('~/.zcode/cli/db/db.sqlite') + '?mode=ro', uri=True)
+      sdb.row_factory = sqlite3.Row
+    except Exception:
+      sdb = None
+    tasks = []
+    for t in rows:
+      title = t['cli_title'] or ''
+      if (not title) or ('\\ufffd' in title): title = t['title'] or ''
+      if '\\ufffd' in title: title = ''
+      up = max(int(t['cli_updated_at'] or 0), int(t['updated_at'] or 0))
+      running = False
+      if sdb is not None:
+        try:
+          rs = sdb.execute(
+            'SELECT m.data AS mdata,m.time_updated AS mut,'
+            '(SELECT q.data FROM part q WHERE q.message_id=m.id ORDER BY q.sequence DESC LIMIT 1) AS pdata '
+            'FROM message m WHERE m.session_id=? ORDER BY m.sequence DESC LIMIT 3', (t['task_id'],)).fetchall()
+          for row in rs:
+            try: d = json.loads(row['mdata'] or '{}')
+            except Exception: continue
+            if not isinstance(d, dict): continue
+            if d.get('visibility') == 'model-only' or (isinstance(d.get('metadata'), dict) and d['metadata'].get('visibility') == 'model-only') or (isinstance(d.get('semantics'), dict) and d['semantics'].get('uiVisibility') == 'hidden'): continue
+            lt = ''
+            if row['pdata']:
+              try: lt = str(json.loads(row['pdata']).get('type', ''))
+              except Exception: lt = ''
+            up = max(up, int(row['mut'] or 0))
+            running = (d.get('role') == 'assistant' and bool(row['pdata']) and lt != 'step-finish'
+                       and (time.time() * 1000 - int(row['mut'] or 0)) < 1800000)
+            break
+        except Exception: pass
+      tasks.append({
+        'sessionId': str(t['task_id']), 'title': title,
+        'status': t['task_status'] or 'completed', 'mode': t['mode'] or '',
+        'updatedAt': up, 'createdAt': int(t['cli_created_at'] or t['created_at'] or 0),
+        'workspacePath': t['workspace_path'] or '', 'projectId': str(t['project_id'] or ''),
+        'projectName': t['project_name'] or '', 'busy': running,
+      })
+    out['tasks'] = tasks
+  elif A['mode'] == 'messages':
+    if not re.match(r'^(sess|session)_[A-Za-z0-9._-]+$', str(A.get('sessionId', ''))):
+      raise Exception('bad sessionId')
+    db = sqlite3.connect('file:' + H('~/.zcode/cli/db/db.sqlite') + '?mode=ro', uri=True)
+    db.row_factory = sqlite3.Row
+    ms = db.execute('SELECT id,data FROM message WHERE session_id=? ORDER BY sequence ASC LIMIT ?',
+                    (str(A['sessionId']), int(A.get('limit', 200)))).fetchall()
+    msgs = []
+    for m in ms:
+      try: info = json.loads(m['data'] or '{}')
+      except Exception: info = {}
+      parts = []
+      try:
+        for x in db.execute('SELECT data FROM part WHERE message_id=? ORDER BY sequence ASC', (m['id'],)):
+          try: parts.append(json.loads(x['data'] or '{}'))
+          except Exception: pass
+      except Exception: pass
+      msgs.append({'info': info, 'parts': parts})
+    out['messages'] = msgs
+  else:
+    raise Exception('bad mode')
+  out['ok'] = 1
+except Exception as e:
+  out['ok'] = 0
+  out['error'] = str(e)
+sys.stdout.write(json.dumps(out))
+`;
+
+function buildRemoteReader(tpl, argsJson) {
+  return tpl.replace(/__ARGS__/g, argsJson);
+}
+
+/**
+ * 单次 SSH 执行 reader。脚本走 **stdin** 落盘再执行（`cat > file && python3 file`）：
+ * SSH exec 通道对远程命令行有 ~8192 字节截断——命令超长时尾部被腰斩、printf
+ * 把 base64 泄漏到 stdout（问题档案 #34 实测），所以脚本体量绝不能上命令行。
+ * python3 优先（标准库 sqlite3，覆盖无 node 的目标机），缺 python3（exit 127）
+ * 再退 node。永不 reject：失败以 {error} 返回、由调用方标离线。
+ */
+function sshRemoteExec(h, jsScript, pyScript, timeoutMs = 20000) {
+  const baseArgs = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=accept-new'];
+  if (h.port && h.port !== 22) baseArgs.push('-p', String(h.port));
+  const runOnce = (script, remoteCmd) => new Promise((resolve) => {
+    let child;
+    try { child = spawn('ssh', [...baseArgs, `${h.username}@${h.host}`, remoteCmd], { windowsHide: true }); }
+    catch (e) { return resolve({ error: 'ssh-spawn:' + String(e?.message ?? e), missing: false }); }
+    let out = ''; let err = ''; let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* noop */ } finish({ error: 'ssh-timeout', missing: false }); }, timeoutMs);
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += String(d); if (err.length > 4000) err = err.slice(0, 4000); });
+    child.on('error', (e) => { clearTimeout(timer); finish({ error: 'ssh-spawn:' + String(e?.message ?? e), missing: false }); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      const s = out.trim();
+      const i = s.indexOf('{');
+      if (i >= 0) { try { return finish(JSON.parse(s.slice(i))); } catch { /* fallthrough */ } }
+      const missing = code === 127 || /command not found/.test(err);
+      finish({
+        error: err ? ('ssh:' + err.replace(/\s+/g, ' ').slice(0, 200)) : (s ? ('bad-json:' + s.slice(0, 120)) : 'no-output'),
+        missing,
+      });
+    });
+    try { child.stdin.end(script); } catch { /* 管道已断：close 回调兜底 */ }
+  });
+  return (async () => {
+    const PY_CMD = 'cat > ~/.zcode-bridge-reader.py && python3 ~/.zcode-bridge-reader.py';
+    const py = await runOnce(pyScript, PY_CMD);
+    if (!py.missing) return py;
+    const js = await runOnce(jsScript, 'cat > ~/.zcode-bridge-reader.js && node ~/.zcode-bridge-reader.js');
+    if (!js.missing) return js;
+    return { error: 'no-runtime: python3/node 均不可用（' + String(py.error ?? '').slice(0, 80) + ' | ' + String(js.error ?? '').slice(0, 80) + '）' };
+  })();
+}
+
+/** 远程项目注册表（本地任务索引缓存元数据，与官方任务栏同源） */
+function remoteHostRegistry() {
+  try {
+    const db = tasksDb();
+    const hosts = db.prepare(
+      "SELECT host_id,target_json FROM hosts WHERE kind='ssh' ORDER BY position"
+    ).all();
+    const entries = db.prepare(
+      'SELECT host_id,remote_project_id,cached_name,cached_roots_json FROM remote_project_entries ' +
+      'WHERE coalesce(cached_deleted,0)=0 ORDER BY initial_position'
+    ).all();
+    const byHost = new Map();
+    for (const e of entries) {
+      if (!byHost.has(e.host_id)) byHost.set(e.host_id, []);
+      byHost.get(e.host_id).push(e);
+    }
+    const out = [];
+    for (const h of hosts) {
+      const es = byHost.get(h.host_id) ?? [];
+      if (!es.length) continue; // 任务栏语义：只列已登记的远程项目
+      let t = {};
+      try { t = JSON.parse(h.target_json ?? '{}'); } catch { /* bad json */ }
+      if (t.kind !== 'ssh' || !t.host || !t.username) continue;
+      out.push({
+        hostId: String(h.host_id), host: String(t.host),
+        port: Number(t.port ?? 22) || 22, username: String(t.username),
+        projects: es.map((e) => {
+          let roots = [];
+          try { roots = JSON.parse(e.cached_roots_json ?? '[]').map((r) => String(r.rootPath ?? '')).filter(Boolean); } catch { /* bad json */ }
+          return { projectId: String(e.remote_project_id), name: String(e.cached_name ?? ''), roots };
+        }),
+      });
+    }
+    return out;
+  } catch { return []; }
+}
+
+// 短缓存 + 单飞：页面 1.2s 轮询不能每条都开 SSH 连接
+const remoteCache = new Map();
+const remoteFlight = new Map();
+function remoteCached(key, ttlMs, fn) {
+  const hit = remoteCache.get(key);
+  if (hit && Date.now() - hit.t < ttlMs) return Promise.resolve(hit.val);
+  const flying = remoteFlight.get(key);
+  if (flying) return flying;
+  const p = fn()
+    .then((val) => { remoteCache.set(key, { t: Date.now(), val }); remoteFlight.delete(key); return val; })
+    .catch((e) => { remoteFlight.delete(key); throw e; });
+  remoteFlight.set(key, p);
+  return p;
+}
+
 // ────────────────────────── 共享凭据（与桌面端同文件同密钥）──────────────────────────
 // 依据：adapters/src/auth/credential-cipher.ts + shared-credentials.ts
 
@@ -1434,6 +1708,58 @@ async function handleApi(req, res, url) {
         ...(config.workspaces ?? []),
       ],
     });
+  }
+
+  // 远程项目组（官方任务栏「远程项目」分组的数据源）：注册表来自本地任务索引，
+  // 任务列表经 SSH 查远端任务索引（桌面主列表口径），按注册项目分组
+  if (req.method === 'GET' && p === '/api/remote/projects') {
+    const hosts = remoteHostRegistry();
+    const argsJson = JSON.stringify({ mode: 'tasks', limit: 200 });
+    const results = await Promise.all(hosts.map((h) =>
+      remoteCached(`tasks:${h.hostId}`, 5000, () =>
+        sshRemoteExec(h, buildRemoteReader(REMOTE_READER_JS, argsJson), buildRemoteReader(REMOTE_READER_PY, argsJson))
+      ).catch((e) => ({ error: String(e?.message ?? e) }))
+    ));
+    const hostsOut = hosts.map((h, i) => {
+      const r = results[i] ?? { error: 'unknown' };
+      if (r.error || r.ok === 0) logLine('remote', `host ${h.host} 任务拉取失败：${String(r.error ?? 'remote-error').slice(0, 200)}`);
+      const tasks = Array.isArray(r.tasks) ? r.tasks : [];
+      const byProject = new Map();
+      for (const t of tasks) {
+        const k = String(t.projectId ?? '');
+        if (!byProject.has(k)) byProject.set(k, []);
+        byProject.get(k).push(t);
+      }
+      return {
+        hostId: h.hostId, host: h.host, username: h.username, port: h.port,
+        online: !r.error && r.ok !== 0, error: String(r.error ?? (r.ok === 0 ? r.error : '') ?? ''),
+        projects: h.projects.map((pr) => ({
+          projectId: pr.projectId, name: pr.name, roots: pr.roots,
+          sessions: (byProject.get(pr.projectId) ?? []).slice(0, 50),
+        })),
+      };
+    });
+    return sendJson(res, 200, { hosts: hostsOut });
+  }
+
+  // 远程会话消息（只读浏览）：SSH 查远端共享库组装 {info,parts}，与本地同构。
+  // hostId 必须命中注册表——不接受任意地址；sessionId 白名单校验在 reader 双端各做一遍
+  if (req.method === 'GET' && p === '/api/remote/messages') {
+    const hostId = String(url.searchParams.get('host') ?? '');
+    const sid = String(url.searchParams.get('sessionId') ?? '');
+    if (!/^(sess|session)_[A-Za-z0-9._-]+$/.test(sid)) return sendJson(res, 400, { error: 'bad sessionId' });
+    const h = remoteHostRegistry().find((x) => x.hostId === hostId);
+    if (!h) return sendJson(res, 404, { error: 'unknown remote host' });
+    const limit = Number(url.searchParams.get('limit')) || config.maxHistoryMessages;
+    const argsJson = JSON.stringify({ mode: 'messages', sessionId: sid, limit });
+    let r;
+    try {
+      r = await remoteCached(`msg:${hostId}:${sid}:${limit}`, 3000, () =>
+        sshRemoteExec(h, buildRemoteReader(REMOTE_READER_JS, argsJson), buildRemoteReader(REMOTE_READER_PY, argsJson))
+      );
+    } catch (e) { r = { error: String(e?.message ?? e) }; }
+    if (r.error || r.ok === 0) return sendJson(res, 200, { messages: [], error: String(r.error ?? 'remote unavailable') });
+    return sendJson(res, 200, { messages: r.messages ?? [] });
   }
 
   if (req.method === 'POST' && p === '/api/upload') {

@@ -169,6 +169,34 @@ INSERT/UPDATE 时直接按原生形状写全（`cli_title`/`cli_title_source='ge
 `needsBackfill` 豁免（`!host_id || cli_created_at==null`），让旧口径残留行被对账周期回填。
 两条硬边界（标题以共享库为权威、未落库一律不 INSERT）见同步函数头注与问题档案 #14，不变。
 
+### 2.9 远程项目桥（/api/remote/*）
+
+官方任务栏把远程 SSH 主机当一等公民，注册表就在**本地**任务索引里：
+
+- `hosts(kind='ssh')`：`target_json` 含 `host/port/username`；
+- `remote_project_entries`：`cached_name`/`cached_roots_json`/`initial_position`/`cached_deleted`。
+
+但这两张表只是**本地缓存元数据**——远程项目的工作会话（tasks + 消息）在**远程机自己的**
+`~/.zcode/v2/tasks-index.sqlite` + `cli/db/db.sqlite` 里（官方经 SSH agent 查远端）。
+桥复刻同一语义，零依赖 SSH：
+
+- `/api/remote/projects`：按注册表逐主机 SSH 查远端 tasks，**照桌面主列表口径过滤**
+  （`deleted=0 AND coalesce(cli_deleted,0)=0 AND cli_created_at IS NOT NULL AND archived=0`），
+  按 `remote_project_entries` 的项目分组返回（任务按 project_id 归组，不在注册表的项目不显示，同官方）；
+  busy 判定复用共享库末部件法（与 §2.7 `dbTurnState` 同逻辑，在远端跑）。
+- `/api/remote/messages?host=&sessionId=`：SSH 查远端 `message`/`part` 组装
+  `{info,parts}`（`message.data`=info、`part.data`=部件），与本地 `session/messages`
+  **同构**，页面直接复用 `renderHistory` 渲染。
+
+reader 脚本传输：脚本体量上命令行会被 SSH exec 通道在 ~8192 字节处**腰斩**（问题档案 #34），
+必须走 **stdin 落盘**：`cat > ~/.zcode-bridge-reader.py && python3 …`，缺 python3（exit 127）
+再退 `node`。两台目标机实测：一台只有 python3（无 node/sqlite3 CLI），一台 node22+python3 都有。
+
+安全边界：只连注册表里的 host（不接受任意地址）、`BatchMode=yes` 禁密码交互、
+sessionId 双端白名单校验、5s 列表缓存 + 3s 消息缓存 + 单飞合并（页面 4s 轮询打不爆 SSH）、
+超时 kill。只读语义：不 resume、不 SSE、composer 禁用——远程续跑要的是官方 remote agent，
+归档/删除也归桌面，桥只做"能看"（问题档案 #35）。
+
 ---
 
 ## 3. 模块：Web 页面（public/index.html）
@@ -358,6 +386,8 @@ approval 高优通知）。页面 v2 通知与 DOM 桥**双通道并存**，通�
 | 31 | 手机端"没法在指定项目空间新建会话、建成了也不知道属于哪个项目"（乱） | ①「新会话」直接落 `curWs`（localStorage 记忆值），无项目选择环节，落错时服务端 workspaceRef 还**静默回退**到主工作区；②建成后界面无任何归属标识（空会话在抽屉里要等首回合落库才出现）；③config.json 的 workspaces 存在**过期路径**（项目搬迁后未更新），可把会话建到不存在的目录 | ①「新会话」先弹项目选择器（`projectChoices()`：当前项目 ∪ 会话记录 ∪ config 白名单，分隔符/尾斜杠/大小写归一去重，同名目录带父目录消歧）；②`POST /api/sessions` 响应带真实落点 `workspacePath`，页面校正 curWs + toast 明示"新会话 · 项目：X"，空会话 hero 带项目名；③修正 config 过期条目；④抽屉每个项目行加「＋」一键在该项目新建（注意 miNew/btnNew 处理器必须 stopPropagation，否则 document 关弹层处理器立即把选择器关掉） | 浏览器实测：选择器 13 个项目全部可见、同名消歧（TongYi-Lite · DTXY / · coding_projects）、点选后 curWs/hero/toast 三处归属一致 |
 | 32 | **手机端独立创建的会话桌面永远不可见**（tasks-index 里明明有行，桌面列表/项目树都找不到） | 桌面主列表查询自 app.asar 反解：`WHERE provider=? AND deleted=0 AND coalesce(cli_deleted,0)=0 AND cli_created_at IS NOT NULL`——`cli_created_at` 是**准入条件**不是排序键；项目树另按 `project_id + host_id` 挂载。手机同步行只写旧 schema 列（host_id/root_path/project_id/cli_* 全 NULL）→ 全部被过滤。桌面自带的 `initializeLegacyTaskIdentity` 能回填，但只在 app 启动时对存量 NULL 行跑一次，手机后来插入的行等不到 | `syncTaskIndexRows` 的 INSERT/UPDATE 按桌面原生形状写全（见 §2.8）：`host_id='local'`、`root_path=workspace_path`、`project_id` 走 uniqueRootProject 口径反查 project_roots（路径恰好唯一命中才挂）、`cli_title/cli_title_source/cli_created_at/cli_updated_at/cli_last_outcome/cli_deleted` 一次到位；UPDATE 跳过条件加 `needsBackfill` 豁免让存量 NULL 行被对账周期回填 | 同步后索引中手机工作区行 `host_id IS NULL OR cli_created_at IS NULL` 计数=0；此前隐形的 3 个手机会话 `project_id=fd46d984`（zcode-phone-server）挂上项目树，桌面端可见 |
 | 33 | keepalive.log/server.log 暴涨（80MB）：守护每 3 秒 EADDRINUSE 崩溃一次无限刷日志；且真正在服务的实例崩了没人拉起，"自动重启保护"名存实亡 | `run-server.cmd` 无条件 `node server.mjs`：端口被占（另一守护/手动实例在服务）时新进程必然 EADDRINUSE 秒退，守护 3 秒一次写两条日志无限循环，真实故障堆栈全被淹没；而由一次性脚本拉起的实例父进程已死=孤儿，崩了没有任何东西补位 | 守护幂等化：拉起前 netstat 查端口，有监听者→5 秒后复查等待接管，端口空了才拉起并阻塞在服务上。多守护共存、手动 `node server.mjs` 调试都不打架 | 清理僵尸守护后 keepalive.log 零新增；两次实测（含本次调试期）：服务被杀后守护 3 秒内自动补位，端口/健康检查恢复正常 |
+| 34 | 远程 reader 首版把脚本 base64 后塞进 ssh 命令行（约 10.5KB）：远端 stdout 吐出**未解码的 base64 原文**、后续所有命令凭空消失、exit 0 且 stderr 空，Git Bash 手跑同一条命令却正常 | SSH exec 通道对远程命令行在 **~8192 字节**处腰斩（node spawn 二分实测：8042 字节命令完好，9042 起被截），命令行被切成 `printf %s <B64>` 后半段（含重定向）丢失，printf 直接打到外层 stdout；手跑正常是 Git Bash ssh.exe 走了不同的参数组装路径。与远端 shell/基础工具无关 | 脚本改走 **stdin**：`cat > 文件 && python3 文件`（命令行只剩几十字节），python3 优先、127 退 node；node 目标机同样落盘执行 | 双主机（一台仅 python3、一台 node22+python3）`/api/remote/projects` 全在线；`/api/remote/messages` 实测拉回 102KB 完整 MessageWithParts |
+| 35 | 用户报"看不到远程项目的工作会话"；同时怀疑过 `session/list` 漏数（API 143 条 vs 共享库 236 条） | 漏的 93 条全部 `task_type=subagent_child`（子代理子会话）：引擎列表口径**故意**排除，桌面任务索引里也一行都没有（0/93）——官方任务栏同样不把它们当顶层任务，属正常语义不是缺口（若日后"补齐"反而制造官方没有的幽灵行）。真正的缺口：官方任务栏的"远程项目"组（`hosts`+`remote_project_entries`，两台 SSH 主机三个项目）桥此前零实现，远端库里的当日工作会话手机端整体不可见 | 新增 §2.9 远程项目桥：`/api/remote/projects` + `/api/remote/messages`（SSH stdin 落盘 reader，桌面主列表口径过滤）；页面侧栏"远程项目"分组 + 只读会话视图（不 resume/不 SSE/composer 禁用/运行中 5s 跟随） | 页面实测：liang-linux、TongYi-Lite、DSH-Phone 三远程项目组出现，运行中会话（busy）点开后思考/工具/正文全量渲染、输入框置灰提示桌面端继续；搜索命中远程会话 |
 
 ---
 

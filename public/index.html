@@ -3241,6 +3241,7 @@ async function doSend(text, sid) {
 // ── 发送 ──
 
 async function send() {
+  if (remoteView) { toast('远程会话只读：请在桌面端继续该会话'); return; }
   if (!curSession) { toast('先选择一个会话'); return; }
   let text = composer.value.trim();
   if (!text && !pendingImage) return;
@@ -3386,7 +3387,7 @@ document.addEventListener('click', (e) => {
   if (e.target instanceof Element && (e.target.closest('#atMenu') || e.target === composer)) return;
   closeAtMenu();
 });
-$('btnMenu').addEventListener('click', () => { loadAllSessions(); $('drawer').classList.add('open'); });
+$('btnMenu').addEventListener('click', () => { loadAllSessions(); loadRemoteProjects(); $('drawer').classList.add('open'); });
 $('btnClose').addEventListener('click', () => $('drawer').classList.remove('open'));
 $('drawer').addEventListener('click', (e) => { if (e.target.id === 'drawer') $('drawer').classList.remove('open'); });
 // stopPropagation 必须加：document 的点击关闭弹层处理器会立刻关掉刚开的选择器
@@ -3538,6 +3539,27 @@ function fmtRel(ts) {
 let archivedSessions = [];
 let archExpanded = false;
 
+// ── 远程项目（官方任务栏同款：SSH host → 远程项目 → 工作会话，只读）──
+// 数据源 GET /api/remote/projects：注册表 = 桌面任务索引 hosts/remote_project_entries，
+// 任务与消息由桥 SSH 直查远端 ~/.zcode 库（服务器端 5s 缓存 + 单飞合并，页面
+// 抽屉开着每轮拉一次即可）。点开走 openRemoteSession 只读浏览：不 resume、不 SSE、
+// 输入禁用——与官方任务栏同一份数据，官方能看到的工作会话这里就能看到。
+let remoteHosts = [];          // /api/remote/projects 最近一次成功快照
+let remoteSectExpanded = localStorage.getItem('zcode.remoteOpen') !== '0';
+const remoteProjExpanded = new Map(); // hostId|projectId → 是否展开全部
+let remoteView = null;         // 当前只读视图 {hostId, sessionId, title, host, username}
+let remoteFollowTimer = null;
+
+async function loadRemoteProjects() {
+  try {
+    const r = await api('remote/projects');
+    remoteHosts = Array.isArray(r.hosts) ? r.hosts : [];
+  } catch { /* 保留旧快照，下轮再试 */ }
+  renderProjectList();
+}
+
+const GLOBE_SVG = '<svg class="ic sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8.2"/><path d="M3.8 12h16.4M12 3.8c2.2 2.4 3.4 5.2 3.4 8.2s-1.2 5.8-3.4 8.2c-2.2-2.4-3.4-5.2-3.4-8.2s1.2-5.8 3.4-8.2z"/></svg>';
+
 // ── 会话搜索（对照官方 taskSearch）：按标题/项目名过滤，输入即筛 ──
 // 过滤态下平铺所有匹配（项目行只作分组标题，不再截断 3 条），
 // 归档会话同样参与匹配；清空恢复默认分组视图。
@@ -3584,6 +3606,8 @@ setInterval(() => {
   if ($('drawer').classList.contains('open') || busy || allSessions.some((s) => s.busy)) {
     loadAllSessions();
   }
+  // 远程组只在抽屉开着时刷：SSH 探测比本地列表贵，服务器端有 5s 缓存 + 单飞兜底
+  if ($('drawer').classList.contains('open') && !document.hidden) loadRemoteProjects();
 }, 4000);
 
 // 会话行操作单：锚定 ⋯ 按钮弹出（打开 / 归档或恢复 / 删除）
@@ -3661,7 +3685,19 @@ function renderProjectList() {
     sect.textContent = '搜索结果';
     const hits = allSessions.filter(sessMatches);
     const archHits = archivedSessions.filter(sessMatches);
-    if (!hits.length && !archHits.length) {
+    const q = sessQuery.trim().toLowerCase();
+    const remoteHits = [];
+    for (const h of remoteHosts) {
+      if (!h.online) continue;
+      for (const pr of h.projects ?? []) {
+        for (const s of pr.sessions ?? []) {
+          if (String(s.title ?? '').toLowerCase().includes(q) ||
+              String(pr.name ?? '').toLowerCase().includes(q) ||
+              String(h.host ?? '').toLowerCase().includes(q)) remoteHits.push([h, s]);
+        }
+      }
+    }
+    if (!hits.length && !archHits.length && !remoteHits.length) {
       box.appendChild(el('div', 'sysline', `没有匹配「${sessQuery.trim()}」的会话`));
       return;
     }
@@ -3672,6 +3708,13 @@ function renderProjectList() {
       head.appendChild(el('b', '', `已归档（${archHits.length}）`));
       box.appendChild(head);
       for (const s of archHits.slice(0, 20)) box.appendChild(sessRow({ ...s, archived: true }, s.workspacePath));
+    }
+    if (remoteHits.length) {
+      const head = el('div', 'archsect');
+      head.appendChild(el('span', '', '▸'));
+      head.appendChild(el('b', '', `远程 · 只读（${remoteHits.length}）`));
+      box.appendChild(head);
+      for (const [h, s] of remoteHits.slice(0, 20)) box.appendChild(remoteRow(h, s));
     }
     return;
   }
@@ -3736,6 +3779,73 @@ function renderProjectList() {
       }
     }
   }
+  // 远程项目（官方任务栏同款层级：主机 → 远程项目 → 工作会话，点开只读浏览）
+  if (remoteHosts.length) {
+    const total = remoteHosts.reduce(
+      (a, h) => a + (h.projects ?? []).reduce((x, pr) => x + ((pr.sessions ?? []).length), 0), 0);
+    const head = el('div', 'archsect');
+    const chev = el('span', '', remoteSectExpanded ? '▾' : '▸');
+    chev.style.color = 'var(--faint)';
+    head.appendChild(chev);
+    head.appendChild(el('b', '', `远程项目（${total}）`));
+    head.style.cursor = 'pointer';
+    head.addEventListener('click', () => {
+      remoteSectExpanded = !remoteSectExpanded;
+      try { localStorage.setItem('zcode.remoteOpen', remoteSectExpanded ? '1' : '0'); } catch { /* 忽略 */ }
+      renderProjectList();
+    });
+    box.appendChild(head);
+    if (remoteSectExpanded) {
+      for (const h of remoteHosts) {
+        const hrow = el('div', 'wsrow');
+        const hi = el('span', 'mi'); hi.innerHTML = GLOBE_SVG; hrow.appendChild(hi);
+        hrow.appendChild(el('div', '', `${h.username}@${h.host}`));
+        if (!h.online) {
+          const off = el('span', 'time', '离线');
+          off.style.color = '#e5484d';
+          hrow.appendChild(off);
+        }
+        box.appendChild(hrow);
+        if (!h.online) continue;
+        for (const pr of h.projects ?? []) {
+          const sessions = pr.sessions ?? [];
+          const prow = el('div', 'wsrow');
+          const fi = el('span', 'mi'); fi.innerHTML = FOLDER_SVG; prow.appendChild(fi);
+          prow.appendChild(el('div', '', pr.name));
+          prow.appendChild(el('span', 'time', '远程'));
+          box.appendChild(prow);
+          const key = `${h.hostId}|${pr.projectId}`;
+          const expanded = !!remoteProjExpanded.get(key);
+          const list = expanded ? sessions : sessions.slice(0, 3);
+          for (const s of list) box.appendChild(remoteRow(h, s));
+          if (sessions.length > list.length) {
+            const more = el('button', 'morebtn', `显示更多（还有 ${sessions.length - list.length} 条）`);
+            more.addEventListener('click', () => { remoteProjExpanded.set(key, true); renderProjectList(); });
+            box.appendChild(more);
+          } else if (expanded && sessions.length > 3) {
+            const less = el('button', 'morebtn', '收起');
+            less.addEventListener('click', () => { remoteProjExpanded.set(key, false); renderProjectList(); });
+            box.appendChild(less);
+          }
+        }
+      }
+    }
+  }
+}
+
+// 远程会话行：与 sessRow 同款视觉，点开走只读浏览，无 ⋯ 菜单（归档/删除归桌面）
+function remoteRow(h, s) {
+  const running = !!s.busy;
+  const item = el('div', 'sess' + (remoteView && remoteView.sessionId === s.sessionId ? ' cur' : ''));
+  if (running) {
+    const sp = el('span', 'busy'); sp.innerHTML = SVG.spin; sp.title = '远程任务运行中'; item.appendChild(sp);
+  }
+  const t = el('div', 't', s.title || '未命名会话');
+  if (running) t.style.color = 'var(--fg)';
+  item.appendChild(t);
+  item.appendChild(el('span', 'time' + (running ? ' running' : ''), running ? '运行中' : fmtRel(s.updatedAt)));
+  item.addEventListener('click', () => openRemoteSession(h, s));
+  return item;
 }
 
 // 切换项目：记住选择并重绘分组（数据已全量在本地，无需请求）
@@ -3828,8 +3938,72 @@ function hideSwitching() {
   switchingEl.classList.remove('on');
 }
 
+// ── 远程会话只读浏览（官方任务栏点远程任务 = 同等体验：能看、不能在手机续跑）──
+async function openRemoteSession(h, s) {
+  const mySeq = ++openSeq;
+  $('drawer').classList.remove('open');
+  closePops();
+  showSwitching('打开远程会话…');
+  try {
+    const r = await api(`remote/messages?host=${encodeURIComponent(h.hostId)}&sessionId=${encodeURIComponent(s.sessionId)}&limit=200`);
+    if (mySeq !== openSeq) return; // 已有更新的打开/切换请求接管
+    if (r.error) throw new Error(String(r.error));
+    stopRemoteFollow();
+    remoteView = { hostId: h.hostId, sessionId: s.sessionId, title: s.title || '未命名会话', host: h.host, username: h.username };
+    // 本地会话状态整体退出：curSession=null 后轮询/队列/任务计划自动静默，SSE 手动关
+    curSession = null;
+    if (es) { es.close(); es = null; }
+    busySource = null;
+    setBusy(false);
+    lastSseEventAt = Date.now();
+    lastActivity = Date.now();
+    finishedSince = 0;
+    setSessionTitle(`${s.title || '未命名会话'}（远程 · 只读）`);
+    setActivity(s.busy ? '远程回合运行中' : '');
+    renderHistory(r.messages ?? [], { keepThinkOpen: !!s.busy });
+    setComposerEnabled(false);
+    hideSwitching();
+    toast(`远程会话 · ${h.username}@${h.host}（只读）`);
+    renderProjectList();
+    if (s.busy) startRemoteFollow(h, s);
+  } catch (e) {
+    if (mySeq !== openSeq) return;
+    hideSwitching();
+    $('drawer').classList.add('open');
+    toast(`打开远程会话失败：${e?.message ?? e}`);
+  }
+}
+
+// 运行中的远程会话：每 5s 重拉一次消息跟随输出（服务器端 3s 消息缓存 + 单飞兜底）
+function startRemoteFollow(h, s) {
+  stopRemoteFollow();
+  remoteFollowTimer = setInterval(async () => {
+    if (!remoteView || remoteView.sessionId !== s.sessionId) { stopRemoteFollow(); return; }
+    try {
+      const r = await api(`remote/messages?host=${encodeURIComponent(h.hostId)}&sessionId=${encodeURIComponent(s.sessionId)}&limit=200`);
+      if (r.error) return;
+      const msgs = r.messages ?? [];
+      const fp = fingerprint(msgs);
+      if (fp !== lastFingerprint) renderHistory(msgs, { keepThinkOpen: true });
+    } catch { /* 下轮再试 */ }
+  }, 5000);
+}
+function stopRemoteFollow() {
+  if (remoteFollowTimer) { clearInterval(remoteFollowTimer); remoteFollowTimer = null; }
+}
+function setComposerEnabled(on) {
+  const c = $('composer');
+  if (!c) return;
+  c.disabled = !on;
+  c.placeholder = on ? '继续输入以排队后续修改' : '远程会话只读 · 请在桌面端继续该会话';
+}
+
 async function openSession(sessionId, wsPath) {
   const mySeq = ++openSeq;
+  // 从远程只读视图切回本地会话：恢复输入、停远程跟随
+  stopRemoteFollow();
+  remoteView = null;
+  setComposerEnabled(true);
   // 即时反馈：收抽屉/弹层 + 显示过渡层（成功失败都会收起，见下）
   const drawerWasOpen = $('drawer').classList.contains('open');
   $('drawer').classList.remove('open');
@@ -3941,6 +4115,7 @@ async function openSession(sessionId, wsPath) {
     syncModeUi();
     await loadWorkspaces();
     await loadAllSessions();
+    loadRemoteProjects(); // 远程组异步加载：SSH 慢也不能拖启动（失败保旧快照静默）
     // 校正 localStorage 里的项目：已不存在时回落到最近会话的项目
     const knownPaths = new Set([
       ...allSessions.map((s) => s.workspacePath ?? ''),
