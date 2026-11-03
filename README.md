@@ -32,6 +32,7 @@ ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Prot
 | 限流自动重试 | `turn.failed` 匹配 429/限流时自动重发（5 次 × 20s，`__retry` inputId 防重复回显）；1113/余额类错误不重试，直接推人话提示 |
 | 桌面任务索引同步 | 会话标题/状态按共享 sqlite 库对账进桌面任务索引（标题为空不落库、幽灵行 30 分钟清理）；行必须写成**桌面原生形状**（`host_id/root_path/project_id/cli_title/cli_created_at`…）——桌面列表查询按 `cli_created_at IS NOT NULL` 过滤、项目树按 `project_id` 挂载，缺字段=手机建的会话桌面隐形（详见 MODULE-DESIGN §2.8） |
 | 远程项目桥 | 官方任务栏同款「远程项目」组：注册表读本地任务索引 `hosts`/`remote_project_entries`，工作会话经零依赖 SSH（stdin 落盘 reader，python3/node 双运行时）直查远端 `~/.zcode` 库，按桌面主列表口径过滤；只连注册表主机、只读（详见 MODULE-DESIGN §2.9） |
+| 侧栏官方口径 | 侧栏会话分组（`all=1` 的 `groups`）以**桌面任务索引为唯一事实源**，逐字照官方任务栏查询：删除/归档/`cli_deleted`/provider 全按索引标志位过滤（桌面删的手机上就是没有，含挂在已删除项目下的任务），排序=项目按 `position`、会话按 `cli_updated_at DESC`——页面只按数组顺序渲染禁自排（详见 MODULE-DESIGN §2.10） |
 | 页面自更新 | `index.html` 内容 md5 指纹经 `/api/state` 下发，页面轮询比对自动 reload——**改完页面无需重启服务、无需手机手动刷新** |
 | 静态服务 | `public/` 每请求读盘；token 鉴权（query `?token=` / header `x-zptoken` / cookie） |
 
@@ -44,7 +45,8 @@ ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Prot
 - 工具行（图标 + 名称 + 命令/目标摘要 + 状态，点开看输出）、思考行（可展开）、任务计划条（todos 实时）、提问/权限卡片（批准/始终允许/拒绝——"始终允许"经引擎 `permissionUpdates.addRules` 透传，同工具本会话/项目内不再询问）、排队药丸、附件上传。
 - **代码块升级（对照桌面 codeBlock）**：头部语言标签 + 复制按钮、横向滚动、零依赖轻量语法高亮（注释/字符串/数字/关键字/函数名/标签六类着色，常见语言族共用扫描器，>20KB 自动降级纯文本保流畅）。
 - **回合更改文件卡（对照桌面 changeSummary）**：回合收尾时汇总 Write/Edit 触达的文件（✏️ 标题 + 可点开 chip，多次编辑计 ×N）。
-- **会话搜索**：抽屉按标题/项目名即输即筛，归档会话同搜。
+- **会话搜索**：抽屉按标题/项目名即输即筛（含远程会话）。
+- **侧栏对齐官方任务栏**：项目分组/排序直接渲染服务端官方口径 `groups`（已删除项目、已删会话、归档一律不显示——与桌面一致，由任务索引标志位决定）。
 - **@ 文件引用（对照桌面 @ 菜单）**：输入 `@token` 弹出工作区文件候选（`/api/search/files` 本地模糊匹配，空查询=最近修改），↑↓/Enter/点选插入 `@相对路径`。
 - **消息分叉（对照桌面 fork）**：助手消息操作行"分叉"→ `POST /api/sessions/:id/fork` → 引擎 `session/fork`，从该消息派生新会话（运行中引擎拒绝并透出文案）。
 - **Markdown 图片**：正文 `![alt](url)` 直接渲染（懒加载，点击放大）。
@@ -87,6 +89,7 @@ http://127.0.0.1:8787/?token=<token>
 | `nodePath` | Node 可执行文件（≥22.5） | `tools/node22/node.exe` |
 | `zcodePath` | ZCode 引擎 zcode.cjs 路径 | 桌面端安装路径 |
 | `builtinProviderConfigPath` | 内置 Provider 规则（必须指桌面端 `zcode-builtin.json`） | 桌面随包路径 |
+| `taskProvider` | 侧栏官方口径的 provider 过滤值（任务索引按 provider 分租户，见 MODULE-DESIGN §2.10） | `glm` |
 | `maxHistoryMessages` | 历史消息默认拉取条数 | `200` |
 
 ## HTTP API（全部需 token，query `?token=` 或 header `x-zptoken`）
@@ -95,7 +98,7 @@ http://127.0.0.1:8787/?token=<token>
 |---|---|
 | `GET /api/state` | 服务状态 + 页面构建指纹（`pageBuild`，自动 reload 依据） |
 | `GET /api/workspaces` | 工作区列表 |
-| `GET /api/sessions`（`?workspace=\|all=1`） | 会话列表（含 `busy/busySince/lastSeq`，页面恢复运行态用） |
+| `GET /api/sessions`（`?workspace=\|all=1`） | 会话列表（含 `busy/busySince/lastSeq`，页面恢复运行态用）；`all=1` 附 `groups`＝官方任务栏口径分组（侧栏唯一数据源，服务端已排好序） |
 | `POST /api/sessions` `{sessionId?, workspace?}` | 创建新会话；带 `sessionId` 则恢复（+ 订阅 + setModel） |
 | `GET /api/sessions/:id/messages?limit=` | 历史消息（MessageWithParts，部件粒度） |
 | `GET /api/sessions/:id/stream?afterSeq=` | SSE 实时事件流（重放环 + 心跳 + `event: reset`） |

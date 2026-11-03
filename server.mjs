@@ -1093,6 +1093,161 @@ function cleanupGhostIndexRows(engineIds) {
   return removed;
 }
 
+/**
+ * 手机侧栏「项目 ⇄ 会话」的唯一权威数据源——完全照官方任务栏的查询语义建在任务索引上
+ * （官方桌面 UI 根本不读 session/list，我们此前自造引擎列表+客户端排序是错的，档案 #36）。
+ *
+ * 官方口径（app.asar 反解 + zai-org/ZCode 开源仓库确认）：
+ *   主列表  WHERE provider=? AND deleted=0 AND coalesce(cli_deleted,0)=0
+ *                 AND archived=0 AND cli_created_at IS NOT NULL
+ *           ORDER BY cli_updated_at DESC, task_id
+ *   项目树  projects.host_id='local' AND projects.deleted=0 ORDER BY position, project_id
+ *   （用户删除的项目/会话/归档在桌面任务栏就是这么消失的——索引标志位，
+ *    共享库行还在也不算数；手机此前按共享库+引擎列表显示，所以"删掉的还在"）
+ *
+ * 每行仍要过的本地校验：共享库存在性（索引行可能比库新=幽灵，点开必报错，跳过）、
+ * 标题以共享库为权威（索引滞后 60s 对账）、busy 桥内存 ∥ 消息级末部件判定。
+ * 输出已按官方顺序排好——页面只按数组顺序渲染，禁止再排（排序错乱的根源就是两端各排各的）。
+ */
+function dbOfficialSessionGroups() {
+  const provider = String(config.taskProvider ?? 'glm');
+  try {
+    const db = tasksDb();
+    // 共享库一遍扫：存在性 + 权威标题 + 消息级时间
+    const shared = new Map();
+    try {
+      if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
+      for (const r of agentDbHandle.prepare(
+        'SELECT id, title, time_updated FROM session WHERE time_deleted IS NULL'
+      ).all()) shared.set(String(r.id), r);
+    } catch { return []; }
+    const cleanTitle = (s) => {
+      const t = String(s ?? '');
+      return t.includes('\uFFFD') ? '' : t;
+    };
+    const projects = db.prepare(
+      "SELECT project_id, name, position FROM projects WHERE host_id='local' AND deleted=0 " +
+      'ORDER BY position, project_id'
+    ).all();
+    const projById = new Map(projects.map((p) => [String(p.project_id), p]));
+    const nameCount = new Map();
+    for (const p of projects) nameCount.set(String(p.name ?? ''), (nameCount.get(String(p.name ?? '')) ?? 0) + 1);
+    // 主根路径（新会话落点 + 同名消歧上下文）
+    const primaryRoot = new Map();
+    try {
+      for (const r of db.prepare('SELECT project_id, root_path FROM project_roots ORDER BY project_id, position, root_path').all()) {
+        const k = String(r.project_id);
+        if (!primaryRoot.has(k)) primaryRoot.set(k, String(r.root_path ?? ''));
+      }
+    } catch { /* 无 roots 行：回退 task.workspace_path */ }
+    const tasks = db.prepare(
+      'SELECT task_id, title, cli_title, task_status, mode, cli_updated_at, updated_at, cli_created_at, created_at, ' +
+      'workspace_path, root_path, project_id FROM tasks ' +
+      'WHERE deleted=0 AND coalesce(cli_deleted,0)=0 AND archived=0 AND cli_created_at IS NOT NULL AND provider=? ' +
+      'ORDER BY cli_updated_at DESC, task_id'
+    ).all(provider);
+    const groups = new Map();
+    const groupOf = (key, proto) => {
+      let g = groups.get(key);
+      if (!g) { g = { key, ...proto, sessions: [] }; groups.set(key, g); }
+      return g;
+    };
+    for (const t of tasks) {
+      const sid = String(t.task_id);
+      const sh = shared.get(sid);
+      if (!sh) continue; // 幽灵索引行：库里已删（等 60s 对账清理），不显示
+      // 官方项目树语义：任务挂在存活项目下才可见。project_id 指向已删除/不存在
+      // 项目的行，桌面任务栏根本不显示（用户"删掉的项目还在手机上"的根源）——丢弃。
+      // 手机自建行不会误伤：syncTaskIndexRows 的 projectIdFor 只挂未删除项目，否则 NULL。
+      if (t.project_id && !projById.has(String(t.project_id))) continue;
+      const p = t.project_id ? projById.get(String(t.project_id)) : null;
+      const ws = String(t.root_path || t.workspace_path || '');
+      const turn = dbTurnState(sid);
+      let title = cleanTitle(sh.title);
+      if (!title) title = cleanTitle(t.cli_title) || cleanTitle(t.title);
+      const row = {
+        sessionId: sid, title,
+        status: t.task_status ?? 'completed', mode: t.mode ?? '',
+        updatedAt: Math.max(Number(t.cli_updated_at ?? 0), Number(t.updated_at ?? 0), Number(sh.time_updated ?? 0)),
+        createdAt: Number(t.cli_created_at ?? t.created_at ?? 0),
+        workspacePath: ws,
+        busy: sessionState(sid).busy || (turn?.running ?? false),
+      };
+      if (p) {
+        const name = String(p.name ?? '');
+        const root = primaryRoot.get(String(p.project_id)) || ws;
+        // 同名项目消歧（官方同款）：追加根路径父目录名
+        const label = (nameCount.get(name) ?? 0) > 1 && root
+          ? `${name} · ${String(path.dirname(root)).split(/[\\/]/).filter(Boolean).pop() ?? ''}`.trim()
+          : name;
+        const g = groupOf('proj:' + p.project_id, {
+          kind: 'project', label, path: root || ws,
+          position: Number(p.position ?? 0), order: 0,
+        });
+        g.sessions.push(row);
+      } else {
+        // 无项目归属（uniqueRootProject 0 命中/多义、或旧行）：按工作区聚组垫底，
+        // 官方对应视图亦按 max(updated_at) DESC, root_path 排序
+        const g = groupOf('ws:' + ws.toLowerCase(), {
+          kind: 'ws', label: projName(ws) || ws, path: ws,
+          position: 0, order: 1,
+        });
+        g.sessions.push(row);
+      }
+    }
+    // 未删除项目即使暂无任务也要出现在树上（官方行为；同时保住"在该项目新建会话"入口）
+    for (const p of projects) {
+      const key = 'proj:' + p.project_id;
+      if (!groups.has(key)) {
+        const root = primaryRoot.get(String(p.project_id)) || '';
+        const name = String(p.name ?? '');
+        const label = (nameCount.get(name) ?? 0) > 1 && root
+          ? `${name} · ${String(path.dirname(root)).split(/[\\/]/).filter(Boolean).pop() ?? ''}`.trim()
+          : name;
+        groupOf(key, { kind: 'project', label, path: root, position: Number(p.position ?? 0), order: 0 });
+      }
+    }
+    // 已删除项目的路径（projects.deleted=1）：桌面任务栏不显示其一切——白名单里
+    // 残留这些路径也不能垫组，否则"删掉的项目"又从配置里复活
+    const deletedProjPaths = new Set();
+    try {
+      for (const r of db.prepare(
+        'SELECT r.root_path AS root_path FROM project_roots r JOIN projects p ON p.project_id=r.project_id ' +
+        "WHERE p.host_id='local' AND p.deleted=1"
+      ).all()) deletedProjPaths.add(path.resolve(String(r.root_path ?? '')).toLowerCase());
+    } catch { /* 无 roots 行：不跳过任何白名单路径 */ }
+    // config.workspaces 白名单里没有项目行的，也垫进 ws 组（保住白名单落点可发现）
+    for (const w of config.workspaces ?? []) {
+      const wp = path.resolve(String(w?.path ?? ''));
+      if (!wp || deletedProjPaths.has(wp.toLowerCase())) continue;
+      let covered = false;
+      for (const g of groups.values()) {
+        if (g.path && path.resolve(String(g.path)) === wp) { covered = true; break; }
+      }
+      if (!covered) groupOf('ws:' + wp.toLowerCase(), { kind: 'ws', label: projName(wp) || wp, path: wp, position: 0, order: 1 });
+    }
+    // 官方顺序：项目按 position（projects 表全局序）；无项目归属组按最近会话时间垫底
+    const out = [...groups.values()];
+    out.sort((a, b) =>
+      (a.order ?? 0) - (b.order ?? 0) ||
+      (a.order === 0 ? (a.position ?? 0) - (b.position ?? 0) : 0) ||
+      (b.sessions[0]?.updatedAt ?? 0) - (a.sessions[0]?.updatedAt ?? 0) ||
+      String(a.label).localeCompare(String(b.label))
+    );
+    for (const g of out) if (g.path) knownWorkspaces.add(path.resolve(String(g.path)));
+    return out;
+  } catch (e) {
+    logLine('task-sync', `官方口径列表构建失败：${String(e?.message ?? e).slice(0, 200)}`);
+    return [];
+  }
+}
+
+/** projName 的服务端同款：路径末段作组名 */
+function projName(p) {
+  const base = String(p ?? '').split(/[\\/]/).filter(Boolean).pop();
+  return base || '（默认）';
+}
+
 // 桌面标题自动生成有延迟、页面也未必开着：每 60s 全量对账一次
 setInterval(() => {
   agent.request('session/list', { limit: 200 })
@@ -1777,52 +1932,49 @@ async function handleApi(req, res, url) {
   if (req.method === 'GET' && p === '/api/sessions') {
     const ws = url.searchParams.get('workspace');
     // all=1：全项目会话（官方 PC「项目 ⇄ 会话」分组列表的数据源）。
-    // session/list 的 workspace 可选——不传即返回全部会话，每条带归属 workspace。
+    // 数据源 = 桌面任务索引（官方任务栏同款过滤/排序，见 dbOfficialSessionGroups 头注）：
+    // 用户删除的项目/会话、归档在索引标志位上就是"不存在"，共享库/引擎里还有行也不显示。
+    // 引擎 session/list 只用于两件事：①喂索引同步（手机行 upsert）②knownWorkspaces 积累。
     if (url.searchParams.get('all') === '1') {
       const now = Date.now();
       const wantArchived = url.searchParams.get('archived') === '1';
       if (!allListCache || allListCache.archived !== wantArchived || now - allListCache.t > 5000) {
-        let list;
+        let list = null;
+        let groups = null;
         if (wantArchived) {
-          // 归档视图共享库直查（见 dbArchivedSessions 头注：随包引擎的 list
-          // 把归档行挡在存储层，引擎通道拿不到）
+          // 归档视图共享库直查（见 dbArchivedSessions 头注）：保留给 API 兼容/排查，
+          // 页面已按用户决策（2026-11-03）不再展示归档组——官方任务栏主列表就没有归档
           list = dbArchivedSessions();
         } else {
           // 不传 includeArchived：随包引擎（桌面版 3.14.4）schema 无此键，
           // strict 校验整帧被拒（Unrecognized key，2026-11-03 实测）；引擎默认
-          // 即"排除归档"。归档视图另走 dbArchivedSessions。
+          // 即"排除归档"。
           const r = await agent.request('session/list', { limit: 200 });
           list = (r.sessions ?? []).map((s) => {
-            // 运行态以共享库为准：引擎 status 对桌面驱动的回合是静止的（F2），
-            // 且桥未挂载的会话也读不到实时状态——直接看最后消息末部件。
-            // 桥自己驱动的回合用内存 busy 标记（事件实时性最好）。
             const turn = dbTurnState(s.sessionId);
             return {
               sessionId: s.sessionId,
               title: String(s.title ?? '').includes('\uFFFD') ? '' : s.title,
               status: s.status,
               mode: s.mode,
-              // 时间新鲜度也走共享库：外进程回合 session.updatedAt 不更新，
-              // 侧栏"刚刚/6分"必须反映真实最后写入
               updatedAt: Math.max(Number(s.updatedAt ?? 0), turn?.updatedAt ?? 0),
               createdAt: s.createdAt,
-              // 防御性过滤：引擎存储层已按 time_archived 排除，DB 判定兜底
               archived: dbSessionArchived(s.sessionId) === true,
               workspacePath:
                 s.workspace?.workspacePath ?? s.workspace?.workspaceKey ?? s.workspacePath ?? '',
               busy: sessionState(s.sessionId).busy || (turn?.running ?? false),
             };
           }).filter((s) => !s.archived);
-          list.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
-          // 双向同步：手机侧会话同步进桌面任务索引（桌面→手机本就走共享存储）。
-          // 归档视图不同步——归档会话不进桌面列表（新行会以未归档形态冒出来）
-          syncTaskIndexRows(list).catch(() => {});
+          for (const it of list) {
+            if (it.workspacePath) knownWorkspaces.add(path.resolve(it.workspacePath));
+          }
+          // 先同步再读索引：手机刚建的会话本轮就能进组（同步失败不挡读——60s 对账兜底）
+          try { await syncTaskIndexRows(list); } catch { /* 对账兜底 */ }
+          groups = dbOfficialSessionGroups();
         }
-        allListCache = { t: now, list, archived: wantArchived };
-        for (const it of list) {
-          if (it.workspacePath) knownWorkspaces.add(path.resolve(it.workspacePath));
-        }
+        allListCache = { t: now, list, groups, archived: wantArchived };
       }
+      if (allListCache.groups) return sendJson(res, 200, { sessions: allListCache.list, groups: allListCache.groups });
       return sendJson(res, 200, { sessions: allListCache.list });
     }
     const r = await agent.request('session/list', { workspace: workspaceRef(ws), limit: 50 });

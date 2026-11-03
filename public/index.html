@@ -3516,7 +3516,8 @@ applyTheme();
 
 let workspaces = [];      // config.workspaces（补齐还没有会话的项目行）
 let curWs = localStorage.getItem('zcode.ws') ?? '';
-let allSessions = [];     // 全项目会话（GET /api/sessions?all=1，每条带 workspacePath）
+let allSessions = [];     // 摊平视图（busy/搜索/兜底用）；渲染以 allGroups 为准
+let allGroups = null;     // GET /api/sessions?all=1 → 任务索引官方口径分组（服务端排好序）
 const projExpanded = new Map(); // 项目路径 → 是否展开全部会话
 
 const FOLDER_SVG = '<svg class="ic sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2.5h8A1.5 1.5 0 0 1 20.5 9v8.5a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5v-11z"/></svg>';
@@ -3536,8 +3537,8 @@ function fmtRel(ts) {
   return `${Math.floor(diff / 86400e3)}天`;
 }
 
-let archivedSessions = [];
-let archExpanded = false;
+// 归档会话不进侧栏（官方任务栏主列表现实；用户决策 2026-11-03）——
+// 归档在任务索引 archived=1，服务端 dbOfficialSessionGroups 已过滤，页面不再拉取归档视图
 
 // ── 远程项目（官方任务栏同款：SSH host → 远程项目 → 工作会话，只读）──
 // 数据源 GET /api/remote/projects：注册表 = 桌面任务索引 hosts/remote_project_entries，
@@ -3588,12 +3589,13 @@ document.getElementById('sessSearchClear')?.addEventListener('click', () => {
 async function loadAllSessions() {
   try {
     const r = await api('sessions?all=1');
-    allSessions = r.sessions ?? [];
+    // groups = 服务端官方口径分组（过滤/排序都在服务端按任务索引做死）；
+    // allSessions 仅为其摊平视图（busy 探测 / 搜索 / 启动兜底用），不再参与分组排序
+    allGroups = Array.isArray(r.groups) ? r.groups : null;
+    allSessions = allGroups
+      ? allGroups.flatMap((g) => (g.sessions ?? []).map((s) => ({ ...s, _gpath: String(g.path ?? '') })))
+      : (r.sessions ?? []);
   } catch { /* 保留旧数据，下轮再试 */ }
-  try {
-    const r2 = await api('sessions?all=1&archived=1');
-    archivedSessions = r2.sessions ?? [];
-  } catch { archivedSessions = []; }
   renderProjectList();
 }
 
@@ -3624,9 +3626,9 @@ function openSessPop(anchor, s) {
     });
     pop.appendChild(b);
   };
-  mk('打开', () => openSession(s.sessionId, s.workspacePath));
-  if (s.archived) mk('恢复', () => archiveSession(s.sessionId, false));
-  else mk('归档', () => archiveSession(s.sessionId, true));
+  mk('打开', () => openSession(s.sessionId, s._gpath || s.workspacePath));
+  // 无"归档"项：归档会话不进列表（官方任务栏主列表现实，用户决策 2026-11-03）——
+  // 手机上归档等于把会话推进看不见的黑洞，恢复入口在桌面
   mk('删除', async () => {
     if (!confirm(`删除会话「${s.title || '未命名'}」？\n消息与记录将一并删除，不可恢复。`)) return;
     if (s.sessionId === curSession) { openSession(null); }
@@ -3644,15 +3646,6 @@ function openSessPop(anchor, s) {
   pop.classList.add('open');
 }
 document.addEventListener('click', (e) => { if (!$('sessPop').contains(e.target)) closeSessPop(); });
-
-async function archiveSession(sid, archived) {
-  try {
-    await api(`sessions/${encodeURIComponent(sid)}/archive`, { method: 'POST', body: JSON.stringify({ archived }) });
-    if (sid === curSession && archived) openSession(null);
-    toast(archived ? '已归档' : '已恢复');
-  } catch (e) { toast(`${archived ? '归档' : '恢复'}失败：${e.message}`); }
-  loadAllSessions();
-}
 
 function sessRow(s, projectPath) {
   // 只信服务端核实过的 busy：它 = 桥内存标记 ∥ 共享库末部件判定。
@@ -3684,7 +3677,6 @@ function renderProjectList() {
   if (sessQuery.trim()) {
     sect.textContent = '搜索结果';
     const hits = allSessions.filter(sessMatches);
-    const archHits = archivedSessions.filter(sessMatches);
     const q = sessQuery.trim().toLowerCase();
     const remoteHits = [];
     for (const h of remoteHosts) {
@@ -3697,18 +3689,11 @@ function renderProjectList() {
         }
       }
     }
-    if (!hits.length && !archHits.length && !remoteHits.length) {
+    if (!hits.length && !remoteHits.length) {
       box.appendChild(el('div', 'sysline', `没有匹配「${sessQuery.trim()}」的会话`));
       return;
     }
-    for (const s of hits) box.appendChild(sessRow(s, s.workspacePath));
-    if (archHits.length) {
-      const head = el('div', 'archsect');
-      head.appendChild(el('span', '', '▸'));
-      head.appendChild(el('b', '', `已归档（${archHits.length}）`));
-      box.appendChild(head);
-      for (const s of archHits.slice(0, 20)) box.appendChild(sessRow({ ...s, archived: true }, s.workspacePath));
-    }
+    for (const s of hits) box.appendChild(sessRow(s, s._gpath || s.workspacePath));
     if (remoteHits.length) {
       const head = el('div', 'archsect');
       head.appendChild(el('span', '', '▸'));
@@ -3719,28 +3704,18 @@ function renderProjectList() {
     return;
   }
   sect.textContent = '项目 / 会话';
-  // 分组：workspacePath → sessions[]（接口已按 updatedAt 降序）
-  const groups = new Map();
-  for (const s of allSessions) {
-    const key = s.workspacePath ?? '';
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(s);
-  }
-  // 项目全集 = 有会话的项目 ∪ config.workspaces，按最近会话时间排序（官方布局）
-  const entries = [...groups.entries()];
-  for (const w of workspaces) {
-    const p = String(w.path ?? '');
-    if (!entries.some(([k]) => k === p)) entries.push([p, []]);
-  }
-  entries.sort((a, b) => (b[1][0]?.updatedAt ?? 0) - (a[1][0]?.updatedAt ?? 0));
-  if (!entries.length) { box.appendChild(el('div', 'sysline', '还没有项目和会话')); return; }
-  for (const [p, sessions] of entries) {
+  // 分组与排序一律以服务端 groups 为准（官方任务索引口径：项目按 position、任务按
+  // cli_updated_at DESC；已删除的项目/会话、归档在数据源里就被过滤）。
+  // 页面禁止再分组、再排序——此前"按最近会话时间自排"就是排序乱掉的根源。
+  const groups = allGroups ?? [];
+  if (!groups.length) { box.appendChild(el('div', 'sysline', '还没有项目和会话')); }
+  for (const g of groups) {
+    const p = String(g.path ?? '');
     const isCur = p === curWs;
     const row = el('div', 'wsrow' + (isCur ? ' cur' : ''));
     const fi = el('span', 'mi'); fi.innerHTML = FOLDER_SVG; row.appendChild(fi);
-    row.appendChild(el('div', '', projName(p)));
-    // 项目行内「＋」：一键把新会话建到这个项目（此前"先点项目、再退出去点新会话"
-    // 全靠脑补，落错了项目无任何提示）
+    row.appendChild(el('div', '', g.label || projName(p)));
+    // 项目行内「＋」：一键把新会话建到这个项目
     const add = el('button', 'wsadd', '＋');
     add.title = '在此项目新建会话';
     add.addEventListener('click', (ev) => { ev.stopPropagation(); openSession(null, p); });
@@ -3749,34 +3724,18 @@ function renderProjectList() {
     row.addEventListener('click', () => switchWorkspace(p));
     box.appendChild(row);
     // 每个项目平铺最近 3 条会话，「显示更多」展开全量（官方交互）
-    const expanded = !!projExpanded.get(p);
+    const sessions = g.sessions ?? [];
+    const expanded = !!projExpanded.get(g.key ?? p);
     const list = expanded ? sessions : sessions.slice(0, 3);
-    for (const s of list) box.appendChild(sessRow(s, p));
+    for (const s of list) box.appendChild(sessRow(s, p || s.workspacePath));
     if (sessions.length > list.length) {
       const more = el('button', 'morebtn', `显示更多（还有 ${sessions.length - list.length} 条）`);
-      more.addEventListener('click', () => { projExpanded.set(p, true); renderProjectList(); });
+      more.addEventListener('click', () => { projExpanded.set(g.key ?? p, true); renderProjectList(); });
       box.appendChild(more);
     } else if (expanded && sessions.length > 3) {
       const less = el('button', 'morebtn', '收起');
-      less.addEventListener('click', () => { projExpanded.set(p, false); renderProjectList(); });
+      less.addEventListener('click', () => { projExpanded.set(g.key ?? p, false); renderProjectList(); });
       box.appendChild(less);
-    }
-  }
-  // 已归档会话：折叠分组（官方交互），恢复/删除走行内 ⋯ 菜单
-  if (archivedSessions.length) {
-    const head = el('div', 'archsect');
-    const chev = el('span', '', archExpanded ? '▾' : '▸');
-    chev.style.color = 'var(--faint)';
-    head.appendChild(chev);
-    head.appendChild(el('b', '', `已归档（${archivedSessions.length}）`));
-    head.style.cursor = 'pointer';
-    head.addEventListener('click', () => { archExpanded = !archExpanded; renderProjectList(); });
-    box.appendChild(head);
-    if (archExpanded) {
-      for (const s of archivedSessions.slice(0, 20)) {
-        const row = sessRow({ ...s, archived: true }, s.workspacePath);
-        box.appendChild(row);
-      }
     }
   }
   // 远程项目（官方任务栏同款层级：主机 → 远程项目 → 工作会话，点开只读浏览）
@@ -3885,6 +3844,8 @@ function projectChoices() {
   };
   push(curWs);
   for (const s of allSessions) push(s.workspacePath);
+  // 服务端分组里的空项目（0 会话）也要能建进去——官方任务栏照样显示它
+  for (const g of allGroups ?? []) push(g.path);
   for (const w of workspaces) push(w.path);
   return out;
 }
@@ -4119,6 +4080,7 @@ async function openSession(sessionId, wsPath) {
     // 校正 localStorage 里的项目：已不存在时回落到最近会话的项目
     const knownPaths = new Set([
       ...allSessions.map((s) => s.workspacePath ?? ''),
+      ...(allGroups ?? []).map((g) => String(g.path ?? '')),
       ...workspaces.map((w) => String(w.path ?? '')),
     ]);
     if (!knownPaths.has(curWs)) {

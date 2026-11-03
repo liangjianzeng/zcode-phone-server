@@ -50,6 +50,7 @@
 | `autoAnswer` | `allow`=自动放行权限/自动选第一项；`ask`=转发手机人工 | |
 | `nodePath` / `zcodePath` | 引擎运行时；当前指**桌面版闭源二进制**（与桌面同凭据机制） | `…/Programs/ZCode/resources/glm/zcode.cjs` |
 | `builtinProviderConfigPath` | 内置 Provider 规则（Registry 的模型目录来源；CLI 自带缓存会缺文件） | 桌面随包 `zcode-builtin.json` |
+| `taskProvider` | 侧栏官方口径的 provider 过滤值（见 §2.10；桌面任务索引按 provider 分租户） | `glm` |
 
 ### 2.2 凭据解析（readCodingPlanApiKey / connectedProviderId）
 
@@ -115,7 +116,7 @@ sessionState(sid) = { subs:Set<res>, ring:[≤1000], busy, busySince, lastSend, 
 | 端点 | 要点 |
 |---|---|
 | `GET /api/state` | workspace/mode/**model**/autoAnswer/agentRunning（页面输入卡模型名来源） |
-| `GET /api/workspaces`、`GET /api/sessions?workspace=|all=1` | 会话列表（含 `busy` 引擎侧标记、updatedAt） |
+| `GET /api/workspaces`、`GET /api/sessions?workspace=|all=1` | 会话列表（含 `busy` 引擎侧标记、updatedAt）；`all=1` 附 `groups`＝官方任务栏口径的分组（§2.10，页面侧栏唯一数据源） |
 | `POST /api/sessions {sessionId?, workspace?}` | create/resume + **subscribe**（legacy 通道必须订阅才有事件）+ setModel（**必须带档位**）；响应含 `lastSeq/busy/busySince`（页面恢复运行态与增量订阅） |
 | `GET /api/sessions/:id/messages?limit=` | limit 可覆盖（页面轻量探测用小值）；`Session is not active` = 未 resume |
 | `GET /api/sessions/:id/stream` | SSE（见上） |
@@ -198,6 +199,38 @@ sessionId 双端白名单校验、5s 列表缓存 + 3s 消息缓存 + 单飞合�
 归档/删除也归桌面，桥只做"能看"（问题档案 #35）。
 **产品决策（2026-11-03 用户确认）：远程组按"能看"交付，可操作性（发消息/审批/停止）
 明确不在范围内**；日后若要做远程续跑，立项对齐官方 remote agent 协议，别在只读通道上打补丁。
+
+### 2.10 侧栏官方口径（dbOfficialSessionGroups，`GET /api/sessions?all=1` 的 `groups`）
+
+侧栏唯一事实源 = **桌面任务索引** `~/.zcode/v2/tasks-index.sqlite`（桌面任务栏读的
+就是这份），不是引擎 `session/list`、也不是共享库直查——用户删除的项目/会话/归档
+在索引标志位上就是"不存在"，共享库行还在也不算数（问题档案 #36）。
+
+官方查询（app.asar 反解 + zai-org/ZCode 开源仓库确认，逐字对齐）：
+
+```
+主列表  WHERE provider=? AND deleted=0 AND coalesce(cli_deleted,0)=0 AND archived=0
+                AND cli_created_at IS NOT NULL
+        ORDER BY cli_updated_at DESC, task_id
+项目树  projects WHERE host_id='local' AND deleted=0 ORDER BY position, project_id
+```
+
+三条容易漏、且必须守住的语义：
+
+1. **任务挂在已删除项目下 = 不显示**。`tasks.project_id` 非空但 `projects` 无存活行
+   （deleted=1 或不存在）→ 整行丢弃。手机自建行不会误伤：`syncTaskIndexRows` 的
+   `projectIdFor` 只挂未删除项目，否则写 NULL（NULL 才进无归属组）。
+2. **白名单不覆盖官方删除态**。`config.workspaces` 垫组前必须跳过
+   `project_roots ⋈ projects.deleted=1` 的路径，否则"删掉的项目"从配置里复活。
+3. **provider 过滤**照官方 `provider=?`（`config.taskProvider ?? 'glm'`）；共享库里
+   provider 为 NULL 的 52 条 legacy 行官方任务栏同样不显示，手机跟随。
+
+每行本地校验：共享库存在性（索引比库新=幽灵，跳过）、标题以共享库为权威
+（索引 60s 对账滞后）、busy = 桥内存 ∥ `dbTurnState`。分组输出已按官方顺序排好——
+项目组按 `position`、无归属组按最近会话垫底，组内 `cli_updated_at DESC`。
+**页面只按数组顺序渲染，禁止再排**（排序错乱的根源就是两端各排各的）。
+归档视图入口已从页面移除（官方主列表 `archived=0`，归档只在桌面归档区管理）；
+`all=1` 的 `sessions` 字段保留为兼容/兜底（引擎列表平铺），页面有 `groups` 时一律用 `groups`。
 
 ---
 
@@ -390,6 +423,7 @@ approval 高优通知）。页面 v2 通知与 DOM 桥**双通道并存**，通�
 | 33 | keepalive.log/server.log 暴涨（80MB）：守护每 3 秒 EADDRINUSE 崩溃一次无限刷日志；且真正在服务的实例崩了没人拉起，"自动重启保护"名存实亡 | `run-server.cmd` 无条件 `node server.mjs`：端口被占（另一守护/手动实例在服务）时新进程必然 EADDRINUSE 秒退，守护 3 秒一次写两条日志无限循环，真实故障堆栈全被淹没；而由一次性脚本拉起的实例父进程已死=孤儿，崩了没有任何东西补位 | 守护幂等化：拉起前 netstat 查端口，有监听者→5 秒后复查等待接管，端口空了才拉起并阻塞在服务上。多守护共存、手动 `node server.mjs` 调试都不打架 | 清理僵尸守护后 keepalive.log 零新增；两次实测（含本次调试期）：服务被杀后守护 3 秒内自动补位，端口/健康检查恢复正常 |
 | 34 | 远程 reader 首版把脚本 base64 后塞进 ssh 命令行（约 10.5KB）：远端 stdout 吐出**未解码的 base64 原文**、后续所有命令凭空消失、exit 0 且 stderr 空，Git Bash 手跑同一条命令却正常 | SSH exec 通道对远程命令行在 **~8192 字节**处腰斩（node spawn 二分实测：8042 字节命令完好，9042 起被截），命令行被切成 `printf %s <B64>` 后半段（含重定向）丢失，printf 直接打到外层 stdout；手跑正常是 Git Bash ssh.exe 走了不同的参数组装路径。与远端 shell/基础工具无关 | 脚本改走 **stdin**：`cat > 文件 && python3 文件`（命令行只剩几十字节），python3 优先、127 退 node；node 目标机同样落盘执行 | 双主机（一台仅 python3、一台 node22+python3）`/api/remote/projects` 全在线；`/api/remote/messages` 实测拉回 102KB 完整 MessageWithParts |
 | 35 | 用户报"看不到远程项目的工作会话"；同时怀疑过 `session/list` 漏数（API 143 条 vs 共享库 236 条） | 漏的 93 条全部 `task_type=subagent_child`（子代理子会话）：引擎列表口径**故意**排除，桌面任务索引里也一行都没有（0/93）——官方任务栏同样不把它们当顶层任务，属正常语义不是缺口（若日后"补齐"反而制造官方没有的幽灵行）。真正的缺口：官方任务栏的"远程项目"组（`hosts`+`remote_project_entries`，两台 SSH 主机三个项目）桥此前零实现，远端库里的当日工作会话手机端整体不可见 | 新增 §2.9 远程项目桥：`/api/remote/projects` + `/api/remote/messages`（SSH stdin 落盘 reader，桌面主列表口径过滤）；页面侧栏"远程项目"分组 + 只读会话视图（不 resume/不 SSE/composer 禁用/运行中 5s 跟随） | 页面实测：liang-linux、TongYi-Lite、DSH-Phone 三远程项目组出现，运行中会话（busy）点开后思考/工具/正文全量渲染、输入框置灰提示桌面端继续；搜索命中远程会话 |
+| 36 | 侧栏"删掉的项目/会话还在、归档还在、排序乱糟糟全跑到最下面"——用户两度斥责"官方都开源了还瞎做" | 侧栏数据源用错：拿引擎 `session/list`（不知道桌面删除态）+ 客户端按 updatedAt 自排。官方任务栏读的是**桌面任务索引**：删除/归档都是索引标志位（`deleted/cli_deleted/archived`），"删掉的项目"是 `projects.deleted=1` 且**挂其下的任务整行不显示**（实测 5 个已删项目名下仍有 50 条存活任务行，桌面靠项目树挂载关系过滤）；排序是项目按 `position`、任务按 `cli_updated_at DESC, task_id`。手机此前两处自造：悬空 project_id 落进无归属组、`config.workspaces` 白名单把已删项目路径垫回来 | 新增 §2.10 `dbOfficialSessionGroups()` 为侧栏唯一事实源（官方逐字查询 + 悬空项目丢弃 + 白名单跳过已删路径 + provider 过滤），页面只按服务端数组顺序渲染、禁自排；归档分组/入口从页面删除（官方主列表 `archived=0`，归档归桌面管） | 索引对账：glm 存活 68 行 − 50 悬空 = 18 条，与页面逐条一致、0 幽灵；浏览器实测侧栏 6 项目按 position 排列、已删项目/归档全部消失、远程组照旧 |
 
 ---
 
