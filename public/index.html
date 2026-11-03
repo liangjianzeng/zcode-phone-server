@@ -30,7 +30,7 @@
     --code-bg: #08080b; --code-inline: #1c1c24;
     --chip-fg: #b7a5ff; --link: #7cb7ff;
     --btn-muted: #2c2c36; --btn-muted-2: #3a3a46;
-    --rowbg: #17171f; --tint: rgba(124,92,255,.14);
+    --tint: rgba(124,92,255,.14);
     --tok-key: #c792ea; --tok-str: #a5d6a5; --tok-num: #f2ae70; --tok-com: #6a6a76;
     --tok-fn: #82aaff; --tok-tag: #7cb7ff;
     --shadow: 0 10px 34px rgba(0,0,0,.55);
@@ -45,7 +45,7 @@
     --chip-fg: #5b3df0; --link: #0b62d6;
     --btn-muted: #e7e7ee; --btn-muted-2: #d9d9e2;
     /* 浅色下 --card 与 --panel 同为白——侧栏选中/分组底色必须另有层级色，否则完全隐形 */
-    --rowbg: #eef0f6; --tint: rgba(106,77,240,.12);
+    --tint: rgba(106,77,240,.12);
     --tok-key: #7c3aed; --tok-str: #1a7f37; --tok-num: #b45309; --tok-com: #9a9aa3;
     --tok-fn: #1d4ed8; --tok-tag: #0b62d6;
     --shadow: 0 10px 34px rgba(0,0,0,.18);
@@ -424,17 +424,19 @@
   #info .sheet .head { padding: 14px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
   #info .sheet .head b { flex: 1; }
   .sheetbody { flex: 1; overflow-y: auto; padding: 8px; }
+  /* 分组头无底色（用户拍板 2026-11-03：底色只用于当前会话行，项目不需要）；
+     层级感靠 加粗字重 + 条数 + 下方导轨线 完成 */
   .wsrow {
     display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-radius: 10px;
     margin: 3px 0; cursor: pointer; border: 1px solid transparent; font-size: 13.5px;
-    background: var(--rowbg);
   }
   /* 分组头与会话行字体分层：项目加粗收紧、会话维持常规正文字号——同字号同字重时一锅粥 */
   .wsrow .plabel {
     flex: 1; min-width: 0; font-weight: 600; font-size: 13px; letter-spacing: .03em;
     color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .wsrow.cur { background: var(--tint); border-color: rgba(124,92,255,.5); }
+  /* 当前项目行不加底色——底色是"正在查看的会话"专属信号，项目用圆点标记即可 */
+  .wsrow.cur { border-color: transparent; }
   /* 主机行下的项目行缩半格（远程 主机→项目→会话 三级层级） */
   .wsrow.sub { margin-left: 16px; }
   .wsrow .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
@@ -1961,6 +1963,9 @@ function setToolStatus(toolCallId, status, desc, detail) {
 // 有变化才全量拉取重渲染；运行态按"最后部件是否 step-finish"推断。
 
 let lastFingerprint = '';    // 最后渲染的消息尾部指纹（renderHistory 内更新）
+// 历史分页（打开会话首屏只拉最近 histLimit 条，更早按需）：与 server HISTORY_INIT_PAGE 对齐
+let histLimit = 40;
+let histTotal = 0;
 // SSE turn.started 回显的用户气泡（{mid, text, at}）：引擎落库后 renderTail/
 // renderHistory 会用存储 messageId 重画同一条消息——不清理就是"发出一条回显两条"。
 // 存储渲染同文本用户消息时移除对应回显气泡（60 秒窗口，连发两条相同内容也各自对齐）。
@@ -2177,8 +2182,48 @@ function renderHistory(messages, opts = {}) {
   // 全量重绘后：空闲会话的历史思考都已完成 → 全部折叠；
   // 忙碌中（打开运行中的会话/断线重同步）则保留"最新思考展开"跟着输出
   if (!busy && !opts.keepThinkOpen) collapseOpenThinks();
-  scrollBottom(true); // 打开/重同步会话：回到最新消息（不受用户滚动守卫限制）
+  // 上方还有历史 → 顶部挂「加载更早」（打开时只拉了最近 histLimit 条，
+  // 大会话全量 9.7MB 是打开慢的主因；更早的按需拉，见 loadOlderMessages）
+  if (histTotal > histLimit && vis.length) {
+    const btn = el('button', 'morebtn', `加载更早消息（上方还有 ${histTotal - histLimit} 条）`);
+    btn.style.margin = '0 0 10px 0';
+    btn.addEventListener('click', () => loadOlderMessages());
+    chat.insertBefore(btn, chat.firstChild);
+  }
+  if (!opts.noAutoScroll) scrollBottom(true); // 打开/重同步会话：回到最新消息（不受用户滚动守卫限制）
 }
+
+// 「加载更早」：histLimit 窗口一次多取 80 条重建对话；滚动锚定在原位置
+// （renderHistory 默认 rAF 强制滚底，此场景传 noAutoScroll 后手动补偿高度差）
+let olderLoading = false;
+async function loadOlderMessages() {
+  if (!curSession || olderLoading) return;
+  if (histTotal <= histLimit) return;
+  olderLoading = true;
+  const sid = curSession;
+  histLimit = Math.min(histLimit + 80, histTotal);
+  try {
+    const r = await api(`sessions/${encodeURIComponent(sid)}/messages?limit=${histLimit}`);
+    if (curSession !== sid) return; // await 期间已切会话：作废
+    histTotal = Number(r.total ?? histTotal);
+    const h0 = chat.scrollHeight, t0 = chat.scrollTop;
+    renderHistory(r.messages ?? [], { keepThinkOpen: !!busy, noAutoScroll: true });
+    chat.scrollTop = t0 + (chat.scrollHeight - h0);
+  } catch { /* 失败保持原渲染 */ }
+  finally { olderLoading = false; }
+}
+
+// 上拉（滚到顶部）自动加载更多：距顶 ≤80px 即续拉，不必点按钮（按钮是手动兜底）。
+// 防误触发：renderHistory 后 800ms 内忽略（打开会话瞬间 scrollTop 还没被 rAF 推底，
+// 否则一开就误判"到顶"连环拉）；远程只读视图不自动拉。
+let histRenderedAt = 0;
+chat.addEventListener('scroll', () => {
+  if (remoteView || olderLoading) return;
+  if (histTotal <= histLimit) return;
+  if (Date.now() - histRenderedAt < 800) return;
+  if (chat.scrollHeight <= chat.clientHeight + 100) return; // 没溢出屏幕谈不上拉
+  if (chat.scrollTop <= 80) loadOlderMessages();
+});
 
 // ── 计划 / 用量 / 插件（引擎能力，端点容错降级）──
 
@@ -2893,7 +2938,8 @@ async function resync() {
   if (!curSession) return;
   const sid = curSession;
   try {
-    const r = await api(`sessions/${encodeURIComponent(sid)}/messages`);
+    const r = await api(`sessions/${encodeURIComponent(sid)}/messages?limit=60`);
+    // 断线重同步只需要尾部窗口（指纹比对 + renderTail），不必全量
     // 异步竞态守卫：await 期间用户已切换会话 → 旧会话历史不得渲染进
     // 新会话视图（串台）。SSE 断线重连瞬间正好叠加快速切换会话时必现。
     if (curSession !== sid) return;
@@ -4006,6 +4052,7 @@ async function openRemoteSession(h, s) {
     finishedSince = 0;
     setSessionTitle(`${s.title || '未命名会话'}（远程 · 只读）`);
     setActivity(s.busy ? '远程回合运行中' : '');
+    histLimit = 0; histTotal = 0; // 远程只读视图整包渲染，不挂「加载更早」
     renderHistory(r.messages ?? [], { keepThinkOpen: !!s.busy });
     setComposerEnabled(false);
     hideSwitching();
@@ -4095,6 +4142,10 @@ async function openSession(sessionId, wsPath) {
     // 外部（桌面端）驱动的回合：引擎 status 恒为 idle，但从存储里
     // 最后一条消息未以 step-finish 收尾可推断出"运行中"
     const foreignRunning = !running && turnLooksRunning(r.messages ?? []);
+    // 首屏历史已由服务端共享库直查截到最近 40 条（server HISTORY_INIT_PAGE），
+    // histTotal 决定顶部要不要挂「加载更早」
+    histLimit = r.messages?.length ? Math.max(r.messages.length, 40) : 40;
+    histTotal = Number(r.total ?? (r.messages ?? []).length);
     renderHistory(r.messages ?? [], { keepThinkOpen: running || foreignRunning });
     // 恢复会话时对齐运行态：服务端 ring 为空（重启过）也能正确显示"运行中"
     if (running && !busy) {

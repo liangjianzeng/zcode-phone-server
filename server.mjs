@@ -27,6 +27,7 @@ import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { gzip as gzipAsync, gzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -722,6 +723,39 @@ function dbSessionTodos(sid) {
       'SELECT content, status, priority, position FROM todo WHERE session_id = ? ORDER BY position'
     ).all(sid);
   } catch { return []; }
+}
+
+/**
+ * 历史消息共享库直查（打开会话/轮询探测的服务端实现，不再走引擎 session/messages）：
+ * "最近 N 条"语义 = sequence DESC 取 N 再反转（引擎 resume 快照带**全量** messages，
+ * 实测 200 条 = 9.7MB，是"流会话历史加载很慢"的最大头——首屏只需要最近几条，
+ * 更早的由页面向上「加载更早」按需拉取）。可见性过滤与远程 reader 同款
+ * （model-only / uiVisibility hidden 不进历史，桌面口径）。
+ * total = 该会话消息总行数（页面据此决定要不要挂「加载更早」）。
+ */
+const HISTORY_INIT_PAGE = 40; // 打开会话首屏条数（gzip 后通常几百 KB）
+function dbMessagesPage(sid, limit = HISTORY_INIT_PAGE) {
+  const out = { messages: [], total: 0 };
+  if (!/^(sess|session)_[A-Za-z0-9._-]+$/.test(String(sid ?? ''))) return out;
+  if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
+  const s = String(sid);
+  out.total = Number(agentDbHandle.prepare('SELECT count(*) AS c FROM message WHERE session_id=?').get(s)?.c ?? 0);
+  const lim = Math.max(1, Math.min(500, Number(limit) || HISTORY_INIT_PAGE));
+  const rows = agentDbHandle.prepare(
+    'SELECT id, data FROM message WHERE session_id=? ORDER BY sequence DESC LIMIT ?'
+  ).all(s, lim).reverse();
+  const ps = agentDbHandle.prepare('SELECT data FROM part WHERE message_id=? ORDER BY sequence ASC');
+  for (const r of rows) {
+    let info = null;
+    try { info = JSON.parse(r.data ?? '{}'); } catch { continue; }
+    if (String(info?.visibility ?? '') === 'model-only' ||
+        String(info?.metadata?.visibility ?? '') === 'model-only' ||
+        String(info?.semantics?.uiVisibility ?? '') === 'hidden') continue;
+    let parts = [];
+    try { parts = ps.all(r.id).map((x) => { try { return JSON.parse(x.data ?? '{}'); } catch { return null; } }).filter(Boolean); } catch { /* 坏部件行跳过 */ }
+    out.messages.push({ info, parts });
+  }
+  return out;
 }
 
 /**
@@ -1813,10 +1847,49 @@ function checkAuth(req, url) {
   return t && timingSafeEqual(t, config.token);
 }
 
-function sendJson(res, status, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+// ── gzip 传输压缩（node:zlib 标准库，零 npm 依赖承诺不变）──
+// 动因：打开大会话 = 全量拉历史，实测 200 条 = 9.7MB（思考/工具输出是 JSON 里的大头），
+// 全走在 SSH 隧道 + 蜂窝链路上，"流会话历史加载很慢"就是它。JSON 文本压缩比实测 3~4x。
+// SSE 不压（块压缩会把流式帧憋在缓冲里，破坏实时性）。
+const GZIP_MIN = 1024; // 低于此值压缩得不偿失
+function wantsGzip(res) {
+  const ae = res.req?.headers?.['accept-encoding'];
+  return typeof ae === 'string' && /\bgzip\b/.test(ae);
+}
+function gzipBuf(buf) {
+  // 大 payload 走异步：9.7MB 同步 gzip 会阻塞事件loop几百毫秒，殃及 SSE 心跳
+  if (buf.length < 64 * 1024) { try { return Promise.resolve(gzipSync(buf, { level: 6 })); } catch { return Promise.resolve(null); } }
+  return new Promise((resolve) => { gzipAsync(buf, { level: 6 }, (err, out) => resolve(err ? null : out)); });
+}
+
+async function sendJson(res, status, obj) {
+  let body;
+  try { body = Buffer.from(JSON.stringify(obj)); } catch { body = Buffer.from('{}'); }
+  const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
+  if (body.length >= GZIP_MIN && wantsGzip(res)) {
+    const gz = await gzipBuf(body);
+    if (gz) {
+      res.writeHead(status, { ...headers, 'Content-Encoding': 'gzip', 'Content-Length': gz.length, 'Vary': 'Accept-Encoding' });
+      return res.end(gz);
+    }
+  }
+  res.writeHead(status, { ...headers, 'Content-Length': body.length, 'Vary': 'Accept-Encoding' });
   res.end(body);
+}
+
+// 静态文件 gzip：按 (路径,mtime,size) 缓存压缩结果——页面热更新场景 mtime 一变即失效，
+// 与 pageBuild 指纹自动 reload 机制天然兼容
+const STATIC_GZ = new Map();
+function staticGzFor(file) {
+  const st = fs.statSync(file);
+  const key = `${file}:${st.mtimeMs}:${st.size}`;
+  let gz = STATIC_GZ.get(key);
+  if (gz === undefined) {
+    gz = gzipSync(fs.readFileSync(file), { level: 6 });
+    if (STATIC_GZ.size > 16) STATIC_GZ.clear();
+    STATIC_GZ.set(key, gz);
+  }
+  return gz;
 }
 
 function readBody(req, limit = 5 * 1024 * 1024) {
@@ -2033,11 +2106,15 @@ async function handleApi(req, res, url) {
       await agent.request('session/setModel', { sessionId: sid, model: sel }).catch((e) =>
         logLine('set-model-error', String(e?.message ?? e)));
     }
+    // 首屏历史 = 共享库直查最近 HISTORY_INIT_PAGE 条（不再转发引擎 resume 快照的
+    // 全量 messages——大会话 9.7MB 全量是打开慢的主因；更早由页面「加载更早」按需拉）
+    const hist = dbMessagesPage(sid, HISTORY_INIT_PAGE);
     return sendJson(res, 200, {
       sessionId: sid,
       title: snap?.session?.title ?? '',
       status: snap?.session?.status ?? 'idle',
-      messages: snap?.messages ?? [],
+      messages: hist.messages,
+      total: hist.total,
       // lastSeq：页面首连从此序号只收新事件（历史已由 messages 渲染，重放会重复）
       lastSeq: sessionState(sid).lastSeq,
       // 运行态恢复：页面刷新/重开后能立即回到"运行中"并接续计时。
@@ -2084,9 +2161,13 @@ async function handleApi(req, res, url) {
     }
 
     if (req.method === 'GET' && sub === 'messages') {
-      // limit 可由查询参数覆盖：页面轮询用小 limit 轻量探测，变化才全量拉取
+      // limit 可由查询参数覆盖：页面轮询用小 limit 轻量探测，「加载更早」按 histLimit 递增。
+      // 共享库直查（最近 N 条 + total，见 dbMessagesPage 头注）；库异常时回退引擎通道
       const limit =
         Number(url.searchParams.get('limit')) || config.maxHistoryMessages;
+      try {
+        return sendJson(res, 200, dbMessagesPage(sid, limit));
+      } catch { /* 共享库不可用：回退引擎 */ }
       const r = await agent.request('session/messages', { sessionId: sid, limit });
       return sendJson(res, 200, { messages: r.messages ?? [] });
     }
@@ -2478,13 +2559,29 @@ const server = http.createServer(async (req, res) => {
       return await handleApi(req, res, url);
     }
     if (url.pathname === '/' || url.pathname === '/index.html') {
-      const html = fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      const file = path.join(PUBLIC_DIR, 'index.html');
+      const base = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' };
+      if (wantsGzip(res)) {
+        try {
+          const gz = staticGzFor(file);
+          return res.writeHead(200, { ...base, 'Content-Encoding': 'gzip', 'Content-Length': gz.length, 'Vary': 'Accept-Encoding' }).end(gz);
+        } catch { /* 压缩失败回落原文 */ }
+      }
+      const html = fs.readFileSync(file, 'utf8');
+      res.writeHead(200, base);
       return res.end(html);
     }
     const staticPath = path.join(PUBLIC_DIR, path.normalize(url.pathname).replace(/^([.][.][/\\])+/, ''));
     if (staticPath.startsWith(PUBLIC_DIR) && fs.existsSync(staticPath) && fs.statSync(staticPath).isFile()) {
-      res.writeHead(200, { 'Content-Type': MIME[path.extname(staticPath)] ?? 'application/octet-stream' });
+      const ext = path.extname(staticPath);
+      const base = { 'Content-Type': MIME[ext] ?? 'application/octet-stream' };
+      if (wantsGzip(res) && ['.html', '.js', '.css', '.svg'].includes(ext)) {
+        try {
+          const gz = staticGzFor(staticPath);
+          return res.writeHead(200, { ...base, 'Content-Encoding': 'gzip', 'Content-Length': gz.length, 'Vary': 'Accept-Encoding' }).end(gz);
+        } catch { /* 压缩失败回落原文 */ }
+      }
+      res.writeHead(200, base);
       return res.end(fs.readFileSync(staticPath));
     }
     return sendJson(res, 404, { error: 'not found' });
