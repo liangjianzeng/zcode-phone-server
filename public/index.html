@@ -2168,6 +2168,22 @@ function scheduleTodoRefresh() {
   }, 600);
 }
 
+// 消息元素稳定键（2026-11-04 气泡 ×N 重复事故的页面侧防线）：优先存储/引擎
+// 注入的 messageId/id；id 缺失（异常通道/旧服务端）时退化为 role+时间+正文摘要
+// 的确定性结构键——跨轮询恒定，ensureMsg 才能认出"同一条消息"复用元素。
+// ⚠️ 绝不允许 Math.random() 兜底：随机 id = 每轮探测都是"新消息" = 尾部窗口
+// 每次指纹变化整窗重贴一份（本次重复事故根因，工具行因 callId 去重幸免）。
+function messageKey(msg) {
+  const info = msg?.info ?? {};
+  const mid = String(info.messageId ?? info.id ?? '');
+  if (mid) return mid;
+  let t = '';
+  for (const p of msg?.parts ?? []) if (p?.type === 'text') t += String(p.text ?? '');
+  let h = 5381;
+  for (let i = 0; i < t.length; i++) h = ((h << 5) + h + t.charCodeAt(i)) >>> 0;
+  return 'c:' + (info.role ?? 'a') + ':' + (info.time ?? '') + ':' + t.length + ':' + h.toString(36);
+}
+
 function renderHistory(messages, opts = {}) {
   chat.textContent = '';
   // 任务计划条已移出滚动容器（chatCol 的常驻表头），全量重绘不会动它
@@ -2195,7 +2211,7 @@ function renderHistory(messages, opts = {}) {
   for (let vi = 0; vi < vis.length; vi++) {
     const msg = vis[vi];
     const role = msg.info?.role ?? 'assistant';
-    const mid = String(msg.info?.messageId ?? msg.info?.id ?? Math.random());
+    const mid = messageKey(msg);
     const m = ensureMsg(mid, role === 'user' ? 'user' : 'assistant');
     for (const part of msg.parts ?? []) {
       switch (part.type) {
@@ -3052,7 +3068,7 @@ function renderTail(messages) {
       continue;
     }
     const role = msg.info?.role ?? 'assistant';
-    const mid = String(msg.info?.messageId ?? msg.info?.id ?? Math.random());
+    const mid = messageKey(msg);
     if (role === 'user') dropMatchingUserEcho(messageText(msg));
     const m = ensureMsg(mid, role === 'user' ? 'user' : 'assistant');
     // 直播思考块去重：存储里的思考"追平"了直播内容（同一段思考已完成落库）

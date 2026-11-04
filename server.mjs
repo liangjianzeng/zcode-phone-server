@@ -747,15 +747,32 @@ function dbMessagesPage(sid, limit = HISTORY_INIT_PAGE) {
   const rows = agentDbHandle.prepare(
     'SELECT id, data FROM message WHERE session_id=? ORDER BY sequence DESC LIMIT ?'
   ).all(s, lim).reverse();
-  const ps = agentDbHandle.prepare('SELECT data FROM part WHERE message_id=? ORDER BY sequence ASC');
+  const ps = agentDbHandle.prepare('SELECT id, data FROM part WHERE message_id=? ORDER BY sequence ASC');
   for (const r of rows) {
     let info = null;
     try { info = JSON.parse(r.data ?? '{}'); } catch { continue; }
     if (String(info?.visibility ?? '') === 'model-only' ||
         String(info?.metadata?.visibility ?? '') === 'model-only' ||
         String(info?.semantics?.uiVisibility ?? '') === 'hidden') continue;
+    // 稳定身份注入（2026-11-04 思考气泡 ×N 重复事故的修复）：共享库 data 只有
+    // role/time/parentID 等字段、没有任何 id，页面 mid=info.messageId??info.id??
+    // Math.random() 于是每轮轮询都给全部尾部消息发新随机 id → ensureMsg 认不出
+    // → 尾部窗口每次指纹变化整窗重贴一份（工具行按 callId 全局去重幸免，思考/
+    // 正文/用户气泡全中）。id 列就是引擎 messageID（zcode.cjs "delete from
+    // message where id=?" 绑 t.messageID，与 SSE 事件 part.messageId 同源），
+    // 注入后直播/落库两路并进同一元素；partId 用部件行 id（引擎 part 表
+    // on conflict(id) 的自有 id）。
+    if (info && typeof info === 'object' && info.id == null && info.messageId == null) info.id = r.id;
     let parts = [];
-    try { parts = ps.all(r.id).map((x) => { try { return JSON.parse(x.data ?? '{}'); } catch { return null; } }).filter(Boolean); } catch { /* 坏部件行跳过 */ }
+    try {
+      parts = ps.all(r.id).map((x) => {
+        try {
+          const p = JSON.parse(x.data ?? '{}');
+          if (p && typeof p === 'object' && p.partId == null && p.id == null) p.partId = x.id;
+          return p;
+        } catch { return null; }
+      }).filter(Boolean);
+    } catch { /* 坏部件行跳过 */ }
     out.messages.push({ info, parts });
   }
   return out;

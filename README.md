@@ -42,6 +42,7 @@ ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Prot
 
 - **双通道跟随**：SSE 实时事件 + 1.2s 存储轮询，桌面端驱动的回合（无 SSE）也能近实时旁观。
 - **部件通道为唯一事实来源**：正文/思考按部件落库事件渲染；token 直播块仅在部件未落库时兜底显示，落库追平即交接（`settleLiveText`），**杜绝直播/落库双份重复**；流式 markdown 渲染 60ms 合帧，长回复不掉帧。
+- **消息身份稳定键**：消息/部件 DOM 跨轮询按服务端注入的稳定 id 合并（`messageKey`）；id 缺失的异常通道退化为确定性结构键（role+时间+正文摘要）——**绝不发随机 id**，杜绝轮询整窗重贴的思考/正文/用户气泡 ×N 重复（工具行本就按 callId 去重不受影响，MODULE-DESIGN 问题档案 #39）。
 - 工具行（图标 + 名称 + 命令/目标摘要 + 状态，点开看输出）、思考行（可展开）、任务计划条（todos 实时）、提问/权限卡片（批准/始终允许/拒绝——"始终允许"经引擎 `permissionUpdates.addRules` 透传，同工具本会话/项目内不再询问）、排队药丸、附件上传。
 - **代码块升级（对照桌面 codeBlock）**：头部语言标签 + 复制按钮、横向滚动、零依赖轻量语法高亮（注释/字符串/数字/关键字/函数名/标签六类着色，常见语言族共用扫描器，>20KB 自动降级纯文本保流畅）。
 - **回合更改文件卡（对照桌面 changeSummary）**：回合收尾时汇总 Write/Edit 触达的文件（✏️ 标题 + 可点开 chip，多次编辑计 ×N）。
@@ -100,7 +101,7 @@ http://127.0.0.1:8787/?token=<token>
 | `GET /api/workspaces` | 工作区列表 |
 | `GET /api/sessions`（`?workspace=\|all=1`） | 会话列表（含 `busy/busySince/lastSeq`，页面恢复运行态用）；`all=1` 附 `groups`＝官方任务栏口径分组（侧栏唯一数据源，服务端已排好序） |
 | `POST /api/sessions` `{sessionId?, workspace?}` | 创建新会话；带 `sessionId` 则恢复（+ 订阅 + setModel） |
-| `GET /api/sessions/:id/messages?limit=` | 历史消息（MessageWithParts，部件粒度） |
+| `GET /api/sessions/:id/messages?limit=` | 历史消息（MessageWithParts，部件粒度；共享库直查**注入稳定 `info.id`/`part.partId`**——行 id 即引擎 messageID，页面消息去重与直播/落库合流的唯一锚点，见 MODULE-DESIGN #39） |
 | `GET /api/sessions/:id/stream?afterSeq=` | SSE 实时事件流（重放环 + 心跳 + `event: reset`） |
 | `POST /api/sessions/:id/send` `{content}` | 发送消息（运行中自动入队） |
 | `POST /api/sessions/:id/stop` | 停止当前回合 |
