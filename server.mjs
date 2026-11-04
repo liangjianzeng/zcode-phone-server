@@ -769,6 +769,11 @@ function dbMessagesPage(sid, limit = HISTORY_INIT_PAGE) {
         try {
           const p = JSON.parse(x.data ?? '{}');
           if (p && typeof p === 'object' && p.partId == null && p.id == null) p.partId = x.id;
+          // 部件行 id（引擎 part 表 on conflict(id)）与工具调用键归一：
+          // 引擎落库部件是 callID（大写），页面/事件通道约定 callId（小写）——
+          // 不归一的话历史渲染里所有工具行折叠成一个 "undefined" 键（实测 681
+          // 个 Edit 部件的会话只渲染出 1 行工具）。
+          if (p && typeof p === 'object' && p.type === 'tool' && p.callId == null && p.callID != null) p.callId = p.callID;
           return p;
         } catch { return null; }
       }).filter(Boolean);
@@ -1223,7 +1228,7 @@ function dbOfficialSessionGroups() {
     } catch { /* 无 roots 行：回退 task.workspace_path */ }
     const tasks = db.prepare(
       'SELECT task_id, title, cli_title, task_status, mode, cli_updated_at, updated_at, cli_created_at, created_at, ' +
-      'workspace_path, root_path, project_id FROM tasks ' +
+      'workspace_path, root_path, project_id, pinned, unread_at, last_unread_at FROM tasks ' +
       'WHERE deleted=0 AND coalesce(cli_deleted,0)=0 AND archived=0 AND cli_created_at IS NOT NULL AND provider=? ' +
       'ORDER BY cli_updated_at DESC, task_id'
     ).all(provider);
@@ -1253,8 +1258,16 @@ function dbOfficialSessionGroups() {
         createdAt: Number(t.cli_created_at ?? t.created_at ?? 0),
         workspacePath: ws,
         busy: sessionState(sid).busy || (turn?.running ?? false),
+        // 置顶/未读（对照桌面 ProjectSidebar：置顶独立分区、未读时间戳圆点。
+        // 数据源即共享任务索引 tasks.pinned / unread_at / last_unread_at，只读展示）
+        pinned: Number(t.pinned ?? 0) === 1,
+        unreadAt: Number(t.unread_at ?? 0) || Number(t.last_unread_at ?? 0) || 0,
       };
-      if (p) {
+      if (row.pinned) {
+        // 官方同款：置顶任务不进普通分组，单列"已置顶"区（grouped-view.ts !task.pinned 过滤 +
+        // selectProjectRows({kind:'pinned'})）。组内保持 cli_updated_at DESC（查询序）。
+        groupOf('pinned', { kind: 'pinned', label: '已置顶', path: '', position: -1, order: -1 }).sessions.push(row);
+      } else if (p) {
         const name = String(p.name ?? '');
         const root = primaryRoot.get(String(p.project_id)) || ws;
         // 同名项目消歧（官方同款）：追加根路径父目录名
@@ -1441,7 +1454,7 @@ try {
       let info = {};
       try { info = JSON.parse(m.data ?? '{}'); } catch (e) { info = {}; }
       let parts = [];
-      try { parts = ps.all(m.id).map((x) => { try { return JSON.parse(x.data ?? '{}'); } catch (e) { return null; } }).filter(Boolean); } catch (e) { parts = []; }
+      try { parts = ps.all(m.id).map((x) => { try { const q = JSON.parse(x.data ?? '{}'); if (q && q.type === 'tool' && q.callId == null && q.callID != null) q.callId = q.callID; return q; } catch (e) { return null; } }).filter(Boolean); } catch (e) { parts = []; }
       return { info, parts };
     });
   } else {
@@ -1526,7 +1539,12 @@ try:
       parts = []
       try:
         for x in db.execute('SELECT data FROM part WHERE message_id=? ORDER BY sequence ASC', (m['id'],)):
-          try: parts.append(json.loads(x['data'] or '{}'))
+          try:
+            q = json.loads(x['data'] or '{}')
+            # callID→callId 归一（与本地共享库直查同口径，工具行按 callId 去重）
+            if isinstance(q, dict) and q.get('type') == 'tool' and 'callId' not in q and 'callID' in q:
+              q['callId'] = q['callID']
+            parts.append(q)
           except Exception: pass
       except Exception: pass
       msgs.append({'info': info, 'parts': parts})
@@ -1897,7 +1915,7 @@ function pageBuildFingerprint() {
   } catch { /* 文件暂不可读：沿用上次结果 */ }
   return pageBuildCache.hash;
 }
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf' };
 
 function timingSafeEqual(a, b) {
   const ab = Buffer.from(String(a));
@@ -1907,6 +1925,10 @@ function timingSafeEqual(a, b) {
 }
 
 function checkAuth(req, url) {
+  // /vendor/ 第三方静态库（mermaid/KaTeX 及其字体）豁免 token：脚本/CSS 由浏览器子资源
+  // 加载不携 token，字体更是由 CSS url() 触发根本无法带参——它们不含任何用户数据，
+  // 且服务端仍受 127.0.0.1 绑定 + PUBLIC_DIR 前缀守卫约束。API 与页面本身照旧强制。
+  if (url.pathname.startsWith('/vendor/')) return true;
   const t = url.searchParams.get('token') ?? req.headers['x-zptoken'] ?? req.headers.cookie?.match(/zpt=([^;]+)/)?.[1] ?? '';
   return t && timingSafeEqual(t, config.token);
 }
@@ -2312,6 +2334,24 @@ async function handleApi(req, res, url) {
       return sendJson(res, 200, { ok: true, removed: item, queue: st.queue });
     }
 
+    // 相邻重排（对照桌面 ConversationQueuePanel 的重排）：dir=-1 靠前 / +1 靠后，
+    // 越界钳制为 no-op——手机上比拖拽可靠（误触率低、单手可达）。
+    if (req.method === 'POST' && sub === 'queue/move') {
+      const body = await readBody(req);
+      const id = String(body.id ?? '');
+      const dir = Number(body.dir ?? 0);
+      const st = sessionState(sid);
+      const idx = st.queue.findIndex((q) => q.id === id);
+      if (idx < 0) return sendJson(res, 404, { error: '排队项不存在' });
+      const to = idx + (dir < 0 ? -1 : 1);
+      if (to >= 0 && to < st.queue.length) {
+        const [item] = st.queue.splice(idx, 1);
+        st.queue.splice(to, 0, item);
+        pushQueueState(sid);
+      }
+      return sendJson(res, 200, { ok: true, queue: st.queue });
+    }
+
     if (req.method === 'POST' && sub === 'send') {
       const body = await readBody(req);
       const content = String(body.content ?? '').trim();
@@ -2512,6 +2552,63 @@ async function handleApi(req, res, url) {
       const r = await agent.request('session/fork', { sessionId: sid, target }, 60000);
       allListCache = null; // 新会话立即可见于列表
       return sendJson(res, 200, r ?? {});
+    }
+
+    // 子代理列表（对照桌面 ConversationStatusPanel 的运行中子代理行）：
+    // 只读透传；引擎缺该方法/旧版不支持时优雅降级为 unavailable，页面据此隐藏。
+    if (req.method === 'GET' && sub === 'subagents') {
+      try {
+        const r = await agent.request('session/subagents', { sessionId: sid });
+        return sendJson(res, 200, r ?? {});
+      } catch (e) {
+        return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
+      }
+    }
+
+    // 会话用量统计（对照桌面 CodingPlanContextUsage 的 token 分段来源之一）：
+    // usage/stats 已被官方标注 deprecated（host 走 v4/conversation/usage），
+    // 但 stdio legacy 面仍存活——只读透传，失败降级不阻塞页面。
+    if (req.method === 'GET' && sub === 'usageStats') {
+      try {
+        const r = await agent.request('usage/stats', { sessionId: sid });
+        return sendJson(res, 200, r ?? {});
+      } catch (e) {
+        return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
+      }
+    }
+
+    // 后台任务取消（对照桌面后台 Bash 任务控制条）：taskId 由页面传入。
+    if (req.method === 'POST' && sub === 'cancelBackgroundTask') {
+      const body = await readBody(req);
+      const taskId = String(body.taskId ?? '').trim();
+      if (!taskId) return sendJson(res, 400, { error: 'taskId 必填' });
+      const r = await agent.request('session/cancelBackgroundTask', { sessionId: sid, taskId });
+      return sendJson(res, 200, r ?? { ok: true });
+    }
+
+    // 会话 token 构成（对照桌面 ChatContextUsage 的分段与缓存命中率）：
+    // turn_usage 按会话聚合（input/output/reasoning/cache_read/cache_creation），
+    // 共享库只读直查——零依赖、不惊动引擎；库不可用时降级 unavailable。
+    if (req.method === 'GET' && sub === 'usageBreakdown') {
+      try {
+        if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
+        const r = agentDbHandle.prepare(
+          'SELECT count(*) AS turns, ' +
+          'coalesce(sum(input_tokens),0) AS input, coalesce(sum(output_tokens),0) AS output, ' +
+          'coalesce(sum(reasoning_tokens),0) AS reasoning, ' +
+          'coalesce(sum(cache_read_input_tokens),0) AS cacheRead, ' +
+          'coalesce(sum(cache_creation_input_tokens),0) AS cacheWrite ' +
+          'FROM turn_usage WHERE session_id=?'
+        ).get(sid);
+        return sendJson(res, 200, {
+          turns: Number(r?.turns ?? 0),
+          input: Number(r?.input ?? 0), output: Number(r?.output ?? 0),
+          reasoning: Number(r?.reasoning ?? 0), cacheRead: Number(r?.cacheRead ?? 0),
+          cacheWrite: Number(r?.cacheWrite ?? 0),
+        });
+      } catch (e) {
+        return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
+      }
     }
   }
 
