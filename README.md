@@ -1,6 +1,6 @@
 # zcode-phone-server
 
-> **当前版本：v0.0.1**（版本号见 `VERSION`，与 git tag 同步）
+> **当前版本：v0.1.0**（版本号见 `VERSION`，与 git tag 同步）
 
 ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Protocol stdio 协议），
 封装成 token 鉴权的 HTTP/SSE 服务，并自带一套移动优先的聊天 Web 页面，
@@ -28,13 +28,13 @@ ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Prot
 | 引擎桥 | stdio 驱动 app-server；凭据解析（start-plan `zcodejwttoken` 直通）、账号授权推送、全部反向请求应答（权限/提问/请求期鉴权）；崩溃自动拉起（退避 ≤15s），`event: reset` 通知页面重连 |
 | SSE 枢纽 | 每会话订阅者集合 + ≤1000 事件重放环（断线按 `afterSeq` 续传，15s 心跳）；`model.streaming` 只直播不进环 |
 | **delta 合帧** | `model.streaming`/`part.delta` 相邻同键 chunk 合并成一帧（60ms 或非 delta 事件到达时冲刷），严格 FIFO 不重排——长回复从几千个 SSE 帧降到几十帧，手机蜂窝网络省流量、页面渲染不再碎片化 |
-| 发送队列 | 引擎 `session/send` 单飞（运行中 409）：运行中收到的消息入队（绑定会话、可取回删除），回合结束后自动补发为下一回合；桌面驱动的回合按共享存储核实收尾后补发 |
+| 发送队列 | 引擎 `session/send` 单飞（运行中 409）：运行中收到的消息入队（绑定会话），回合结束后自动补发为下一回合；桌面驱动的回合按共享存储核实收尾后补发。队列管理完整：✎ 取回编辑（`queue/replace` 原位插回）、⚡ 立即发出（`queue/send-now`）、↑↓ 相邻重排（`queue/move`）、✕ 删除 |
 | 限流自动重试 | `turn.failed` 匹配 429/限流时自动重发（5 次 × 20s，`__retry` inputId 防重复回显）；1113/余额类错误不重试，直接推人话提示 |
 | 桌面任务索引同步 | 会话标题/状态按共享 sqlite 库对账进桌面任务索引（标题为空不落库、幽灵行 30 分钟清理）；行必须写成**桌面原生形状**（`host_id/root_path/project_id/cli_title/cli_created_at`…）——桌面列表查询按 `cli_created_at IS NOT NULL` 过滤、项目树按 `project_id` 挂载，缺字段=手机建的会话桌面隐形（详见 MODULE-DESIGN §2.8） |
 | 远程项目桥 | 官方任务栏同款「远程项目」组：注册表读本地任务索引 `hosts`/`remote_project_entries`，工作会话经零依赖 SSH（stdin 落盘 reader，python3/node 双运行时）直查远端 `~/.zcode` 库，按桌面主列表口径过滤；只连注册表主机、只读（详见 MODULE-DESIGN §2.9） |
 | 侧栏官方口径 | 侧栏会话分组（`all=1` 的 `groups`）以**桌面任务索引为唯一事实源**，逐字照官方任务栏查询：删除/归档/`cli_deleted`/provider 全按索引标志位过滤（桌面删的手机上就是没有，含挂在已删除项目下的任务），排序=项目按 `position`、会话按 `cli_updated_at DESC`——页面只按数组顺序渲染禁自排（详见 MODULE-DESIGN §2.10） |
 | 页面自更新 | `index.html` 内容 md5 指纹经 `/api/state` 下发，页面轮询比对自动 reload——**改完页面无需重启服务、无需手机手动刷新** |
-| 静态服务 | `public/` 每请求读盘；token 鉴权（query `?token=` / header `x-zptoken` / cookie） |
+| 静态服务 | `public/` 每请求读盘，文本资源 gzip 传输；token 鉴权（query `?token=` / header `x-zptoken` / cookie）。`public/vendor/` 第三方库（mermaid/KaTeX 及字体）对浏览器子资源加载**豁免 token**——脚本/CSS/字体无法携 token，且不含用户数据，127.0.0.1 绑定 + 目录前缀守卫仍然生效 |
 
 ## Web 页面能力（public/index.html）
 
@@ -48,6 +48,10 @@ ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Prot
 - **回合更改文件卡（对照桌面 changeSummary）**：回合收尾时汇总 Write/Edit 触达的文件（✏️ 标题 + 可点开 chip，多次编辑计 ×N）。
 - **会话搜索**：抽屉按标题/项目名即输即筛（含远程会话）。
 - **侧栏对齐官方任务栏**：项目分组/排序直接渲染服务端官方口径 `groups`（已删除项目、已删会话、归档一律不显示——与桌面一致，由任务索引标志位决定）；组头带条数与 ▾/▸ 整组折叠（状态持久化），会话子树导轨缩进体现层级（MODULE-DESIGN §2.10/§3.8）。
+- **置顶与未读（对照桌面任务栏）**：桌面置顶的会话单列「已置顶」区（不参与普通分组、不切工作区）；桌面标记未读的会话行首显示蓝点（索引 `unread_at`）——均随共享任务索引只读对齐，手机不写回（桌面 mark-read 带乐观锁）。
+- **Token 构成（对照桌面 contextUsage）**：用量弹层五段占比条——缓存读/输入/缓存写/输出/思考（色走主题变量）+ 图例 + 缓存命中率；数据 = 共享库 `turn_usage` 会话聚合（`GET /usageBreakdown`）。
+- **mermaid 图与数学公式（对照桌面 streamdown 插件）**：vendor 官方库（mermaid 11 / KaTeX 0.16，npmmirror 快照入 `public/vendor/` 共 3.3MB），**首次遇到内容才惰性加载**、加载失败静默降级原文；mermaid 图随气泡宽缩放 + 「查看源码」折叠（语言 class 与复制按钮保留）；公式支持 `$$…$$`、`\[…\]`、`\(…\)`——刻意不支持裸 `$…$`，防 "$5/$10" 价格文案误渲染。
+- **历史分页提速**：打开会话首屏只拉最近 40 条，触顶自动续拉更早消息——大会话秒开（服务端 gzip 传输）。
 - **@ 文件引用（对照桌面 @ 菜单）**：输入 `@token` 弹出工作区文件候选（`/api/search/files` 本地模糊匹配，空查询=最近修改），↑↓/Enter/点选插入 `@相对路径`。
 - **消息分叉（对照桌面 fork）**：助手消息操作行"分叉"→ `POST /api/sessions/:id/fork` → 引擎 `session/fork`，从该消息派生新会话（运行中引擎拒绝并透出文案）。
 - **Markdown 图片**：正文 `![alt](url)` 直接渲染（懒加载，点击放大）。
@@ -118,6 +122,8 @@ http://127.0.0.1:8787/?token=<token>
 | `GET /api/remote/projects` | 远程项目组（官方任务栏同源：hosts/remote_project_entries 注册表 + SSH 查远端任务索引） |
 | `GET /api/remote/messages?host=&sessionId=` | 远程会话消息（SSH 查远端共享库，`{info,parts}` 与本地同构，只读） |
 | `POST /api/sessions/:id/fork` `{messageId?}` | 分叉会话（引擎 `session/fork`；缺省从最近 checkpoint） |
+| `GET /api/sessions/:id/usageBreakdown` | Token 构成聚合（共享库 `turn_usage`：input/output/reasoning/cacheRead/cacheWrite + 回合数；库不可用降级 `unavailable` 不阻塞） |
+| `POST /api/sessions/:id/queue/move` `{id, dir}` | 排队消息相邻重排（越界钳制 no-op；配套 `queue/replace` 取回编辑、`queue/send-now` 立即发出、`queue/remove` 删除） |
 | `GET /api/plan` | 订阅计划 + 当前套餐余额（z.ai billing/balance 的 remaining/total） |
 
 ## 事件流（SSE `zcode` 事件）
