@@ -283,7 +283,33 @@
   details.think[open] .tprev { display: none; }
 
   /* 流末尾运行指示（官方：✳ 转圈） */
-  .streamspin { padding: 8px 6px; color: var(--dim); display: flex; align-items: center; }
+  /* 回合状态行（对照桌面 ChatLoading：spinner + 活动标签 + 秒表）——
+     之前只有孤零零一个转圈，"在干什么/跑了多久"全藏在视觉隐藏的桥接条里 */
+  .streamspin { padding: 8px 6px; color: var(--dim); display: flex; align-items: center; gap: 8px; font-size: 12.5px; min-height: 34px; }
+  .streamspin .sa-act { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .streamspin .sa-el { color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* 流式尾部光标：挂在流式文本元素之后的独立兄弟节点（不进每帧重建的
+     DOM → 眨眼不闪断），settle 后移除；系统减弱动效时静态半透明 */
+  .scaret { display: inline-block; width: 7px; height: 14px; margin-left: 2px; background: var(--accent); border-radius: 2px; vertical-align: -2px; animation: caretblink 1s step-end infinite; }
+  @keyframes caretblink { 50% { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { .scaret { animation: none; opacity: .55; } }
+  /* 回到底部悬浮按钮（对照桌面 ConversationBackToBottomButton）：
+     上滑离底出现，居中悬在输入区上方；直播期间有新内容亮小圆点 */
+  #chatCol { position: relative; }
+  .b2b {
+    position: absolute; left: 50%; transform: translateX(-50%) translateY(6px);
+    bottom: 12px; z-index: 30;
+    width: 38px; height: 38px; border-radius: 50%;
+    background: var(--card); color: var(--dim);
+    border: 1px solid var(--line); box-shadow: 0 2px 10px rgba(0,0,0,.18);
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s;
+  }
+  .b2b.on { opacity: 1; pointer-events: auto; transform: translateX(-50%) translateY(0); }
+  .b2b .ic { width: 18px; height: 18px; }
+  .b2b.dot::after { content: ''; position: absolute; top: -1px; right: -1px; width: 9px; height: 9px; border-radius: 50%; background: var(--accent); border: 2px solid var(--card); }
+  /* 长会话渲染瘦身（>80 条挂 .cvchat）：屏外消息跳过布局/绘制 */
+  #chat.cvchat .msg { content-visibility: auto; contain-intrinsic-size: auto 140px; }
 
   .fileMention {
     display: inline-block; margin: 3px 6px 1px 0; padding: 3px 11px; border-radius: 999px;
@@ -776,6 +802,10 @@
     <main id="chat">
       <div class="hero"><div class="bigz">Z</div><div class="t1">ZCode Phone</div><div class="t2" id="heroTip">选择一个会话，下达你的第一个任务</div></div>
     </main>
+    <!-- 回到底部悬浮按钮：上滑阅读时出现（对照桌面 ConversationBackToBottomButton） -->
+    <button id="b2b" class="b2b" aria-label="回到底部" title="回到底部">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+    </button>
   </section>
 </div>
 
@@ -867,7 +897,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-11-03.7';
+const PAGE_BUILD = '2026-11-06.1';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -976,9 +1006,44 @@ async function api(p, opts = {}) {
 // 之前任何事件都无条件拽底，任务结束后往上拉就被弹回来（无法回看）。
 // force=true 用于用户主动发送、打开会话这类"应当回到底部"的场景。
 function nearBottom() { return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 140; }
+// 回到底部悬浮按钮（对照桌面 ConversationBackToBottomButton）：上滑离底出现；
+// 直播事件照常入流但不再拽用户回来，点按钮一键回直播尾部。不贴底期间
+// 持续有新内容 → 亮小圆点（桌面同款无角标，手机端补的感知增强）
+const b2b = $('b2b');
+function updateB2B() {
+  const scrollable = chat.scrollHeight > chat.clientHeight + 120;
+  const away = scrollable && !nearBottom();
+  b2b.classList.toggle('on', away);
+  if (!away) b2b.classList.remove('dot');
+}
 function scrollBottom(force = false) {
-  if (!force && !nearBottom()) return;
+  if (!force && !nearBottom()) {
+    if (b2b.classList.contains('on')) b2b.classList.add('dot'); // 你在看别处，下面又长了新内容
+    return;
+  }
   requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
+}
+chat.addEventListener('scroll', updateB2B, { passive: true });
+b2b.addEventListener('click', () => { b2b.classList.remove('dot'); scrollBottom(true); });
+
+// 切会话滚动记忆（对照桌面 chatSessionScrollMemory）：非贴底阅读位在
+// 切回来时恢复（按高度增量映射），贴底则照常跟最新。LRU 50 防增长。
+const sessScrollMem = new Map(); // sessionId → { top, h, follow }
+function rememberScroll(sid) {
+  if (!sid || remoteView) return;
+  if (chat.scrollHeight <= chat.clientHeight + 100) return; // 空会话/没滚动的无位可记
+  sessScrollMem.delete(sid);
+  sessScrollMem.set(sid, { top: chat.scrollTop, h: chat.scrollHeight, follow: nearBottom() });
+  if (sessScrollMem.size > 50) sessScrollMem.delete(sessScrollMem.keys().next().value);
+}
+function restoreScroll(sid) {
+  const mem = sessScrollMem.get(sid);
+  if (!mem || mem.follow) return false;
+  requestAnimationFrame(() => { // renderHistory 的 rAF 强滚底先注册先执行，这里后到覆盖
+    const over = chat.scrollHeight - mem.h; // 两次渲染间新增的内容高度
+    chat.scrollTop = Math.max(0, Math.min(mem.top + over, chat.scrollHeight - chat.clientHeight));
+  });
+  return true;
 }
 
 function el(tag, cls, text) {
@@ -1666,9 +1731,16 @@ async function refreshSettings(renderMenus = true) {
   try {
     const s = await api(`sessions/${encodeURIComponent(curSession)}/settings`);
     // unavailable（会话未在本进程激活）时服务端仍可能带共享 DB 回退的
-    // projection——只吸收 projection，模型/档位保持现有值
+    // projection 和 model.current（该会话最后真实跑的模型）——只吸收这两项，
+    // 模型菜单/档位保持现有值
     if (s && !s.unavailable) sessionSettings = s;
-    else if (s?.projection && sessionSettings) sessionSettings.projection = s.projection;
+    else if (s && sessionSettings) {
+      if (s.projection) sessionSettings.projection = s.projection;
+      if (s.model?.current?.modelId) {
+        sessionSettings.model = sessionSettings.model ?? {};
+        sessionSettings.model.current = s.model.current;
+      }
+    }
   } catch { /* 保持现有设置 */ }
   // projection 为 0 时用 goal 快照回退：会话恢复后引擎的 projection 常报 0，
   // 而 goal 快照的 contextUsed/contextWindow 是真实值（用量面板同款回退）
@@ -1712,6 +1784,8 @@ let subagentLastAt = 0;
 function setActivity(text) {
   baseActivity = text || '智能体正在执行任务…';
   $('turnActivity').textContent = baseActivity + subagentNote;
+  const sa = document.getElementById('saAct'); // 可视状态行同步（#streamSpin 内，随行存在）
+  if (sa) sa.textContent = baseActivity + subagentNote;
 }
 async function refreshSubagentNote() {
   if (!busy || subagentUnavailable || !curSession) return;
@@ -1735,7 +1809,10 @@ function fmtElapsed(ms) {
   return `已运行 ${Math.floor(m / 60)} 时 ${m % 60} 分`;
 }
 function tickElapsed() {
-  $('turnElapsed').textContent = busySince ? fmtElapsed(Date.now() - busySince) : '';
+  const t = busySince ? fmtElapsed(Date.now() - busySince) : '';
+  $('turnElapsed').textContent = t;
+  const se = document.getElementById('saEl'); // 可视状态行秒表同步
+  if (se) se.textContent = t;
 }
 function markThinkDurations() {
   // 思考行补时长（回合结束/开始新思考时结算）
@@ -1829,10 +1906,15 @@ function setBusy(on, opts = {}) {
     spinRow = el('div', 'streamspin');
     spinRow.id = 'streamSpin';
     spinRow.innerHTML = SVG.spin;
+    const sa = el('span', 'sa-act'); sa.id = 'saAct'; // 可视活动文案（对照桌面 ChatLoading "Working"）
+    const se = el('span', 'sa-el'); se.id = 'saEl';   // 可视耗时（秒表）
+    spinRow.appendChild(sa); spinRow.appendChild(se);
     chat.appendChild(spinRow);
+    setActivity(baseActivity); // 立即带上当前活动文案，不等下一个事件
     scrollBottom();
   } else if (!on && spinRow) {
     spinRow.remove();
+    dropCaret(); // 回合结束：流式光标退场
   }
   if (on) {
     turnSession = curSession; // 回合归属登记（切换期重新接管也一样盖写，旧归属不带入）
@@ -2229,9 +2311,29 @@ function setToolStatus(toolCallId, status, desc, detail) {
     status === 'completed' ? SVG.check :
     status === 'error' || status === 'failed' ? SVG.cross : '';
   if (detail !== undefined && detail !== null && detail !== '') {
-    t.body.textContent = '';
-    const pre = el('pre'); pre.textContent = String(detail).slice(0, 4000);
-    t.body.appendChild(pre);
+    const raw = String(detail);
+    if (status === 'running') {
+      // 运行中 progress 帧：60ms 合帧 + 末 12 行 tail 直播（对照桌面
+      // ExecuteOutput 的贴底 tail）。之前每帧全量重建 4000 字符——
+      // 打开着的工具卡肉眼闪烁、还平白多耗一倍解析
+      t.__tail = raw;
+      if (t.__tailTimer) return; // 已有挂帧：只刷新待渲染文本
+      t.__tailTimer = setTimeout(() => {
+        t.__tailTimer = null;
+        const s = t.__tail ?? ''; t.__tail = null;
+        if (!s || !t.el.isConnected) return;
+        t.body.textContent = '';
+        const pre = el('pre');
+        const lines = s.replace(/\n+$/, '').split('\n');
+        pre.textContent = (lines.length > 12 ? '…\n' : '') + lines.slice(-12).join('\n');
+        t.body.appendChild(pre);
+      }, 60);
+    } else {
+      if (t.__tailTimer) { clearTimeout(t.__tailTimer); t.__tailTimer = null; t.__tail = null; }
+      t.body.textContent = '';
+      const pre = el('pre'); pre.textContent = raw.slice(0, 4000);
+      t.body.appendChild(pre);
+    }
   }
   if (status === 'running') setActivity(`正在执行 ${t.name.textContent}`);
   scrollBottom();
@@ -2545,6 +2647,7 @@ function renderHistory(messages, opts = {}) {
   chat.textContent = '';
   findClear(); // 全量重绘前清查找高亮（mark 节点已随 DOM 销毁，只复位状态）
   // 任务计划条已移出滚动容器（chatCol 的常驻表头），全量重绘不会动它
+  for (const t of toolEls.values()) if (t.__tailTimer) { clearTimeout(t.__tailTimer); t.__tailTimer = null; } // 运行中工具的 live-tail 挂帧随重绘作废
   msgEls.clear(); toolEls.clear(); thinkTimers.clear();
   sseUserEchoes = []; // 全量重绘，SSE 回显气泡已随 DOM 清掉
   // 更新尾部指纹：轮询跟随以这里为准（打开会话/重连重同步/轮询全量拉取共用）
@@ -2616,6 +2719,9 @@ function renderHistory(messages, opts = {}) {
     btn.addEventListener('click', () => loadOlderMessages());
     chat.insertBefore(btn, chat.firstChild);
   }
+  // 长会话渲染瘦身：屏外消息跳过布局/绘制（>80 条才挂，避免小会话白白
+  // 引入屏外高度估算）。触顶续拉的滚动锚定实测有抖动就摘掉这两行
+  chat.classList.toggle('cvchat', vis.length > 80);
   if (!opts.noAutoScroll) scrollBottom(true); // 打开/重同步会话：回到最新消息（不受用户滚动守卫限制）
 }
 
@@ -2729,6 +2835,12 @@ async function loadUsage(silent = false) {
   // 套餐 + 当前余额（z.ai 计费接口，真实数据）
   try { plan = await api('plan'); } catch { /* 降级 */ }
   if (settings && !settings.unavailable) { sessionSettings = settings; syncComposerChrome(); }
+  else if (settings?.model?.current?.modelId && sessionSettings) {
+    // unavailable：吸收共享库回退的"实际在跑模型"，模型名不再滞留上一个会话的值
+    sessionSettings.model = sessionSettings.model ?? {};
+    sessionSettings.model.current = settings.model.current;
+    syncComposerChrome();
+  }
   // 回来了弹卡已关（用户点了别处）：不重绘
   if (!pop.classList.contains('open')) return;
   // 行构造（label 左、值右）
@@ -3355,6 +3467,7 @@ function handleZcodeEvent(ev) {
 
 // 清理 token 流式直播元素：回合结束后由存储渲染的真实部件接管
 function purgeLiveStream() {
+  dropCaret(); // 直播块清理：光标一并退场（回合结束/轮询自愈路径）
   for (const m of msgEls.values()) {
     for (const key of ['__live-text', '__live-think']) {
       const pe = m.partEls.get(key);
@@ -3390,6 +3503,27 @@ function settleLiveText(m) {
 // 权威渲染（renderTextPart）与直播块清理会取消挂起任务，最终状态以落库
 // 部件为准，节流不会吞尾字。
 const richTimers = new Map(); // pe → setTimeout 句柄
+// 流式尾部光标：独立兄弟节点挂在流式文本元素之后——不进每帧重建的 DOM，
+// 眨眼动画不闪断；settle/权威渲染接管时移除
+const caretEl = document.createElement('span'); caretEl.className = 'scaret';
+function dropCaret() { caretEl.remove(); }
+// 流式未闭合 markdown 收尾（对照桌面 Streamdown parseIncompleteMarkdown）：
+// 仅流式渲染 tick 使用——尾部"开了没闭"的行内标记按字面渲染会在闭合帧
+// 到达时闪跳，先补上闭合符让当帧收敛；落库/settle 路径不碰（桌面教训：
+// remend 对 ./src/**/* 这类字面量误补，故只用于流式中间帧）。
+// 按"开没闭"奇偶计数判定，不碰已闭合对后面的正常尾巴；未闭合代码围栏
+// 整体跳过（richText 的 ``` 分割本就把尾段按增长中的代码块渲染）。
+function remendLite(t) {
+  const s = String(t);
+  const segs = s.split(/```/);
+  if (segs.length % 2 === 0) return s; // 奇数个围栏 = 围栏未闭合
+  const seg = segs[segs.length - 1];   // 成对围栏时的末段＝纯文本段
+  let add = '';
+  if ((seg.match(/\*\*/g) ?? []).length % 2 === 1 && !/\*$/.test(seg)) add += '**';
+  if ((seg.match(/~~/g) ?? []).length % 2 === 1 && !/~$/.test(seg)) add += '~~';
+  if ((seg.match(/`/g) ?? []).length % 2 === 1 && !/`$/.test(seg)) add += '`';
+  return add ? s + add : s;
+}
 function streamRich(pe, text) {
   pe.__pending = text;
   if (richTimers.has(pe)) return;
@@ -3397,13 +3531,18 @@ function streamRich(pe, text) {
     richTimers.delete(pe);
     const t = pe.__pending;
     pe.__pending = null;
-    if (t != null && pe.el.isConnected) { pe.el.textContent = ''; richText(pe.el, t); scrollBottom(); }
+    if (t != null && pe.el.isConnected) {
+      pe.el.textContent = ''; richText(pe.el, remendLite(t));
+      pe.el.after(caretEl); // 光标跟到本帧渲染的流式元素后
+      scrollBottom();
+    }
   }, 60));
 }
 function flushStreamRich(pe) {
   const t = richTimers.get(pe);
   if (t) { clearTimeout(t); richTimers.delete(pe); }
   pe.__pending = null;
+  dropCaret(); // 权威渲染接管：光标退场（settle 路径同此）
 }
 
 function handleUiEvent(p) {
@@ -4108,6 +4247,12 @@ async function refreshModelMenu(anchor) {
   try {
     const s = await api(`sessions/${encodeURIComponent(curSession)}/settings`);
     if (s && !s.unavailable) { sessionSettings = s; syncComposerChrome(); }
+    else if (s?.model?.current?.modelId && sessionSettings) {
+      // unavailable：只吸收共享库回退的实际在跑模型，勾选项不再滞留旧值
+      sessionSettings.model = sessionSettings.model ?? {};
+      sessionSettings.model.current = s.model.current;
+      syncComposerChrome();
+    }
   } catch { /* 拉取失败沿用缓存渲染 */ }
   const pop = $('modelMenu');
   if (pop.classList.contains('open')) {
@@ -4830,6 +4975,7 @@ function setComposerEnabled(on) {
 
 async function openSession(sessionId, wsPath) {
   const mySeq = ++openSeq;
+  if (curSession) rememberScroll(curSession); // 离场前记阅读位（restoreScroll 在渲染后恢复）
   // 切会话/新建：静默抛弃当前回合（幽灵卡根因修复，见 abandonTurn）——
   // 旧会话回合的改动卡/产出卡/结束线不会再跟画进新会话视图
   abandonTurn();
@@ -4887,6 +5033,7 @@ async function openSession(sessionId, wsPath) {
     histLimit = r.messages?.length ? Math.max(r.messages.length, 40) : 40;
     histTotal = Number(r.total ?? (r.messages ?? []).length);
     renderHistory(r.messages ?? [], { keepThinkOpen: running || foreignRunning });
+    if (sessionId && restoreScroll(curSession)) { /* 非贴底阅读位已恢复（覆盖强滚底） */ }
     // 恢复会话时对齐运行态：服务端 ring 为空（重启过）也能正确显示"运行中"。
     // 归属核对：切会话的 await 窗口里，旧会话在途事件可能把 busy 又拉起来
     // （turnSession 还指着旧会话）——那种 busy 不算数，必须按新会话实况重判

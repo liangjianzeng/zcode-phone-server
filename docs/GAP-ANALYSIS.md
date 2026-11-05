@@ -4,7 +4,7 @@
 
 ## 7. 试实施总结（2026-11-05，巡检自动化收口）
 
-**G1–G14 全部完成**，每项均有代码证据与实测记录（见 §5 状态列）。落地能力：
+**G1–G14 全部完成**（G15 为后续追加的流式体验完善批次），每项均有代码证据与实测记录（见 §5 状态列）。落地能力：
 
 - **G1** Edit/Write 工具 diff 视图（行级 LCS 红绿 + 统计头，三路渲染同口径）
 - **G2** 提问卡升级（多问题/多选/自定义输入/拒绝，协议 answers 映射）
@@ -20,6 +20,7 @@
 - **G12** 检查点回滚能力探测（stdio=legacy 面无 v4；可达能力已覆盖，差距定性为通道差异）
 - **G13** mermaid 图 + KaTeX 公式渲染（vendor 惰性加载、深色主题、复制/折叠契约保持；顺带修复 token 门拦截子资源问题）
 - **G14** 离线推送核验（设施早已存在）+ 失败回合专属通知「DSH 任务失败」（页面侧即时生效；**APK 已重打包生效**——安装 Flutter 3.29.0 并行副本后 `flutter build apk --release` 成功出包 22.5MB）
+- **G15** 消息区流式体验完善（2026-11-06，对照桌面 v4 timeline 逐项补齐）：回到底部悬浮按钮（+新内容圆点）、可视回合状态行（活动文案+秒表，对照桌面 ChatLoading）、工具运行输出 live-tail（60ms 合帧+末 12 行）、流式尾部光标、切会话滚动位记忆、长会话 content-visibility、流式 remendLite 未闭合 markdown 补全
 
 **明确暂缓**：无。~~mermaid/数学公式~~ → G13 已实现；~~离线推送~~ → G14 核验：设施早已存在，本轮补齐 task_failed 区分。
 
@@ -105,8 +106,9 @@
 | **G12** | **检查点回滚能力探测**（桌面证据 `ConversationFileRewindDialog.tsx` + `v4/conversation/fileRewindPreview`）：探测本机引擎（zcode.cjs 3.17.2，15.4MB）的回滚面——二进制含 `fileRewindPreview×4 / targetCheckpointId×14 / checkpointId×18`；对照 `packages/server/src/entry-stdio.ts`+`stdio.ts`：**stdio app-server 是 legacy 方法表，无 v4 路由**——`v4/conversation/fileRewindPreview`（文件回滚预览）与破坏性 rewind 不可达；legacy 面可达 = `session/fork` target `{kind:"latestCheckpoint"}` / `{kind:"checkpoint",checkpointId}` / `{kind:"message",messageId}` | ① 探测结论有源码/二进制双重证据；② 手机已覆盖可达能力：消息分叉 + 缺省最近检查点分叉（现有 fork 端点）；③ 文件级回滚预览记为「V4 通道专属，stdio 架构不可达」，与桌面差距收敛到官方 transport 差异，留待未来 bridge 升级 V4 | ✅ 探测完成（结论：无需 UI 改动，差距定性为通道差异而非功能缺失） |
 | **G13** | **mermaid 图 + 数学公式渲染**（桌面证据：streamdown `@streamdown/math\|mermaid` = KaTeX/mermaid 插件；原「vendor 违背零依赖」暂缓项经用户"继续"授权重开）：vendor 官方库（npmmirror mermaid@11.12.2 UMD + katex@0.16.22，共 3.3MB 入 `public/vendor/`，仅 woff2 字体）；页面 `enhanceChatRich` 惰性增强——首次出现内容才动态加载、失败静默降级原文；mermaid 图 + 「查看源码」折叠（保留语言 class 与复制按钮）；KaTeX 支持 `$$…$$`/`\[…\]`/`\(…\)`，**刻意不支持裸 `$…$`**（防 $5/$10 价格误渲染，与桌面 markdown 安全口径一致）。服务端两处配套：MIME 补 woff2/woff/ttf/mjs；**token 门豁免 `/vendor/` 前缀**（字体由 CSS `url()` 触发无法带 token；无用户数据 + 127.0.0.1 绑定 + PUBLIC_DIR 前缀守卫仍在） | ① 真实 Chromium（本机 Chrome headless，与手机 WebView 同引擎家族）CDP 驱动 index.html 全管线：mermaid SVG+4 节点、KaTeX 3 式、KaTeX_Main 字体加载 true、复制/折叠契约在、0 JS 错误；② 截图确认深色主题图文正确；③ 安全边界：vendor 200 / api 仍 401；④ 未 vendor 场景降级为原文（loadLib 失败缓存，不重复重试） | ✅ 已实现并实测（2026-11-05；验证中修复 token 拦子资源问题；开发用 IAB 拦子资源属宿主环境特性，不代表手机 WebView） |
 | **G14** | **离线推送核验 + task_failed 区分**（官方推送五类事件 question/approval/plan/task_completed/task_failed）：勘察发现推送设施**早已端到端存在**——TaskNotifier（HIGH+PUBLIC 通道、锁屏可见）+ 双层桥（页面直推 `notifyTaskState→onTaskState` + APK 注入 taskBridgeJs 扫哨兵词/审批按钮）+ 前台服务保活；本轮补齐唯一缺口：回合**失败**与完成区分——页面 `notifyTaskState` 结算时按 `lastTurnFailed` 发 `state:'failed'`、`setBusy(false)` 写 `#turnStatus[data-result]`，APK 侧 taskBridgeJs 读 data-result、新增 `showFailed()`（「DSH 任务失败」+耗时）与 handler 分派 | ① 页面语法闸过；② 我改的三个 dart 文件 analyze 零问题（14 个既有错误全在 foreground_service.dart，系 pub 环境过期：本机 Flutter 3.27 vs lockfile 需 3.47.9，与本次无关）；③ 旧版 APK 兼容：handler 无 default，'failed' 静默忽略（页面直推层）；但旧 APK 内嵌 DOM 桥仍会在失败回合报 settled→「已完成」（烙进 APK 无法修，行为与改动前一致）；④ **新版通知需重打包 APK**；页面侧（data-result/'failed' 推送）即时生效 | ✅ 已实现且 APK 已重打包（安装 Flutter 3.29.0 并行副本 /c/src/flutter-3.29.0 解决 SDK 版本墙：pubspec 需 Dart ^3.7.0 而 3.27 只有 3.6.0；`flutter build apk --release` 482s 成功出包 22.5MB，三 dart 文件 analyze 零问题） |
+| **G15** | **消息区流式体验完善**（对照桌面 v4 timeline 逐项比对后的感知缺口收口，全部在 public/index.html，服务端零改动）：① 回到底部悬浮按钮（对照 `ConversationBackToBottomButton`）——上滑离底出现、直播不拽人、新内容亮小圆点（桌面无角标，手机端增强）；② 可视回合状态行（对照 `chat-loading.tsx`）——`#streamSpin` 升级为 spinner+活动文案+秒表，`setActivity/tickElapsed` 双写，`#turnStatus` 桥接隐藏 DOM 一字不动；③ 工具运行输出 live-tail（对照 `ExecuteOutput.tsx` 贴底 tail）——progress 帧 60ms 合帧+末 12 行，completed 恢复全量；④ 流式尾部光标（独立兄弟节点，不进重建 DOM，`prefers-reduced-motion` 降级）；⑤ 切会话滚动位记忆（对照 `chatSessionScrollMemory`，LRU 50，非贴底恢复）；⑥ 长会话 `content-visibility: auto`（>80 条挂 .cvchat）；⑦ 流式 remendLite（对照 Streamdown `parseIncompleteMarkdown`，奇偶计数判定+未闭合围栏跳过，settle 路径不碰） | ① 双 script 块 `node --check` 过；② 真 Chromium CDP 21 项探针：remendLite 7 用例（含已闭合对不误补/glob 尾星不补/围栏跳过）、b2b 初始隐藏→上滑出现→点击回底→圆点亮灭、光标挂载/退场、状态行槽位+双写+`#turnStatus` 仍 display:none、工具 tail 二连帧合帧+completed 清场，19/21 直接过、2 项为探针测量误判（rAF 时序/脚本源码文本含哨兵词）修正复测全过；③ **真实忙碌回合 E2E**：探针页 boot 自动恢复本会话（busySource=inferred），状态行实况「正在执行 终端 · 已运行 1 分 12 秒」、b2b 离底 2333px 亮起；④ 400×850 深色截图视觉验收（圆钮+紫点）；⑤ 桥接五红线全绿 | ✅ 已实现并实测（2026-11-06；页面指纹 pageBuild 3df9f6d5 已生效，手机端自动热更新） |
 
-> 后续批次已全部完成（G8–G14）。§4 P1 清单剩余项全部处理：置顶/未读（G9）、用量分段（G10）、队列重排（G11）、检查点回滚（G12 探测）、mermaid/公式（G13）、推送（G14）；文件变更投影为 V4 通道专属（同 G12 定性）。
+> 后续批次已全部完成（G8–G14；G15 为 2026-11-06 追加的流式体验完善批）。§4 P1 清单剩余项全部处理：置顶/未读（G9）、用量分段（G10）、队列重排（G11）、检查点回滚（G12 探测）、mermaid/公式（G13）、推送（G14）；文件变更投影为 V4 通道专属（同 G12 定性）。
 
 ## 6. 验证与巡检
 
