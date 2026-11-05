@@ -616,12 +616,18 @@ function dbContextUsage(sessionId) {
   try {
     if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
     const row = agentDbHandle.prepare(
-      'SELECT provider_id, model_id, input_tokens, output_tokens FROM model_usage WHERE session_id = ? ORDER BY started_at DESC, id DESC LIMIT 1'
+      'SELECT provider_id, model_id, variant, input_tokens, output_tokens FROM model_usage WHERE session_id = ? ORDER BY started_at DESC, id DESC LIMIT 1'
     ).get(sessionId);
     if (!row) return null;
     const used = Number(row.input_tokens ?? 0) + Number(row.output_tokens ?? 0);
     if (used <= 0) return null;
-    return { used, providerId: String(row.provider_id ?? ''), modelId: String(row.model_id ?? '') };
+    // variant 即该次请求的思考档位（如 xhigh）：当前模型投影缺失时一并回填
+    return {
+      used,
+      providerId: String(row.provider_id ?? ''),
+      modelId: String(row.model_id ?? ''),
+      reasoningLevel: String(row.variant ?? ''),
+    };
   } catch { return null; }
 }
 
@@ -834,12 +840,49 @@ async function sessionLooksFinished(sid) {
 }
 
 /**
+ * 本地（personal）模型的真实上下文窗口：桌面端「模型配置」把 contextWindow
+ * 写进共享配置 ~/.zcode/v2/provider_config.json 的 modelConfigRules.providerModelRules
+ * （2026-11-05 实测：qwen38-fp4=256K、Ornith-1.5=260K）。引擎目录 available 同源
+ * 是对的，但运行时 projection.contextWindow 对 personal 模型仍报 200K 老默认值，
+ * DB 回退路径更没有窗口来源——手机侧本地模型因此恒显 20 万、超 20 万即"显示超了"。
+ * 直查共享配置作为窗口的事实来源（桌面端改动即时生效：mtime+size 失效缓存）。
+ */
+const PROVIDER_CONFIG_PATH = path.join(os.homedir(), '.zcode', 'v2', 'provider_config.json');
+let providerRulesCache = null; // { key, rules }
+function providerModelRules() {
+  try {
+    const st = fs.statSync(PROVIDER_CONFIG_PATH);
+    const key = `${st.mtimeMs}:${st.size}`;
+    if (providerRulesCache && providerRulesCache.key === key) return providerRulesCache.rules;
+    const j = JSON.parse(fs.readFileSync(PROVIDER_CONFIG_PATH, 'utf8'));
+    const mr = j?.config?.modelConfigRules ?? {};
+    const rules = [...(mr.providerModelRules ?? []), ...(mr.manualProviderModelRules ?? [])];
+    providerRulesCache = { key, rules };
+    return rules;
+  } catch { return providerRulesCache?.rules ?? []; }
+}
+function providerConfigContextWindow(providerId, modelId) {
+  if (!modelId) return null;
+  let loose = null;
+  for (const r of providerModelRules()) {
+    if (!r || String(r.modelId ?? '') !== String(modelId)) continue;
+    const win = Number(r?.config?.properties?.contextWindow ?? 0);
+    if (!(win > 0)) continue;
+    if (!providerId || !r.providerId || String(r.providerId) === String(providerId)) return win;
+    loose = loose ?? win; // 同名模型挂在别的 provider 下：聊胜于无
+  }
+  return loose;
+}
+
+/**
  * z.ai Coding Plan 的 GLM-5.3 系列真实上下文窗口是 1M（100万 KV）：
  * 引擎内置 provider 目录写的是 200K 老默认值，且投影 contextUsed 实测已
  * 冲到 20.3 万任务仍正常跑（context_exceeded 从未触发），200K 显然错误。
- * 非 GLM-5.3 或非 z.ai 账户返回 null（沿用引擎值）。
+ * 个人模型走桌面端配置的 contextWindow；两者都不命中返回 null（沿用引擎值）。
  */
 function realContextWindow(providerId, modelId) {
+  const personal = providerConfigContextWindow(providerId, modelId);
+  if (personal) return personal;
   if (/^account:/.test(String(providerId ?? '')) && /glm-5\.3/i.test(String(modelId ?? ''))) {
     return 1_000_000;
   }
@@ -859,17 +902,21 @@ function projectSettings(snapshot, fallbackSid = '') {
   // session/read 快照不带 session 对象（2026-10-04 实测），路由侧补传 sid，
   // 否则 DB 回退查不到 model_usage，容量恒显 0
   const sid = String(snapshot?.session?.id ?? snapshot?.sessionId ?? fallbackSid ?? '');
-  const cur = modelRefToJson(model.current);
-  // 投影缺 0（idle/外进程驱动）时用共享 DB 的真实上下文占用补；
-  // DB 回退还能带回该会话实际用的模型（provider/model），用于修正窗口
-  const dbCtx = Number(proj?.contextUsed ?? 0) > 0
+  const curFromSnap = modelRefToJson(model.current);
+  // 投影缺 0（idle/外进程驱动）或快照连当前模型都没有时，用共享 DB 补：
+  // model_usage 最后一行既带真实上下文占用，也带该会话实际在跑的模型
+  // （provider/model/档位）——用于修正窗口与回填 model.current
+  const dbCtx = (Number(proj?.contextUsed ?? 0) > 0 && curFromSnap)
     ? null
     : dbContextUsage(sid);
+  const cur = curFromSnap ?? (dbCtx?.modelId
+    ? {
+        providerId: dbCtx.providerId,
+        modelId: dbCtx.modelId,
+        ...(dbCtx.reasoningLevel ? { reasoningLevel: dbCtx.reasoningLevel } : {}),
+      }
+    : null);
   const used = Number(proj?.contextUsed ?? 0) > 0 ? Number(proj.contextUsed) : (dbCtx?.used ?? 0);
-  // 窗口修正：引擎内置目录的 GLM-5.3 是 200K 老默认值，真实 1M。
-  // 优先看会话实际用的模型，再看当前选中模型。
-  const winOverride = realContextWindow(dbCtx?.providerId, dbCtx?.modelId)
-    ?? realContextWindow(cur.providerId, cur.modelId);
   const available = (Array.isArray(model.available) ? model.available : []).map((o) => ({
     providerId: o.ref?.providerId ?? '',
     modelId: o.ref?.modelId ?? '',
@@ -885,6 +932,18 @@ function projectSettings(snapshot, fallbackSid = '') {
     defaultReasoningLevel: o.reasoning?.defaultLevel ?? '',
     disabledReason: o.disabledReason ?? '',
   }));
+  // 窗口修正：引擎运行时投影对 personal/GLM-5.3 都报目录 200K 老默认值。
+  // 事实来源取桌面端配置（realContextWindow），优先会话实际用的模型，
+  // 再看当前选中模型；最后兜底引擎目录里该模型的 contextWindow。
+  const winModel = dbCtx?.modelId ? dbCtx : cur;
+  const catalogHit = (winModel?.modelId && available.find((o) => o.modelId === winModel.modelId
+    && (!winModel.providerId || !o.providerId || o.providerId === winModel.providerId))) || null;
+  const catalogWin = Number(catalogHit?.contextWindow ?? 0) > 0
+    ? Number(catalogHit.contextWindow)
+    : null;
+  const winOverride = realContextWindow(winModel?.providerId, winModel?.modelId)
+    ?? realContextWindow(cur?.providerId, cur?.modelId)
+    ?? catalogWin;
   return {
     model: {
       current: cur,
@@ -2176,6 +2235,17 @@ async function handleApi(req, res, url) {
         titleGenerationEnabled: true,
       }, 180000);
       sid = snap?.session?.sessionId ?? snap?.sessionId;
+      // 显式落一次模型选择：create 的 model 参数不保证写入会话运行时（turn 期校验用的是会话选择）。
+      // session/setModel 的 model 是 {providerId, modelId, options?} 对象（2026-10-03 实测：
+      // 传字符串报 expected object；此前 [object Object] 报错实为 Registry 空所致）。
+      // 只允许对新会话执行：resume 也灌 config.model 会把会话自己正在跑的模型
+      // 强行改成全局最后选择的模型——进入会话显示错模型、后续回合悄悄换模型跑，
+      // 会话的模型选择只该由用户在模型菜单里改（POST /model 路由）。
+      const sel = parseModelSelection(config.model);
+      if (sel) {
+        await agent.request('session/setModel', { sessionId: sid, model: sel }).catch((e) =>
+          logLine('set-model-error', String(e?.message ?? e)));
+      }
     }
     if (!sid) throw new Error('session/create 未返回 sessionId');
     sessionState(sid);
@@ -2186,14 +2256,6 @@ async function handleApi(req, res, url) {
     resumeSettingsCache.set(sid, projectSettings(snap, sid));
     // 订阅事件流（legacy 通道：subscribe 后才有 session/event 推送）
     await agent.request('session/subscribe', { sessionId: sid, deliveryKind: 'desktop-continuous', includeSnapshot: false });
-    // 显式落一次模型选择：create 的 model 参数不保证写入会话运行时（turn 期校验用的是会话选择）。
-    // session/setModel 的 model 是 {providerId, modelId, options?} 对象（2026-10-03 实测：
-    // 传字符串报 expected object；此前 [object Object] 报错实为 Registry 空所致）。
-    const sel = parseModelSelection(config.model);
-    if (sel) {
-      await agent.request('session/setModel', { sessionId: sid, model: sel }).catch((e) =>
-        logLine('set-model-error', String(e?.message ?? e)));
-    }
     // 首屏历史 = 共享库直查最近 HISTORY_INIT_PAGE 条（不再转发引擎 resume 快照的
     // 全量 messages——大会话 9.7MB 全量是打开慢的主因；更早由页面「加载更早」按需拉）
     const hist = dbMessagesPage(sid, HISTORY_INIT_PAGE);
@@ -2232,6 +2294,14 @@ async function handleApi(req, res, url) {
     if (req.method === 'GET' && sub === 'goal') {
       try {
         const r = await agent.request('session/goal', { sessionId: sid, action: 'show' });
+        // goal 快照的 contextWindow 与 projection 同源（personal/GLM-5.3 也是
+        // 200K 目录值；页面在 projection 报 0 时以它为准）：用共享配置的真实窗口修正
+        const snap = r?.snapshot;
+        if (snap && Number(snap.contextWindow) > 0) {
+          const dbCtx = dbContextUsage(sid);
+          const real = dbCtx && realContextWindow(dbCtx.providerId, dbCtx.modelId);
+          if (real) snap.contextWindow = real;
+        }
         return sendJson(res, 200, r ?? {});
       } catch (e) {
         return sendJson(res, 200, { unavailable: String(e?.message ?? e).slice(0, 200) });
@@ -2462,11 +2532,19 @@ async function handleApi(req, res, url) {
         return sendJson(res, 200, ps);
       } catch (e) {
         // 会话不在本进程激活（引擎重启后未 resume）：模型/档位拿不到，但
-        // 上下文容量仍可从共享 DB 回答（页面弹卡需要它，不能整包 unavailable）
+        // 上下文容量与"实际在跑的模型"仍可从共享 DB 回答（页面弹卡/模型名
+        // 需要它们，不能整包 unavailable）
         const dbCtx = dbContextUsage(sid);
         if (dbCtx) {
           return sendJson(res, 200, {
             unavailable: String(e?.message ?? e).slice(0, 200),
+            model: {
+              current: {
+                providerId: dbCtx.providerId,
+                modelId: dbCtx.modelId,
+                ...(dbCtx.reasoningLevel ? { reasoningLevel: dbCtx.reasoningLevel } : {}),
+              },
+            },
             projection: {
               contextUsed: dbCtx.used,
               contextWindow: realContextWindow(dbCtx.providerId, dbCtx.modelId) ?? 200000,
