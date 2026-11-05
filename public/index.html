@@ -795,8 +795,15 @@
   </nav>
   <section id="chatCol">
     <!-- 任务计划条：消息区顶部常驻表头（滚动容器之外，见样式区说明） -->
-    <div id="todoBar" role="button" aria-label="任务计划" title="点击展开/收起任务计划">
-      <div class="thead"><span class="chev">▸</span><span class="tlabel">任务计划</span><span class="tsum"></span><span class="thint">点击展开</span></div>
+    <!-- data-dsh-no-artifact：App 注入桥的成果劫持豁免（见 webview_bridges.dart
+         click 捕获监听 step 0）。todo 内容是模型写的文本，极易含文件路径；
+         桥的 step-4 会把「span/p/td/li 单行纯文本、含 \ 或以已知后缀结尾」的
+         点击 preventDefault+stopPropagation 并拉起原生成果查看页——计划条整个
+         被盖住 = 用户看到的"一点击展开就不见了"（2026-11-06 真机 CDP 实证）。
+         双保险：本组件内所有用户文本一律不放进 span/p/td/li（旧 APK 无豁免
+         也安全），桥侧同认此属性（新 APK 根治）。 -->
+    <div id="todoBar" role="button" aria-label="任务计划" title="点击展开/收起任务计划" data-dsh-no-artifact>
+      <div class="thead"><span class="chev">▸</span><span class="tlabel">任务计划</span><div class="tsum"></div><span class="thint">点击展开</span></div>
       <div class="titems"></div>
     </div>
     <main id="chat">
@@ -2596,6 +2603,9 @@ function renderTodoBar() {
   const sum = cur ? `正在：${cur.content}` : (done === curTodos.length ? '全部完成' : '等待执行');
   // todo 内容是模型生成的文本：走 DOM 构造而非 innerHTML/insertAdjacentHTML
   // （计数徽标同函数前几行用 textContent 的纪律保持一致，消除注入面）
+  // 用户文本（todo 内容/摘要）必须是 div.tsum 与 div.ti 下的裸文本节点：
+  // App 注入桥按 span/p/td/li 的「单行纯文本像路径」劫持点击（preventDefault +
+  // 拉起原生成果页），文本节点目标向上到 div 即脱钩（HTML 侧注释有完整说明）。
   const tsum = bar.querySelector('.tsum');
   tsum.textContent = '';
   tsum.appendChild(document.createTextNode(sum + ' '));
@@ -2607,7 +2617,7 @@ function renderTodoBar() {
     const mk = el('span', 'mk' + (t.status === 'completed' ? ' done' : ''),
       t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '●' : '○');
     row.appendChild(mk);
-    row.appendChild(el('span', '', t.content));
+    row.appendChild(document.createTextNode(t.content));
     box.appendChild(row);
   }
 }
