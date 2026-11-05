@@ -2267,9 +2267,21 @@ async function handleApi(req, res, url) {
         Connection: 'keep-alive',
         'X-Accel-Buffering': 'no',
       });
-      res.write('retry: 3000\n\n');
+      // 手机端走 SSH 隧道/蜂窝，高延迟链路。Nagle 会把每个小 SSE 帧憋着等上一个 ACK，
+      // 每事件拖一个 RTT，多事件累加就是几秒——桌面早跑完几个回合了。关闭它即时推送。
+      try { res.socket.setNoDelay(true); } catch { /* noop */ }
+      // 移动网络下 SSE 掉线频繁：重连间隔由这里的 retry 字段控制（标准机制，
+      // 客户端 EventSource 依此重连）。3s→1s，缩短掉线后收不到事件的空窗。
+      res.write('retry: 1000\n\n');
       const s = sessionState(sid);
-      const afterSeq = Number(url.searchParams.get('afterSeq') ?? '-1');
+      // 断线重连时 EventSource 自动带 Last-Event-ID（最后收到的事件 seq），
+      // 必须优先于 URL 里的初始 afterSeq——否则移动网络每次掉线都把整个
+      // 重放环（≤1000 条）重发一遍，手机要先咽完重复洪峰才能收到新事件，
+      // 表现为"桌面跑完几个回合了端侧还在转圈追赶"。
+      const lastEventId = Number(req.headers['last-event-id'] ?? NaN);
+      const afterSeq = Number.isFinite(lastEventId)
+        ? lastEventId
+        : Number(url.searchParams.get('afterSeq') ?? '-1');
       for (const ev of s.ring) if ((ev.seq ?? 0) > afterSeq) {
         res.write(`id: ${ev.seq}\nevent: zcode\ndata: ${JSON.stringify(ev)}\n\n`);
       }
@@ -2716,7 +2728,13 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   try {
     if (!checkAuth(req, url)) {
-      return sendJson(res, 401, { error: 'token 无效。请经 SSH 隧道用 /?token=<访问令牌> 访问。' });
+      // 调试回显：把本次请求带进来的 token 原样返回，方便对端一眼看出是空还是错
+      const cookieTok = (req.headers.cookie && req.headers.cookie.match(/zpt=([^;]+)/) || [])[1];
+      const recv = url.searchParams.get('token') ?? req.headers['x-zptoken'] ?? cookieTok ?? '';
+      const detail = recv === ''
+        ? '（本次请求 token 为空：URL 的 ?token= 后面没值，或请求没带 token）'
+        : `（本次请求带来的 token=${recv}，长度=${recv.length}，与服务器不一致）`;
+      return sendJson(res, 401, { error: `token 无效。${detail}请经 SSH 隧道用 /?token=<访问令牌> 访问。` });
     }
     if (url.pathname.startsWith('/api/')) {
       return await handleApi(req, res, url);
