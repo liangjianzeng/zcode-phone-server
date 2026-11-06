@@ -56,6 +56,14 @@ const DEFAULT_CONFIG = {
   /** agent 反向交互（权限/提问）自动应答：allow=自动放行；ask=转发手机端人工处理。 */
   autoAnswer: 'allow',
   /**
+   * 模型心跳保活：true=每 keepaliveIntervalMs 向当前后端发一次最小模型调用，
+   * 把后端模型保持在热态，消除首次 6–12s 冷启动（后端空闲 >90s 即冷启动）。
+   * 手机发起的回合首拍最痛，心跳让第一拍也走热态。失败只记日志不抛。
+   */
+  keepalive: true,
+  /** 心跳间隔（毫秒），需小于后端空闲冷启动阈值（实测 ~90s）。 */
+  keepaliveIntervalMs: 45000,
+  /**
    * Coding Plan API Key（id.secret 形态，引擎 V4 请求签名必需）。
    * 桌面端 oauth 的 access_token（JWT）只能完成授权推送，跑不了推理；
    * 在 https://bigmodel.cn/usercenter/proj-mgmt/apikeys 创建后粘贴到这里。
@@ -849,6 +857,7 @@ async function sessionLooksFinished(sid) {
  */
 const PROVIDER_CONFIG_PATH = path.join(os.homedir(), '.zcode', 'v2', 'provider_config.json');
 let providerRulesCache = null; // { key, rules }
+let keepaliveRulesCache = null; // { key, rules }
 function providerModelRules() {
   try {
     const st = fs.statSync(PROVIDER_CONFIG_PATH);
@@ -887,6 +896,158 @@ function realContextWindow(providerId, modelId) {
     return 1_000_000;
   }
   return null;
+}
+
+// ────────────────────────── 模型心跳保活 ──────────────────────────
+// 后端模型空闲 >90s 会冷启动（首次调用 6–12s）。手机发起的回合首拍最痛——
+// 用一个每 45s 的最小模型调用把模型持续保暖，消除首次冷启动。心跳直连后端，
+// 与引擎的 turn 互不干扰；解析走 engine 同源配置（provider_config.json）。
+
+/** 读 ~/.zcode/v2/provider_config.json 的 providerRules（带 mtime+size 失效缓存）。 */
+function providerRules() {
+  try {
+    const st = fs.statSync(PROVIDER_CONFIG_PATH);
+    const key = `${st.mtimeMs}:${st.size}`;
+    if (keepaliveRulesCache?.key === key) return keepaliveRulesCache.rules;
+    const j = JSON.parse(fs.readFileSync(PROVIDER_CONFIG_PATH, 'utf8'));
+    const rules = j?.config?.providerConfigRules?.providerRules ?? [];
+    keepaliveRulesCache = { key, rules };
+    return rules;
+  } catch { return keepaliveRulesCache?.rules ?? []; }
+}
+
+/**
+ * 从 config.model（provider/model$level）解析出当前后端目标：
+ * baseUrl / api.type / apiKey / configModelId / providerId。真实模型名需另走 {baseUrl}/models。
+ * 缺省返回 null（不保活）。
+ */
+function keepaliveTarget() {
+  const sel = parseModelSelection(config.model);
+  if (!sel?.providerId || !sel?.modelId) return null;
+  const rule = (providerRules() || []).find(r => String(r?.providerId) === String(sel.providerId));
+  const api = rule?.config?.api ?? {};
+  const access = rule?.config?.access ?? {};
+  const baseUrl = String(api.baseUrl ?? '').replace(/\/+$/, '');
+  if (!baseUrl || !api.type) return null;
+  return { baseUrl, type: api.type, apiKey: String(access.apiKey ?? ''), configModelId: sel.modelId, providerId: sel.providerId };
+}
+
+/**
+ * 后端模型名兜底（providerId → 真实后端模型名）。
+ * /v1/models 在冷启动期偶发 404：服务端重启后若后端已冷，心跳拿不到名字就无法保暖，
+ * 用户首条消息会撞到 3.2s+ 冷启动。此处用已知名直连保暖，与 {baseUrl}/models 返回名保持一致。
+ * 一旦 /v1/models 恢复即覆盖缓存，故名字可手动维护，不必实时同步。
+ */
+const BACKEND_MODEL_FALLBACK = {
+  'new-provider': 'Ornith1.5-35B-NVFP4:dflash',
+  'new-provider-2': 'qwen38-fp4',
+};
+
+/**
+ * 后端真实模型名（{baseUrl}/models 返回的 name/id，可能与 config.model 的 modelId 不同，
+ * 如 Ornith-1.5-35B-A3B-NVFP4 → Ornith1.5-35B-NVFP4:dflash）。
+ * 直连心跳必须用后端真实名：POST config.modelId 会命中后端一个恒冷的幻影条目（首拍 3.2s 冷启动），
+ * 永远暖不真正在跑的模型。故名字取自 /v1/models 并持久缓存（按 baseUrl+configModelId 键），
+ * 后端初始化期 /v1/models 偶发 404 时仍用上次拿到的正确名，避免回退到幻影名。
+ */
+let knownBackendModel = { key: null, name: null };
+function backendModelName(target) {
+  const cacheKey = target.baseUrl + '|' + target.configModelId;
+  if (knownBackendModel.key === cacheKey && knownBackendModel.name) return Promise.resolve(knownBackendModel.name);
+  const isAnthropic = /anthropic/i.test(String(target.type));
+  const u = new URL(target.baseUrl);
+  return new Promise((resolve) => {
+    const req = http.request({ host: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + '/models', method: 'GET', timeout: 8000,
+      headers: { ...(isAnthropic
+        ? { 'x-api-key': target.apiKey, 'anthropic-version': '2023-06-01' }
+        : { authorization: 'Bearer ' + target.apiKey }) } },
+      (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => {
+        let name = null;
+        try {
+          const j = JSON.parse(d);
+          const list = isAnthropic ? (j.models ?? []) : (j.data ?? []);
+          if (Array.isArray(list) && list.length) name = isAnthropic ? (list[0].name ?? null) : (list[0].id ?? null);
+        } catch { /* 非 JSON 忽略 */ }
+        if (name) knownBackendModel = { key: cacheKey, name };
+        resolve(name);
+      });});
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
+
+/** 单次最小模型调用（anthropic-messages / openai 两种协议）。模型名取自 {baseUrl}/models，/v1/models 不可用时回退已知名。 */
+async function keepalivePing() {
+  const base = keepaliveTarget();
+  if (!base) return { ok: false, reason: 'no-target' };
+  let model = await backendModelName(base);
+  if (!model) {
+    // /v1/models 冷启动期 404：用已知名兜底，先把模型暖起来；下次 /v1/models 恢复即覆盖缓存。
+    model = BACKEND_MODEL_FALLBACK[base.providerId];
+    if (model) knownBackendModel = { key: base.baseUrl + '|' + base.configModelId, name: model };
+  }
+  if (!model) return { ok: false, reason: 'no-model' };
+  logLine('keepalive-model', `ping model=${model} (provider=${base.providerId})`);
+
+  // 后端多节点负载均衡偶发 404 抖动：重试几次，确保真正暖到模型（单次 404 不会冷却模型，
+  // 但连续失败会让心跳失效、模型始终冷。最多 3 次，间隔 400ms）。
+  const attempts = 3;
+  let last;
+  for (let i = 0; i < attempts; i++) {
+    last = await keepalivePost(base, model);
+    if (last.ok) return last;
+    if (i < attempts - 1) await new Promise((res) => setTimeout(res, 400));
+  }
+  return last;
+}
+
+/** 向当前后端发一次最小模型调用（anthropic-messages / openai 两种协议）。 */
+function keepalivePost(base, model) {
+  const t0 = Date.now();
+  const isAnthropic = /anthropic/i.test(String(base.type));
+  const u = new URL(base.baseUrl);
+  const path = u.pathname + (isAnthropic ? '/messages' : '/chat/completions');
+  const body = JSON.stringify({ model, max_tokens: 1, messages: [{ role: 'user', content: 'ping' }] });
+  return new Promise((resolve) => {
+    const req = http.request({
+      host: u.hostname,
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path,
+      method: 'POST',
+      timeout: 15000,
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+        ...(isAnthropic
+          ? { 'x-api-key': base.apiKey, 'anthropic-version': '2023-06-01' }
+          : { authorization: 'Bearer ' + base.apiKey }),
+      },
+    }, (res) => { res.resume(); resolve({ ok: res.statusCode === 200, latency: Date.now() - t0, status: res.statusCode }); });
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, latency: Date.now() - t0, detail: 'timeout' }); });
+    req.on('error', (e) => resolve({ ok: false, latency: Date.now() - t0, detail: e.code || e.message }));
+    req.write(body); req.end();
+  });
+}
+
+let keepaliveTimer = null;
+/** 启动心跳保活：立即打一次，之后按配置间隔循环。 */
+function startKeepalive() {
+  if (!config.keepalive) return;
+  const interval = Math.max(5000, Number(config.keepaliveIntervalMs) || 45000);
+  logLine('keepalive', `enabled every ${Math.round(interval / 1000)}s (model ${config.model})`);
+  const tick = async () => {
+    try {
+      const r = await keepalivePing();
+      if (!r.ok) logLine('keepalive-miss', `warm ping failed ${r.detail || ('status=' + r.status)} after ${r.latency}ms`);
+      else logLine('keepalive-ok', `warm ping ${r.latency}ms`);
+    } catch (e) {
+      logLine('keepalive-error', String(e?.message ?? e));
+    }
+  };
+  tick();
+  keepaliveTimer = setInterval(tick, interval);
 }
 
 /**
@@ -2870,6 +3031,10 @@ server.listen(config.port, '127.0.0.1', () => {
 });
 
 agent.start();
+
+// 引擎启动后再开心跳：此时 config.model 已就绪，保活把后端模型保持热态，
+// 让手机发起的回合第一拍就走热态而非冷启动。
+startKeepalive();
 
 process.on('SIGINT', () => {
   agent.stopping = true;
