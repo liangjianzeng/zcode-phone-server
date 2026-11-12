@@ -5,9 +5,18 @@ rem £¨keepalive.log/server.log ±©ÕÇ£¬ÈÕÖ¾È«±» EADDRINUSE ¶ÑÕ»ÑÍÃ»£¬¹ÊÕÏÎÞ·¨¶¨Î»£
 rem ÏÖ¸ÄÎª£º¶Ë¿ÚÓÐ¼àÌýÕßÊ±Ö»µÈ´ý½Ó¹Ü£¨5 Ãë¸´²é£©£¬Ô­ÊµÀýÍË³öºó×Ô¶¯²¹Î»ÖØÆô£»
 rem ¶à¸öÊØ»¤ÊµÀý¹²´æ°²È«£¨Êä¼ÒµÈ´ý£¬Ó®¼Ò·þÎñ£©£¬ÊÖ¶¯À­Æð server.mjs Ò²²»ÔÙ´ò¼Ü¡£
 cd /d "%~dp0"
+rem È«ÐÂ clone Ã»ÓÐ logs/ Ä¿Â¼£ºcmd ÖØ¶¨Ïò²»»á´´½¨Ä¿Â¼£¬ÏÂÃæÁ½ÐÐÖØ¶¨Ïò»áÖ±½Ó
+rem Ê§°Üµ¼ÖÂ node ¸ù±¾À­²»ÆðÀ´£¨ÊØ»¤Ñ­»·¿Õ×ª¡¢keepalive.log Ò²Ð´²»³ö£©¡ª¡ªÏÈ½¨Ä¿Â¼
+if not exist logs mkdir logs
+rem node ½âÎö²»ÒÀÀµ PATH£¨ÊØ»¤µÄ¼Ì³Ð»·¾³¿ÉÄÜÃ»ÓÐ node£º9009 ¡ú Ì½²âÊ§°Ü ¡ú PORT Çå¿Õ
+rem ¡ú findstr ": " ÎóÆ¥ÅäÈ«²¿ LISTENING ÐÐ ¡ú ÓÀÔ¶¾²Ä¬µÈ´ý£¬´Ó²»Æô¶¯£©¡£Óë config.json
+rem µÄ nodePath Í¬Ô´£¨nvm4w ³£¹æ°²×°Î»ÓÅÏÈ£¬Æä´Î Program Files£¬×îºó PATH ¶µµ×£©
+set NODE_EXE=node
+if exist "C:\nvm4w\nodejs\node.exe" set NODE_EXE=C:\nvm4w\nodejs\node.exe
+if not exist "%NODE_EXE%" if exist "%ProgramFiles%\nodejs\node.exe" set NODE_EXE=%ProgramFiles%\nodejs\node.exe
 rem ¶Ë¿ÚÒÔ config.json Îªµ¥Ò»À´Ô´£¨Óë server.mjs Ò»ÖÂ£©£¬¶ÁÈ¡Ê§°Ü»ØÂä 8787
 set PORT=8787
-node -e "try{const c=JSON.parse(require('fs').readFileSync('config.json','utf8'));process.stdout.write(String(c.port||8787))}catch(e){process.stdout.write('8787')}" > "%TEMP%\zps_port.txt" 2>nul
+"%NODE_EXE%" -e "try{const c=JSON.parse(require('fs').readFileSync('config.json','utf8'));process.stdout.write(String(c.port||8787))}catch(e){process.stdout.write('8787')}" > "%TEMP%\zps_port.txt" 2>nul
 set /p PORT=<"%TEMP%\zps_port.txt"
 set PORT=%PORT: =%
 
@@ -18,8 +27,10 @@ if not errorlevel 1 (
   timeout /t 5 /nobreak >nul
   goto loop
 )
-echo [%date% %time%] server starting >> logs\keepalive.log
-node server.mjs >> logs\server.log 2>&1
-echo [%date% %time%] server exited (code %errorlevel%), restarting in 3s >> logs\keepalive.log
+rem Â·¾¶È«²¿ÓÃ %~dp0 ¾ø¶ÔÐÎÊ½£º¹¤×÷Ä¿Â¼²»¶ÔÊ±Ïà¶ÔÂ·¾¶»áÈÃ echo Ð´¶ª¡¢node ÕÒ²»µ½
+rem server.mjs¡ª¡ªÊØ»¤ÂÙÎª¾²Ä¬¿Õ×ªÑ­»·£¨2026-11-10 ¹Â¶ùÊØ»¤¿¨ËÀ 3 ÌìµÄ½ÌÑµ£©
+echo [%date% %time%] server starting >> "%~dp0logs\keepalive.log"
+"%NODE_EXE%" "%~dp0server.mjs" >> "%~dp0logs\server.log" 2>&1
+echo [%date% %time%] server exited (code %errorlevel%), restarting in 3s >> "%~dp0logs\keepalive.log"
 timeout /t 3 /nobreak >nul
 goto loop

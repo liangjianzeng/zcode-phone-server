@@ -28,6 +28,7 @@ ZCode 手机端桥接服务：在电脑上驱动 `zcode app-server`（ZCode Prot
 | 引擎桥 | stdio 驱动 app-server；凭据解析（start-plan `zcodejwttoken` 直通）、账号授权推送、全部反向请求应答（权限/提问/请求期鉴权）；崩溃自动拉起（退避 ≤15s），`event: reset` 通知页面重连 |
 | SSE 枢纽 | 每会话订阅者集合 + ≤1000 事件重放环（断线按 `afterSeq` 续传，15s 心跳）；`model.streaming` 只直播不进环 |
 | **delta 合帧** | `model.streaming`/`part.delta` 相邻同键 chunk 合并成一帧（60ms 或非 delta 事件到达时冲刷），严格 FIFO 不重排——长回复从几千个 SSE 帧降到几十帧，手机蜂窝网络省流量、页面渲染不再碎片化 |
+| **桌面回合镜像推帧** | 桌面端驱动的回合事件不经过本桥（SSE 环为空），手机端原本只能 1.2s 轮询共享库、"久不久跳一下"。现对「有订阅者 + 桥不忙」的会话以 450ms 差分共享库，合成与引擎原生事件同形的 `part.upserted`/`turn.started`/`turn.completed` 帧推给页面（页面零改动走既有渲染路径）；落库即达，子代理执行期的静默段受桌面落库粒度限制 |
 | 发送队列 | 引擎 `session/send` 单飞（运行中 409）：运行中收到的消息入队（绑定会话），回合结束后自动补发为下一回合；桌面驱动的回合按共享存储核实收尾后补发。队列管理完整：✎ 取回编辑（`queue/replace` 原位插回）、⚡ 立即发出（`queue/send-now`）、↑↓ 相邻重排（`queue/move`）、✕ 删除 |
 | 限流自动重试 | `turn.failed` 匹配 429/限流时自动重发（5 次 × 20s，`__retry` inputId 防重复回显）；1113/余额类错误不重试，直接推人话提示 |
 | 桌面任务索引同步 | 会话标题/状态按共享 sqlite 库对账进桌面任务索引（标题为空不落库、幽灵行 30 分钟清理）；行必须写成**桌面原生形状**（`host_id/root_path/project_id/cli_title/cli_created_at`…）——桌面列表查询按 `cli_created_at IS NOT NULL` 过滤、项目树按 `project_id` 挂载，缺字段=手机建的会话桌面隐形（详见 MODULE-DESIGN §2.8） |
@@ -113,6 +114,7 @@ http://127.0.0.1:8787/?token=<token>
 | `GET /api/sessions/:id/todos` | 任务计划（TodoWrite 落库状态） |
 | `GET /api/sessions/:id/settings` | 会话设置快照（模型/思考档位/权限模式） |
 | `POST /api/sessions/:id/model` \| `thoughtLevel` \| `mode` | 会话内切换模型/思考档位/权限模式 |
+| `GET /api/interactions` | 待处理交互列表（权限/提问卡；页面刷新/重连后补拉，卡片不再因刷新丢失） |
 | `POST /api/interactions/:requestId` | 应答权限/提问（`autoAnswer: "ask"` 时使用） |
 | `POST /api/upload` | 附件落盘 `<workspace>/.zcode-uploads/`，消息以路径引用 |
 | `POST /api/autoAnswer` | 运行时切换 autoAnswer |

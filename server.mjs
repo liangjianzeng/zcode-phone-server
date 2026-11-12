@@ -20,7 +20,7 @@
 //
 // 零 npm 依赖；Node ≥ 22.5（需要 node:sqlite 由 zcode.cjs 自行使用）。
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
@@ -31,7 +31,7 @@ import { gzip as gzipAsync, gzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..'); // D:\MyWork\Zcode-Phone
+const ROOT = path.resolve(__dirname, '..'); // 仓库根（E:\DTXY\DSH-Phone）
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const LOG_DIR = path.join(__dirname, 'logs');
 
@@ -103,16 +103,36 @@ function saveConfig(cfg) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
 }
 
-const config = loadConfig();
+// 日志目录必须在 loadConfig 之前建好：首次启动生成 token 时就会经 logLine 写
+// server.jsonl，顺序反了时 createWriteStream 的异步 'error'（目录不存在）没有
+// 监听者，直接击穿进程——全新部署（无 config.json 且无 logs/）启动即崩。
 fs.mkdirSync(LOG_DIR, { recursive: true });
+const config = loadConfig();
 
 let logStream = null;
+let logWrites = 0;
+const LOG_ROTATE_BYTES = 32 * 1024 * 1024; // 轮转阈值：server.jsonl 曾无上限涨到 100MB+，排障时都拉不动
 function logLine(kind, message, extra) {
   const rec = { t: new Date().toISOString(), kind, message, ...extra };
   console.log(JSON.stringify(rec));
   try {
-    if (!logStream) logStream = fs.createWriteStream(path.join(LOG_DIR, 'server.jsonl'), { flags: 'a' });
+    if (!logStream) {
+      logStream = fs.createWriteStream(path.join(LOG_DIR, 'server.jsonl'), { flags: 'a' });
+      // 异步 'error'（盘满/句柄异常）try/catch 挡不住：必须挂监听，否则进程击穿
+      logStream.on('error', () => { /* 写日志失败不影响服务 */ });
+    }
     logStream.write(JSON.stringify(rec) + '\n');
+    // 按大小轮转（保留上一份 .old）：end() 回调里句柄已关再 rename（Windows 占用中 rename 会 EPERM）
+    if (++logWrites % 2048 === 0 && logStream) {
+      const logFile = path.join(LOG_DIR, 'server.jsonl');
+      let size = 0;
+      try { size = fs.statSync(logFile).size; } catch { /* 新文件尚未建立 */ }
+      if (size > LOG_ROTATE_BYTES) {
+        const old = logStream;
+        logStream = null; // 后续写入惰性建新流，日志不中断
+        old.end(() => { try { fs.renameSync(logFile, logFile + '.old'); } catch { /* 占用中：下轮再试 */ } });
+      }
+    }
   } catch { /* 日志失败不影响服务 */ }
 }
 
@@ -259,7 +279,12 @@ class ZcodeAgent {
       // 仍走 apiKey 签名路径。
       const pid = params?.providerId ?? '';
       const apiKey = readCodingPlanApiKey(pid);
-      if (apiKey && /^eyJ/.test(apiKey)) {
+      if (apiKey && /^enc:/.test(apiKey)) {
+        // 解密失败的加密 blob 绝不能透传：透传 = 引擎侧必 401、每回合 0.5s 即失败
+        // （2026-11-13 流式全断的放大器：v1 解密器遇到 v2 blob 原样返回）
+        result = { headersApplied: false, errorMessage: `凭据解密失败（${pid} 的加密凭据密钥不可得）` };
+        logLine('credential', 'refused to pass encrypted credential blob', { pid });
+      } else if (apiKey && /^eyJ/.test(apiKey)) {
         // start-plan 的 zcodeJwtToken：官方即以此作 requestAuth.apiKey 直通
         // （headersApplied: true，见 accountProviderRequestAuthService L75）。
         result = { headersApplied: true, requestAuth: { apiKey } };
@@ -333,10 +358,24 @@ function sessionState(id) {
   let s = sessions.get(id);
   if (!s) {
     s = { subs: new Set(), ring: [], busy: false, busySince: 0, title: '', lastSeq: 0,
-          queue: [], queueFlush: null, queuePoll: null };
+          queue: [], queueFlush: null, queuePoll: null, flushing: false };
     sessions.set(id, s);
   }
   return s;
+}
+
+/** 会话销毁的统一清理：停掉挂在状态上的定时器、结束 SSE 订阅、移出 Map。
+ *  只 sessions.delete() 会让 queuePoll 带着旧闭包每 3s 永久空转（查库+打引擎），
+ *  还会把已删会话的条目经 sessionState() 复活回 Map。close/archive/delete 统一走这里。 */
+function disposeSession(id) {
+  const s = sessions.get(id);
+  if (!s) return;
+  if (s.queuePoll) { clearInterval(s.queuePoll); s.queuePoll = null; }
+  if (s.queueFlush) { clearTimeout(s.queueFlush); s.queueFlush = null; }
+  if (s.deltaTimer) { clearTimeout(s.deltaTimer); s.deltaTimer = null; }
+  for (const res of s.subs) { try { res.end(); } catch { /* 已断开 */ } }
+  s.subs.clear();
+  sessions.delete(id);
 }
 
 function waitInteraction(requestId, info) {
@@ -466,31 +505,40 @@ function startQueuePoll(sid) {
 
 async function flushQueue(sid) {
   const s = sessionState(sid);
-  if (!s.queue.length || s.busy || s.lastSend?.timer) return;
+  if (s.flushing || !s.queue.length || s.busy || s.lastSend?.timer) return;
   const item = s.queue[0];
-  // -32010 重试：回合刚结束引擎清理有间隙；连续被拒说明仍有回合在跑，放弃本轮
-  for (let attempt = 0; attempt < 4; attempt++) {
-    try {
-      await agent.request('session/send', { sessionId: sid, content: item.text, inputId: crypto.randomUUID() }, 120000);
-      s.queue.shift();
-      s.busy = true;
-      if (!s.busySince) s.busySince = Date.now();
-      if (s.lastSend?.timer) clearTimeout(s.lastSend.timer);
-      s.lastSend = { content: item.text, at: Date.now(), retries: 0, timer: null };
-      pushQueueState(sid);
-      return;
-    } catch (e) {
-      if (!SEND_BUSY_RE.test(String(e?.message ?? e))) {
-        // 真实失败（限流/余额等）：留在队首，页面提示，等用户处理
-        pushSse(sid, { __ui: 'note', text: `排队消息发送失败：${String(e?.message ?? e).slice(0, 120)}（已保留在队列，可在输入框上方点击取回）` });
-        pushQueueState(sid); // 页面可能拿着旧药丸状态：推一次对齐，避免"删不掉/发不出"的死状态
+  // 单飞守卫：三个入口（queuePoll 3s 轮询 / scheduleQueueFlush 定时器 / send-now）可能
+  // 并发进入——busy 要等 session/send 被引擎受理后才置位，等待期间第二个实例会带着
+  // 同一个队首重复发送（回合恰在对方 1s 重试窗内结束时 = 同一条消息发两遍）。
+  s.flushing = true;
+  try {
+    // -32010 重试：回合刚结束引擎清理有间隙；连续被拒说明仍有回合在跑，放弃本轮
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (s.busy || s.lastSend?.timer) return; // 重试等待期间回合已被拉起：放弃本轮
+      try {
+        await agent.request('session/send', { sessionId: sid, content: item.text, inputId: crypto.randomUUID() }, 120000);
+        s.queue.shift();
+        s.busy = true;
+        if (!s.busySince) s.busySince = Date.now();
+        if (s.lastSend?.timer) clearTimeout(s.lastSend.timer);
+        s.lastSend = { content: item.text, at: Date.now(), retries: 0, timer: null };
+        pushQueueState(sid);
         return;
+      } catch (e) {
+        if (!SEND_BUSY_RE.test(String(e?.message ?? e))) {
+          // 真实失败（限流/余额等）：留在队首，页面提示，等用户处理
+          pushSse(sid, { __ui: 'note', text: `排队消息发送失败：${String(e?.message ?? e).slice(0, 120)}（已保留在队列，可在输入框上方点击取回）` });
+          pushQueueState(sid); // 页面可能拿着旧药丸状态：推一次对齐，避免"删不掉/发不出"的死状态
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 1000));
       }
-      await new Promise((r) => setTimeout(r, 1000));
     }
+    // -32010 重试耗尽（回合实际还没停）：推一次状态，页面药丸与队列对齐
+    pushQueueState(sid);
+  } finally {
+    s.flushing = false;
   }
-  // -32010 重试耗尽（回合实际还没停）：推一次状态，页面药丸与队列对齐
-  pushQueueState(sid);
 }
 
 function scheduleQueueFlush(sid, delay = 1500) {
@@ -845,6 +893,80 @@ async function sessionLooksFinished(sid) {
   finishedCache.set(sid, { t: Date.now(), finished });
   if (finishedCache.size > 500) for (const k of finishedCache.keys()) { finishedCache.delete(k); if (finishedCache.size <= 400) break; }
   return finished;
+}
+
+// ── 桌面驱动回合的镜像推帧（方案 A，2026-11-13）──
+// 桌面端驱动的回合事件不经过本桥（SSE 环是空的），手机端只能 1.2s 轮询共享库，
+// 而桌面引擎只在步骤边界落库 → 手机上"久不久跳一下"。这里对「有订阅者 + 桥不忙」
+// 的会话以 450ms 轮询共享库并差分：新增/变化的部件合成 part.upserted 帧、
+// 运行态翻转合成 turn.started/turn.completed——帧形状与引擎原生事件一致，
+// 页面零改动走既有渲染路径（含 pe.raw 去重、replay 收敛）。
+// 已知边界：子代理/工具执行期间桌面引擎不落库，静默段是数据源粒度，推帧无法消除。
+const MIRROR_POLL_MS = 450;
+const MIRROR_MSGS = 6;
+let mirrorTimer = null;
+function startMirrorLoop() {
+  if (mirrorTimer) return;
+  mirrorTimer = setInterval(() => {
+    for (const [sid, s] of sessions) {
+      if (!s.subs.size || s.busy || s.lastSend?.timer) continue; // 桥自己驱动的回合走原生事件流
+      try { mirrorSession(sid, s); } catch { /* 下轮再试 */ }
+    }
+  }, MIRROR_POLL_MS);
+}
+function nextMirrorSeq(s) { s.lastSeq = (s.lastSeq ?? 0) + 1; return s.lastSeq; }
+function mirrorSession(sid, s) {
+  if (!s.mirror) s.mirror = { running: false, snap: new Map() };
+  const M = s.mirror;
+  let page = null;
+  try { page = dbMessagesPage(sid, MIRROR_MSGS); } catch { return; }
+  const msgs = page?.messages ?? [];
+  const st = dbTurnState(sid); // 直查不经 finishedCache：翻转检测要 450ms 粒度
+  const running = st?.running === true;
+  if (running && !M.running) {
+    M.running = true;
+    M.snap = new Map();
+    // 用户消息文本随 turn.started 推给页面（页面用 payload.input 画用户气泡）。
+    // 只在"刚刚发起"时回显（≤2.5s）：中途附着/历史加载的旧用户消息页面已有，
+    // 再推会与轮询渲染撞出双气泡（页面的 dropMatchingUserEcho 只兜 SSE 先到一侧）
+    const userMsg = msgs.find((m) => m.info?.role === 'user');
+    let inputText = '';
+    if (userMsg) {
+      const c = Number(userMsg.info?.time?.created ?? 0);
+      const createdMs = c > 1e12 ? c : c * 1000;
+      if (Date.now() - createdMs < 2500) {
+        inputText = (userMsg.parts ?? []).filter((p) => p.type === 'text').map((p) => p.text ?? '').join('\n').slice(0, 2000);
+      }
+    }
+    pushSse(sid, { seq: nextMirrorSeq(s), type: 'turn.started', payload: { sessionId: sid, ...(inputText ? { input: inputText } : {}) }, sessionId: sid });
+    logLine('mirror', `桌面驱动回合开始推帧: ${sid.slice(0, 13)}…`);
+  }
+  if (!running) {
+    if (M.running) {
+      M.running = false;
+      pushSse(sid, { seq: nextMirrorSeq(s), type: 'turn.completed', payload: { sessionId: sid }, sessionId: sid });
+      logLine('mirror', `桌面驱动回合推帧结束: ${sid.slice(0, 13)}…`);
+    }
+    return;
+  }
+  const alive = new Set();
+  for (const m of msgs) {
+    const mid = String(m.info?.id ?? '');
+    if (!mid) continue;
+    alive.add(mid);
+    let pm = M.snap.get(mid);
+    if (!pm) { pm = new Map(); M.snap.set(mid, pm); }
+    for (const p of m.parts ?? []) {
+      const pid = String(p.partId ?? p.id ?? '');
+      if (!pid) continue;
+      const json = JSON.stringify(p);
+      if (pm.get(pid) === json) continue;
+      pm.set(pid, json);
+      // 合成 part.upserted：messageId 注入部件（页面 case 以 part.messageId 定位消息）
+      pushSse(sid, { seq: nextMirrorSeq(s), type: 'part.upserted', payload: { part: { ...p, messageId: mid }, messageId: mid }, sessionId: sid });
+    }
+  }
+  for (const k of M.snap.keys()) if (!alive.has(k)) M.snap.delete(k); // 快照只留最近几条
 }
 
 /**
@@ -1891,8 +2013,99 @@ function credentialSecret() {
   return `zcode-credential-fallback:${os.platform()}:${os.homedir()}:${os.userInfo().username}`;
 }
 
+// ── enc:v2 凭据解密（2026-11-13）──
+// 桌面端把凭据加密从 enc:v1（对称派生密钥）升级为 enc:v2:<os|env>:<指纹24hex>:<iv.tag.data>，
+// 老桥接层不解 v2、把加密 blob 原样透传 → 引擎侧 401 → 每回合 0.5s 即失败 → 手机端"完全没有流式"。
+// v2:os 的 32B AES 密钥存 Windows 凭据管理器（@napi-rs/keyring）：
+//   条目 TargetName = "<sha256hex(凭据路径)>.ZCode Credential Encryption"，
+//   密码 = 43 字符 base64url = 密钥本体（CredMan blob 为 UTF-16LE 存储）。
+// 指纹 = sha256(key).hex 前 24 位， payload 的 iv 12B / tag 16B 与 v1 同构（引擎 eTo/tTo）。
+let credKeyV2;
+let credKeyV2Done = false;
+function acquireCredentialKeyV2() {
+  // 源 1：托管密钥文件（引擎 resolveManagedSecret 同口径：<凭据目录>/credential-secret，32B..4KB 文本）
+  try {
+    const f = path.join(path.dirname(CRED_PATH), 'credential-secret');
+    const st = fs.statSync(f);
+    if (st.isFile() && st.size >= 32 && st.size <= 4096) {
+      return { key: crypto.createHash('sha256').update(fs.readFileSync(f, 'utf8')).digest(), source: 'env' };
+    }
+  } catch { /* 无托管密钥文件：走系统凭据库 */ }
+  // 源 2：Windows 凭据管理器（os 源）。PowerShell CredRead 原生无依赖读取，启动期一次。
+  if (process.platform === 'win32') {
+    try {
+      const acct = crypto.createHash('sha256').update(path.resolve(CRED_PATH)).digest('hex');
+      const target = `${acct}.ZCode Credential Encryption`;
+      const script = [
+        "$s = @'",
+        'using System; using System.Runtime.InteropServices;',
+        'public class CredV2R {',
+        '  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]',
+        '  public struct CREDENTIAL {',
+        '    public int Flags; public int Type; public string TargetName; public string Comment;',
+        '    public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;',
+        '    public int CredentialBlobSize; public IntPtr CredentialBlob; public int Persist;',
+        '    public int AttributeCount; public IntPtr Attributes; public string TargetAlias; public string UserName;',
+        '  }',
+        '  [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]',
+        '  public static extern bool CredReadW(string target, int type, int flags, out IntPtr credPtr);',
+        '  [DllImport("advapi32.dll")] public static extern void CredFree(IntPtr cred);',
+        '  public static string Read(string target) {',
+        '    IntPtr p; if (!CredReadW(target, 1, 0, out p)) return null;',
+        '    var c = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));',
+        '    var blob = new byte[c.CredentialBlobSize];',
+        '    Marshal.Copy(c.CredentialBlob, blob, 0, blob.Length);',
+        '    CredFree(p);',
+        '    return Convert.ToBase64String(blob);',
+        '  }',
+        '}',
+        "'@;",
+        'Add-Type -TypeDefinition $s;',
+        '$b = [CredV2R]::Read("' + target + '");',
+        'if ($b) { Write-Output ("B64:" + $b) }',
+      ].join('\n');
+      const r = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], { timeout: 15000 });
+      const line = String(r.stdout ?? '').split('\n').map((l) => l.trim()).find((l) => l.startsWith('B64:'));
+      if (line) {
+        const bytes = Buffer.from(line.slice(4), 'base64');
+        for (const encName of ['utf16le', 'utf8']) {
+          const pwd = bytes.toString(encName);
+          if (/^[A-Za-z0-9_-]{43}$/.test(pwd)) {
+            const key = Buffer.from(pwd, 'base64url');
+            if (key.length === 32) return { key, source: 'os' };
+          }
+        }
+      }
+    } catch { /* 凭据库读取失败：按不可用处理 */ }
+  }
+  return null;
+}
+function credentialKeyV2() {
+  if (!credKeyV2Done) {
+    credKeyV2Done = true;
+    credKeyV2 = acquireCredentialKeyV2();
+    if (!credKeyV2) logLine('credential', 'enc:v2 密钥不可用（凭据管理器/托管文件均未取得）——v2 凭据将无法解密');
+    else logLine('credential', `enc:v2 密钥已取得（source=${credKeyV2.source}）`);
+  }
+  return credKeyV2;
+}
 function decryptCredential(value) {
   const v = String(value ?? '');
+  if (v.startsWith('enc:v2:')) {
+    // 解不开时返回空串——绝不把加密 blob 原样透传（透传 = 引擎侧必 401）
+    const k = credentialKeyV2();
+    if (!k) return '';
+    try {
+      const seg = v.slice('enc:v2:'.length).split(':');
+      if (seg.length !== 3 || !['os', 'env'].includes(seg[0])) return '';
+      if (crypto.createHash('sha256').update(k.key).digest('hex').slice(0, 24) !== seg[1]) return ''; // 指纹不吻合=密钥错配
+      const [iv, tag, data] = seg[2].split('.').map((b) => Buffer.from(b, 'base64url'));
+      if (iv.length !== 12 || tag.length !== 16) return '';
+      const d = crypto.createDecipheriv('aes-256-gcm', k.key, iv);
+      d.setAuthTag(tag);
+      return Buffer.concat([d.update(data), d.final()]).toString('utf8');
+    } catch { return ''; }
+  }
   if (!v.startsWith('enc:v1:')) return v;
   const [ivRaw, tagRaw, dataRaw] = v.slice('enc:v1:'.length).split('.');
   const key = crypto.createHash('sha256').update(credentialSecret()).digest();
@@ -2519,6 +2732,9 @@ async function handleApi(req, res, url) {
       s.subs.add(res);
       const hb = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* noop */ } }, 15000);
       req.on('close', () => { clearInterval(hb); s.subs.delete(res); });
+      // res.write 对已销毁连接的报错是异步 emit（try/catch 挡不住）：移动网络下
+      // SSE 连接生灭频繁，不挂 error 监听 = uncaught 'error' 击穿进程、全体掉线
+      res.on('error', () => { clearInterval(hb); s.subs.delete(res); });
       return;
     }
 
@@ -2632,7 +2848,7 @@ async function handleApi(req, res, url) {
 
     if (req.method === 'POST' && sub === 'close') {
       const r = await agent.request('session/close', { sessionId: sid }).catch((e) => ({ error: e.message }));
-      sessions.delete(sid);
+      disposeSession(sid);
       return sendJson(res, 200, r ?? {});
     }
 
@@ -2647,7 +2863,7 @@ async function handleApi(req, res, url) {
         const st = sessionState(sid);
         st.busy = false; st.busySince = 0;
         agent.request('session/close', { sessionId: sid }).catch(() => {});
-        sessions.delete(sid);
+        disposeSession(sid);
       }
       return sendJson(res, 200, { archived, sessionId: sid });
     }
@@ -2658,8 +2874,16 @@ async function handleApi(req, res, url) {
       if (st.busy || sessionState(sid).lastSend?.timer) {
         return sendJson(res, 409, { error: '会话正在运行任务，先停止再删除' });
       }
-      await agent.request('session/close', { sessionId: sid }).catch(() => {});
-      sessions.delete(sid);
+      // 桌面端驱动的回合本进程 busy 看不到（桥只反映自己的发送）：删行前以
+      // 共享库运行态为准——引擎还在写的行被连带删除 = 数据破坏窗口。
+      if (dbTurnState(sid)?.running) {
+        return sendJson(res, 409, { error: '会话正在运行任务（桌面端驱动），先停止再删除' });
+      }
+      const closeErr = await agent.request('session/close', { sessionId: sid })
+        .then(() => null)
+        .catch((e) => String(e?.message ?? e));
+      if (closeErr) logLine('session', `删除 ${sid} 前 session/close 失败（运行态已核实，继续删行）：${closeErr.slice(0, 120)}`);
+      disposeSession(sid);
       try {
         dbDeleteSession(sid);
       } catch (e) {
@@ -2769,21 +2993,6 @@ async function handleApi(req, res, url) {
       // 会悄悄改掉之后所有新建会话的默认模式，是两件不该耦合的事。
       await agent.request('session/setMode', { sessionId: sid, mode });
       return sendJson(res, 200, { ok: true, mode });
-    }
-
-    // 交互应答开关（审批是否落到手机端）：allow=自动放行权限请求/自动采纳
-    // 提问第一选项；ask=推到手机端审批卡人工处理（30 分钟无应答自动拒绝）。
-    // 运行时可改（config 对象内存生效 + saveConfig 落盘），无需重启服务。
-    if (req.method === 'POST' && p === '/api/autoAnswer') {
-      const body = await readBody(req);
-      const v = String(body.autoAnswer ?? '').trim();
-      if (!['allow', 'ask'].includes(v)) {
-        return sendJson(res, 400, { error: `autoAnswer 不支持：${v}（仅 allow/ask）` });
-      }
-      config.autoAnswer = v;
-      saveConfig(config);
-      logLine('config', `autoAnswer -> ${v}`);
-      return sendJson(res, 200, { ok: true, autoAnswer: v });
     }
 
     // 压缩上下文（对照官方容量卡的主动收缩入口）
@@ -2951,6 +3160,30 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { items: searchWorkspaceFiles(ref.workspacePath, q) });
   }
 
+  // 待处理交互列表：pending 交互只广播不进重放环，页面刷新/重连后拉一次，
+  // 审批/提问卡不丢（此前一刷新就丢卡，引擎侧 30 分钟后自动拒绝）
+  if (req.method === 'GET' && p === '/api/interactions') {
+    const items = [...pendingInteractions.entries()]
+      .map(([requestId, e]) => ({ ...e.info, requestId, pending: true }));
+    return sendJson(res, 200, { items });
+  }
+
+  // 交互应答开关（审批是否落到手机端）：allow=自动放行权限请求/自动采纳
+  // 提问第一选项；ask=推到手机端审批卡人工处理（30 分钟无应答自动拒绝）。
+  // 运行时可改（config 对象内存生效 + saveConfig 落盘），无需重启服务。
+  // （2026-11 修正：曾嵌在 sessions 子路由块内永不可达，手机端切换一直 404）
+  if (req.method === 'POST' && p === '/api/autoAnswer') {
+    const body = await readBody(req);
+    const v = String(body.autoAnswer ?? '').trim();
+    if (!['allow', 'ask'].includes(v)) {
+      return sendJson(res, 400, { error: `autoAnswer 不支持：${v}（仅 allow/ask）` });
+    }
+    config.autoAnswer = v;
+    saveConfig(config);
+    logLine('config', `autoAnswer -> ${v}`);
+    return sendJson(res, 200, { ok: true, autoAnswer: v });
+  }
+
   if (req.method === 'POST' && seg[0] === 'api' && seg[1] === 'interactions' && seg[2]) {
     const requestId = decodeURIComponent(seg[2]);
     const body = await readBody(req);
@@ -3013,12 +3246,24 @@ const server = http.createServer(async (req, res) => {
 
 // ────────────────────────── 启动 ──────────────────────────
 
+// 进程级兜底：随机边角的异步异常（SSE/引擎 stdio 连接生灭、第三方库）不应击穿
+// 整个服务——移动网络场景下这是"全体客户端突然掉线"的头号来源。只记录不退出，
+// 真正不可恢复时守护脚本（run-server.cmd）仍会在进程退出后 3s 拉起。
+process.on('uncaughtException', (e) => { logLine('crash-guard', `未捕获异常：${String(e?.stack ?? e)}`); });
+process.on('unhandledRejection', (e) => { logLine('crash-guard', `未处理的 Promise 拒绝：${String(e?.stack ?? e)}`); });
+
+server.on('error', (e) => {
+  logLine('boot', `server error：${String(e?.message ?? e)}`);
+  process.exit(1); // EADDRINUSE 等致命错误：退出交给守护脚本等待接管
+});
+
 server.listen(config.port, '127.0.0.1', () => {
   logLine('boot', `zcode-phone-server listening on http://127.0.0.1:${config.port}/?token=<token>`, {
     workspace: config.workspacePath,
     mode: config.mode,
     autoAnswer: config.autoAnswer,
-    token: config.token, // 本机日志便于自测；服务只监听回环地址
+    // 只记前 4 位便于对照：logs/ 会被拿去排障分享，不落明文（完整 token 看 config.json）
+    token: config.token.slice(0, 4) + '…',
   });
   console.log('');
   console.log('──────────────────────────────────────────────────');
@@ -3030,6 +3275,7 @@ server.listen(config.port, '127.0.0.1', () => {
   console.log('──────────────────────────────────────────────────');
 });
 
+startMirrorLoop();
 agent.start();
 
 // 引擎启动后再开心跳：此时 config.model 已就绪，保活把后端模型保持热态，

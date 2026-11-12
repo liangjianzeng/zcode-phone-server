@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<!-- token 随页面 URL 携带：禁止 referrer 外泄（markdown 图片/链接的自动外链请求不再带 ?token=） -->
+<meta name="referrer" content="no-referrer">
 <meta name="theme-color" id="metaTheme" content="#0b0b0e">
 <script>
 // 主题预应用：脚本主体在 body 末尾才执行，这里先把解析好的主题落到根
@@ -2105,7 +2107,7 @@ async function shareOrCopy(t) {
 function collectMsgText(m) {
   return [...m.partEls.values()]
     .filter((v) => v.kind === 'text')
-    .map((v) => String(v.raw ?? v.full ?? v.el.innerText ?? '').trim())
+    .map((v) => String(v.raw || v.full || v.el.innerText || '').trim()) // || 而非 ??：空串要落到下一级取值
     .filter(Boolean).join('\n\n');
 }
 
@@ -2733,6 +2735,7 @@ function renderHistory(messages, opts = {}) {
   // 引入屏外高度估算）。触顶续拉的滚动锚定实测有抖动就摘掉这两行
   chat.classList.toggle('cvchat', vis.length > 80);
   if (!opts.noAutoScroll) scrollBottom(true); // 打开/重同步会话：回到最新消息（不受用户滚动守卫限制）
+  histRenderedAt = Date.now(); // 防误触发守卫的时间锚（此前从未赋值，800ms 守卫恒不生效）
 }
 
 // 「加载更早」：histLimit 窗口一次多取 80 条重建对话；滚动锚定在原位置
@@ -3192,7 +3195,9 @@ function handleZcodeEvent(ev) {
         if (String(part.tool ?? '').toLowerCase() === 'todowrite') {
           scheduleTodoRefresh();
         } else {
-          const cid = String(part.callId ?? part.callID ?? `p${part.partId ?? messageId + '-t'}`);
+          // 工具键兜底用 part.messageId（本作用域没有 messageId 变量：旧写法在
+          // callId/callID/partId 全缺时 ReferenceError，事件被空 catch 静默吞掉）
+          const cid = String(part.callId ?? part.callID ?? `p${part.partId ?? part.messageId + '-t'}`);
           toolCard(cid, part.tool, inputSummary(st.input) || st.title || '', m, eventParentToolUseId(part));
           const stt = st.status ?? 'pending';
           setToolStatus(cid, stt, undefined, undefined);
@@ -3310,7 +3315,11 @@ function handleZcodeEvent(ev) {
     }
     case 'permission.requested': {
       // autoAnswer=ask 时才会看到；渲染批准卡片（批准/拒绝短文案 = App 审批检测契约）
-      chat.appendChild(buildPermissionCard(ev.payload ?? {})); scrollBottom();
+      const pr = ev.payload ?? {};
+      const prid = pr.requestId ? String(pr.requestId) : '';
+      if (prid && interactionCardsSeen.has(prid)) break; // 环重放/pending 补拉已渲染过
+      if (prid) interactionCardsSeen.add(prid);
+      chat.appendChild(buildPermissionCard(pr)); scrollBottom();
       break;
     }
     case 'userInput.requested': {
@@ -3320,6 +3329,9 @@ function handleZcodeEvent(ev) {
       // {action:'accept', content:{answers:{题干: 选项/自定义文本}}}
       // 单题兼容旧 answer 字段由引擎归一（answer_0/answer 也认）。
       const p = ev.payload ?? {};
+      const prid = p.requestId ? String(p.requestId) : '';
+      if (prid && interactionCardsSeen.has(prid)) break; // 环重放/pending 补拉已渲染过
+      if (prid) interactionCardsSeen.add(prid);
       const questions = Array.isArray(p.questions) ? p.questions : [];
       const card = el('div', 'ask');
       card.appendChild(el('div', 'q', p.prompt ?? questions[0]?.question ?? 'Agent 提问'));
@@ -3536,6 +3548,10 @@ function remendLite(t) {
 }
 function streamRich(pe, text) {
   pe.__pending = text;
+  // 数据通道同步更新（DOM 只是渲染结果）：复制/分享取 pe.raw（collectMsgText），
+  // 此前只更新 __pending/DOM——流式增长后点复制拿到的是首帧旧前缀甚至空串
+  pe.raw = text;
+  pe.full = text;
   if (richTimers.has(pe)) return;
   richTimers.set(pe, setTimeout(() => {
     richTimers.delete(pe);
@@ -3555,11 +3571,16 @@ function flushStreamRich(pe) {
   dropCaret(); // 权威渲染接管：光标退场（settle 路径同此）
 }
 
+// 已渲染过审批/提问卡的 requestId：SSE 直推/环重放与 pending 列表补拉可能把
+// 同一张卡多路送达，按 requestId 去重（卡片应答后即移除，集合只增不大——交互数量级极小）
+const interactionCardsSeen = new Set();
+
 function handleUiEvent(p) {
   // 会话守卫：异会话的交互事件不渲染进当前视图（串台）
   if (p.sessionId && curSession && p.sessionId !== curSession) return;
   // 服务端 ui 推送以 __ui 标记类型（历史字段 kind 仅权限事件携带，两者都查）
-  if (p.kind === 'permission' && p.pending) {
+  if (p.kind === 'permission' && p.pending && !(p.requestId && interactionCardsSeen.has(String(p.requestId)))) {
+    if (p.requestId) interactionCardsSeen.add(String(p.requestId));
     chat.appendChild(buildPermissionCard(p)); scrollBottom();
   }
   // 服务端自动重试提示（429 限流退避等）
@@ -3657,6 +3678,21 @@ async function answerInteraction(requestId, answer, card) {
 
 let streamEverOpened = false;
 
+// 待处理交互补拉（服务端 GET /api/interactions）：pending 卡只走 SSE 广播、不进
+// 重放环——刷新页面或重连后原本就再也看不到这张卡，引擎侧 30 分钟超时自动拒绝。
+// 首连与每次重连各拉一次；已渲染的 requestId 由 interactionCardsSeen 去重。
+async function fetchPendingInteractions() {
+  if (!curSession) return;
+  try {
+    const r = await api('interactions');
+    for (const item of (r.items ?? [])) {
+      if (item.sessionId && item.sessionId !== curSession) continue; // 其他会话的交互不进当前视图
+      if (item.kind === 'userInput') handleZcodeEvent({ type: 'userInput.requested', payload: item });
+      else handleUiEvent(item);
+    }
+  } catch { /* 列表不可用：维持原状，正常路径不受影响 */ }
+}
+
 function connectStream(sessionId, afterSeq = -1) {
   if (es) { es.close(); es = null; }
   streamEverOpened = false;
@@ -3664,6 +3700,7 @@ function connectStream(sessionId, afterSeq = -1) {
   es.onopen = () => {
     if (streamEverOpened) resync();
     streamEverOpened = true;
+    fetchPendingInteractions(); // 首连/重连补拉待审批卡（autoAnswer=ask 时刷新不再丢卡）
   };
   es.addEventListener('zcode', (e) => { try { handleZcodeEvent(JSON.parse(e.data)); } catch {} });
   es.addEventListener('ui', (e) => { try { handleUiEvent(JSON.parse(e.data)); } catch {} });
@@ -4454,7 +4491,10 @@ $('findInput').addEventListener('keydown', (e) => {
 // ── 项目 / 会话（官方 PC 侧边栏同款：按项目分组的单列表）──
 
 let workspaces = [];      // config.workspaces（补齐还没有会话的项目行）
-let curWs = localStorage.getItem('zcode.ws') ?? '';
+// 顶层裸调 localStorage 在存储被禁（隐私模式/企业策略/WebView 关 DOM storage）时
+// 抛异常 → 顶层求值中断 → 后面全部代码不执行 = 整页死。必须包 try（全文纪律）。
+let curWs = '';
+try { curWs = localStorage.getItem('zcode.ws') ?? ''; } catch { /* 沿用默认工作区 */ }
 let allSessions = [];     // 摊平视图（busy/搜索/兜底用）；渲染以 allGroups 为准
 let allGroups = null;     // GET /api/sessions?all=1 → 任务索引官方口径分组（服务端排好序）
 const projExpanded = new Map(); // 项目路径 → 是否展开全部会话（组内"显示更多"）
@@ -4500,7 +4540,8 @@ function fmtRel(ts) {
 // 抽屉开着每轮拉一次即可）。点开走 openRemoteSession 只读浏览：不 resume、不 SSE、
 // 输入禁用——与官方任务栏同一份数据，官方能看到的工作会话这里就能看到。
 let remoteHosts = [];          // /api/remote/projects 最近一次成功快照
-let remoteSectExpanded = localStorage.getItem('zcode.remoteOpen') !== '0';
+let remoteSectExpanded = true; // 默认展开；localStorage 读取必须包 try（见 curWs 同款说明）
+try { remoteSectExpanded = localStorage.getItem('zcode.remoteOpen') !== '0'; } catch { /* 沿用默认 */ }
 const remoteProjExpanded = new Map(); // hostId|projectId → 是否展开全部
 let remoteView = null;         // 当前只读视图 {hostId, sessionId, title, host, username}
 let remoteFollowTimer = null;
