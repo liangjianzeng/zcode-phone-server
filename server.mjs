@@ -109,6 +109,10 @@ function saveConfig(cfg) {
 fs.mkdirSync(LOG_DIR, { recursive: true });
 const config = loadConfig();
 
+// 进程启动标识：/api/state 下发，restart_server.sh 据此确认"重启后应答的是新进程"
+// ——只看 HTTP 200 的健康检查会把"旧进程没杀掉"误报成重启成功（2026-11-13 实测假成功）
+const BOOT_ID = crypto.randomUUID();
+
 let logStream = null;
 let logWrites = 0;
 const LOG_ROTATE_BYTES = 32 * 1024 * 1024; // 轮转阈值：server.jsonl 曾无上限涨到 100MB+，排障时都拉不动
@@ -469,6 +473,8 @@ function scheduleRateLimitRetry(sid, error) {
     try {
       // inputId 打 __retry 标记：turn.started 会回带 inputId，页面据此跳过
       // 用户消息回显（同一内容的气泡第一次失败时已经渲染过，重发不再重复）
+      // 20s 退避窗口里桌面端可能跑过回合：与直发/补发同款对账，先重建上下文
+      await ensureFreshContext(sid);
       await agent.request('session/send', { sessionId: sid, content: ls.content, inputId: `__retry-${n}-${crypto.randomUUID()}` }, 120000);
       cur.busy = true;
       if (!cur.busySince) cur.busySince = Date.now();
@@ -2484,6 +2490,7 @@ async function handleApi(req, res, url) {
 
   if (req.method === 'GET' && p === '/api/state') {
     return sendJson(res, 200, {
+      bootId: BOOT_ID,
       workspacePath: config.workspacePath,
       mode: config.mode,
       model: config.model,
