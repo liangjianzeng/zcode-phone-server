@@ -417,6 +417,9 @@ agent.onEvent = (event) => {
   if (event.type === 'tool.updated' && !s.busy) { s.busy = true; if (!s.busySince) s.busySince = Date.now(); }
   if (event.type === 'turn.completed' || event.type === 'turn.failed') {
     s.busy = false; s.busySince = 0;
+    // 本进程驱动的回合已落库：游标推进到当前库尾，下次发送不误判"上下文落后"
+    // （桌面驱动的回合不走这里——引擎只推自己跑的回合，那种靠发送前对账兜住）
+    try { s.ctxSeq = dbCursor(event.sessionId); } catch { /* 库不可用：保留旧基线 */ }
     // 本回合结束：若有排队消息，稍候自动补发为下一回合（预备任务语义）
     scheduleQueueFlush(event.sessionId, 1500);
     // 回合结束 3s 后对账桌面任务索引：标题落库、状态收口，行先进索引，
@@ -516,6 +519,7 @@ async function flushQueue(sid) {
     for (let attempt = 0; attempt < 4; attempt++) {
       if (s.busy || s.lastSend?.timer) return; // 重试等待期间回合已被拉起：放弃本轮
       try {
+        await ensureFreshContext(sid); // 补发前同样对账上下文（排队期间桌面可能跑过回合）
         await agent.request('session/send', { sessionId: sid, content: item.text, inputId: crypto.randomUUID() }, 120000);
         s.queue.shift();
         s.busy = true;
@@ -883,6 +887,40 @@ function dbTurnState(sid) {
   } catch { return null; }
 }
 
+/** 会话在共享库的消息游标（最大 sequence）：引擎上下文新鲜度的对账基准。
+ *  引擎的回合上下文在进程内存里，resume 之后别人（桌面端）写进库的新消息
+ *  引擎看不到——手机对桌面会话追问时模型"感知不到上下文"的根因。 */
+function dbCursor(sid) {
+  if (!agentDbHandle) agentDbHandle = new DatabaseSync(AGENT_DB_PATH, { readOnly: true });
+  return Number(agentDbHandle.prepare(
+    'SELECT COALESCE(MAX(sequence), 0) AS c FROM message WHERE session_id=?'
+  ).get(String(sid))?.c ?? 0);
+}
+
+/** 发送前上下文对账：库内游标比桥内基线新（resume 后桌面端跑过回合）时，
+ *  先关掉本进程引擎实例再 resume，强制引擎从共享库重建上下文，然后才发送。
+ *  桌面进程自己的实例不受影响；订阅在重建后补挂（close 会一并丢弃）。
+ *  库不可用/桌面回合仍在写库（running）时不动作：前者按原上下文发送，
+ *  后者反正会被引擎 -32010 拒绝转排队，等 flushQueue 在回合真正结束后重建。 */
+async function ensureFreshContext(sid) {
+  const s = sessionState(sid);
+  let cur = 0;
+  try { cur = dbCursor(sid); } catch { return; }
+  if (!s.ctxSeq) { s.ctxSeq = cur; return; } // 无基线（本进程没 resume 过）：先记基线
+  if (cur <= s.ctxSeq) return;               // 引擎上下文不落后于库：直接发
+  if (dbTurnState(sid)?.running) return;     // 桌面回合写库中：重建会拿到半截上下文
+  const base = s.ctxSeq;
+  try {
+    await agent.request('session/close', { sessionId: sid }).catch(() => {});
+    await agent.request('session/resume', { sessionId: sid }, 180000);
+    await agent.request('session/subscribe', { sessionId: sid, deliveryKind: 'desktop-continuous', includeSnapshot: false });
+    s.ctxSeq = dbCursor(sid);
+    logLine('session', `发送前重建引擎上下文（库内序列 ${cur} > 桥内基线 ${base}）: ${sid.slice(0, 13)}…`);
+  } catch (e) {
+    logLine('session', `发送前上下文重建失败（按原上下文继续）: ${String(e?.message ?? e).slice(0, 120)}`);
+  }
+}
+
 // 运行态判定 3 秒缓存：侧栏 4s 轮询 + 队列补发核实共用，避免每条会话每轮都打库
 const finishedCache = new Map(); // sid → { t, finished }
 async function sessionLooksFinished(sid) {
@@ -904,6 +942,7 @@ async function sessionLooksFinished(sid) {
 // 已知边界：子代理/工具执行期间桌面引擎不落库，静默段是数据源粒度，推帧无法消除。
 const MIRROR_POLL_MS = 450;
 const MIRROR_MSGS = 6;
+const MIRROR_IDLE_POLLS = 3; // 连续 3 轮读空（≈1.35s）才认定回合结束，防步进边界误判
 let mirrorTimer = null;
 function startMirrorLoop() {
   if (mirrorTimer) return;
@@ -922,7 +961,17 @@ function mirrorSession(sid, s) {
   try { page = dbMessagesPage(sid, MIRROR_MSGS); } catch { return; }
   const msgs = page?.messages ?? [];
   const st = dbTurnState(sid); // 直查不经 finishedCache：翻转检测要 450ms 粒度
-  const running = st?.running === true;
+  let running = st?.running === true;
+  // 步进边界防抖：桌面引擎写完 step-finish 到下一个 step-start 落库之间有
+  // 亚秒级"末部件=step-finish"的间隙，dbTurnState 会短暂误读为"已结束"——
+  // 一次读数不够，连续 MIRROR_IDLE_POLLS 轮都读空才认（真结束最多晚 1s 宣告）。
+  if (running) {
+    M.idlePolls = 0;
+  } else if (M.running) {
+    M.idlePolls = (M.idlePolls ?? 0) + 1;
+    if (M.idlePolls < MIRROR_IDLE_POLLS) return;
+    running = false;
+  }
   if (running && !M.running) {
     M.running = true;
     M.snap = new Map();
@@ -2623,6 +2672,9 @@ async function handleApi(req, res, url) {
     }
     if (!sid) throw new Error('session/create 未返回 sessionId');
     sessionState(sid);
+    // 记录 resume/create 时刻的库内游标：之后每次发送前对比（ensureFreshContext），
+    // 桌面端在两次发送之间跑过回合时先重建引擎上下文，追问才带得上新历史
+    try { sessionState(sid).ctxSeq = dbCursor(sid); } catch { /* 库不可用：留空基线 */ }
     // 建/开会话后事件驱动对账：resume 的存量会话状态/时间戳有变也一并刷新（#37）
     scheduleIndexSync();
     // 缓存 create/resume 快照的投影：session/read 的 available 残缺（只剩当前
@@ -2818,6 +2870,7 @@ async function handleApi(req, res, url) {
       const st = sessionState(sid);
       if (!st.busy) {
         try {
+          await ensureFreshContext(sid); // 库里有桥不知道的新历史（桌面跑过回合）：先重建上下文
           const r = await agent.request('session/send', { sessionId: sid, content, inputId: crypto.randomUUID() }, 120000);
           st.busy = true;
           if (!st.busySince) st.busySince = Date.now();

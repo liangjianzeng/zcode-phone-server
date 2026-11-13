@@ -58,7 +58,11 @@
     color-scheme: light;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  html { --kb: 0px; } /* 键盘高度（visualViewport 探测，JS 维护；预留调试/样式用） */
+  /* 键盘高度（visualViewport 探测，JS 维护；预留调试/样式用）；
+     text-size-adjust:100% 关闭 Android WebView 的字体自适应放大——系统字体
+     缩放 ≠100% 时 WebView 会自作主张放大 max-width 约束容器里的文字，
+     症状就是用户气泡"字号巨大、一行两三个字"（App 侧未设 textZoom，页面侧兜死） */
+  html { --kb: 0px; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   html, body { height: 100%; }
   body {
     margin: 0; background: var(--bg); color: var(--fg);
@@ -906,7 +910,7 @@
 const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
 // 页面构建标记：抽屉底部可见（诊断"手机吃到旧页面"——App WebView 缓存曾致
 // 服务端修复长期无法到达终端；新页面有此标记=代码最新）
-const PAGE_BUILD = '2026-11-06.1';
+const PAGE_BUILD = '2026-11-13.1';
 const qs = (o) => Object.entries(o).map(([k,v]) => `${k}=${encodeURIComponent(v)}`).join('&');
 const API = (p) => `/api/${p}${p.includes('?') ? '&' : '?'}${qs({token: TOKEN})}`;
 
@@ -2187,8 +2191,11 @@ function renderTextPart(m, partId, text) {
   let pe = m.partEls.get(partId);
   if (pe && pe.raw === String(text ?? '')) return pe; // 内容未变：跳过整段重建（轮询/重复事件的高频入口，无条件重建 = 页面抖动）
   if (!pe) {
-    // 带 bubble 类：markdown / 代码块样式全挂在 .bubble 之下
-    const div = el('div', 'bubble');
+    // markdown / 代码块样式全挂在 .bubble 之下（后代选择器），正文段容器本身：
+    // 助手消息带 bubble 类；用户消息用中性 ubody——外层气泡（ensureMsg 建的
+    // .msg.user .bubble）已是气泡样式，再套一层 bubble 会继承 max-width:86%
+    // 二次收缩 + 双层底色双份圆角（实测外层 102px 内层仅 65px）
+    const div = el('div', m.role === 'user' ? 'ubody' : 'bubble');
     div.__partId = partId;
     // 正文段是消息容器的直接子节点（内容序）；用户消息渲染进气泡内
     if (m.role === 'user') bubbleOf(m).appendChild(div); else m.el.appendChild(div);
